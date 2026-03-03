@@ -1,0 +1,76 @@
+#!/bin/bash
+#OAR -n hcpa_clean_pytorch_x86
+#OAR -l nodes=1,walltime=4:00:00
+#OAR -p cluster='sirius' or cluster='gemini'
+#OAR -t exotic
+#OAR -O logs/g5k_clean_pytorch_%jobid%.stdout
+#OAR -E logs/g5k_clean_pytorch_%jobid%.stderr
+
+###############################################################################
+# Script OAR - pytorch_base (PyTorch) - x86_64
+# Clusters: Sirius (A100) ou Gemini (V100)
+###############################################################################
+
+set -euxo pipefail
+
+IMAGE="pytorch_distributed_x86:latest"
+PROJ_DIR="$HOME/projects/hcpa/pytorch_base"
+TFREC_DIR="${PROJ_DIR}/data/all-tfrec"
+CONT_WORKDIR="/workspace"
+LOG_DIR="${PROJ_DIR}/logs"
+CACHE_ROOT="/tmp/hcpa_${OAR_JOB_ID}_cache"
+TMP_ROOT="/tmp/hcpa_${OAR_JOB_ID}"
+
+mkdir -p "${LOG_DIR}" "${CACHE_ROOT}" "${TMP_ROOT}/mplconfig"
+
+echo "=========================================="
+echo "HCPA - pytorch_base (PyTorch x86)"
+echo "=========================================="
+echo "Job ID: ${OAR_JOB_ID}"
+echo "Architecture: x86_64"
+echo "Node: $(hostname)"
+echo "Start: $(date)"
+echo "=========================================="
+
+cd "${PROJ_DIR}"
+
+HOST_UID=$(id -u)
+HOST_GID=$(id -g)
+
+if ! docker images | grep -q "${IMAGE%:*}"; then
+    echo "Building Docker image for x86..."
+    docker build \
+        --build-arg UID=${HOST_UID} \
+        --build-arg GID=${HOST_GID} \
+        -t ${IMAGE} .
+fi
+
+nvidia-smi || echo "WARNING: nvidia-smi failed"
+
+echo "Starting PyTorch training..."
+
+docker run --gpus all --rm \
+    -v "${PROJ_DIR}:${CONT_WORKDIR}" \
+    -v "${TFREC_DIR}:${CONT_WORKDIR}/data/all-tfrec" \
+    --network host \
+    --ipc=host \
+    -e NCCL_DEBUG=WARN \
+    -e TORCH_DISTRIBUTED_DEBUG=OFF \
+    -e XDG_CACHE_HOME="${CACHE_ROOT}" \
+    -e HF_HOME="${CACHE_ROOT}/hf" \
+    -e TRANSFORMERS_CACHE="${CACHE_ROOT}/hf" \
+    -e TORCH_HOME="${CACHE_ROOT}/torch" \
+    -e TORCHINDUCTOR_CACHE_DIR="${CACHE_ROOT}/torchinductor" \
+    -e TRITON_CACHE_DIR="${CACHE_ROOT}/triton" \
+    -e TMPDIR="${TMP_ROOT}" \
+    -e MPLCONFIGDIR="${TMP_ROOT}/mplconfig" \
+    -u ${HOST_UID}:${HOST_GID} \
+    ${IMAGE} \
+    python3 ${CONT_WORKDIR}/dr_hcpa_v2_2024.py \
+        --batch_size 96 \
+        --epochs 100 \
+        --data_dir ${CONT_WORKDIR}/data/all-tfrec
+
+echo "=========================================="
+echo "Completed: $(date)"
+echo "=========================================="

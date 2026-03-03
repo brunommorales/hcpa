@@ -1,0 +1,774 @@
+# -*- coding: utf-8 -*-
+import os, io, re, time, argparse, json, math, struct, random
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")   # não usamos TF, mas evita spam se instalado
+os.environ.setdefault("KERAS_BACKEND", "torch")      # importante: backend PyTorch
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+from shutil import rmtree
+from os.path import exists, join
+
+# Keras 3 (multi-backend, aqui rodando sobre PyTorch)
+import keras
+from keras import layers
+
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch import amp
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+# TFRecord (protobufs p/ decodificar Example)
+from tfrecord import example_pb2
+
+from sklearn.metrics import roc_curve, auc, roc_auc_score
+from PIL import Image, ImageOps, ImageEnhance
+
+# ---------------------------
+# Args
+# ---------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="Treino Keras 3 (backend torch) com DDP e TFRecord")
+    p.add_argument('--tfrec_dir', type=str, default='./data/all', help='Diretório com TFRecords')
+    p.add_argument('--dataset', type=str, default='all', help='Nome lógico do dataset')
+    p.add_argument('--results', type=str, default='./results/all', help='Saída de resultados')
+    p.add_argument('--exec', type=int, default=0, help='ID de execução')
+    p.add_argument('--img_sizes', type=int, default=299, help='Tamanho das imagens')
+    p.add_argument('--batch_size', type=int, default=576, help='Batch global (será dividido por GPU)')
+    p.add_argument('--epochs', type=int, default=200, help='Épocas totais')
+    p.add_argument('--num_classes', type=int, default=2, help='N classes (binário=2)')
+    p.add_argument('--lrate', type=float, default=0.01, help='Learning rate (fase 1)')
+    p.add_argument('--num_thresholds', type=int, default=200, help='# thresholds p/ CSV ROC')
+    p.add_argument('--wait_epochs', type=int, default=30, help='Paciencia ReduceLROnPlateau')
+    p.add_argument('--verbose', type=int, default=1, help='Verbosity (apenas no rank 0)')
+    p.add_argument('--model', type=str, default='InceptionV3', help='Backbone Keras Applications')
+    p.add_argument('--cache_dir', type=str, default='', help='(ignoramos cache TFRecord nesta versão)')
+    p.add_argument('--freeze_epochs', type=int, default=3, help='Épocas com base congelada antes do fine-tune')
+    p.add_argument('--fine_tune_lr_factor', type=float, default=0.01, help='Fator aplicado ao LR ao liberar o backbone (ignorado se --fine_tune_lr > 0)')
+    p.add_argument('--fine_tune_lr', type=float, default=-1.0, help='Learning rate absoluto para fase 2 (se > 0 sobrepõe o fator)')
+    p.add_argument('--fine_tune_at', type=int, default=-64, help='Índice da camada para liberar o treino (negativo conta a partir do fim)')
+    p.add_argument('--freeze_bn', dest='freeze_bn', action='store_true', help='Mantém camadas BatchNorm congeladas durante o fine-tune')
+    p.add_argument('--no-freeze_bn', dest='freeze_bn', action='store_false', help='Libera BatchNorm durante o fine-tune')
+    p.set_defaults(freeze_bn=True)
+    p.add_argument('--grad_clip_norm', type=float, default=1.0, help='Norma máxima para clipping de gradiente (<=0 desativa)')
+    p.add_argument('--scheduler', type=str, default='cosine', choices=['cosine', 'plateau'],
+                   help='Agendador de LR para cada fase')
+    p.add_argument('--warmup_epochs', type=int, default=2, help='Épocas de aquecimento (apenas scheduler cosine)')
+    p.add_argument('--min_lr', type=float, default=1e-6, help='LR mínimo aplicado pelo scheduler')
+    p.add_argument('--mixup_alpha', type=float, default=0.2, help='Alpha da distribuição Beta do mixup (<=0 desativa)')
+    p.add_argument('--augment', dest='augment', action='store_true', help='Habilita augmentações no treino')
+    p.add_argument('--no-augment', dest='augment', action='store_false', help='Desabilita augmentações no treino')
+    p.set_defaults(augment=True)
+    p.add_argument('--fine_tune_schedule', type=str, default='',
+                   help='Agenda extra de liberação do backbone, formato epoch:layer[:bn]')
+    p.add_argument('--normalize', type=str, default='preprocess',
+                   choices=['preprocess','raw255','unit'],
+                   help='Esquema de normalização: preprocess (apps), raw255 (0..255), unit (0..1)')
+    return p.parse_args()
+
+# --- Normalização por backbone (visível nos workers do DataLoader) ---
+from keras import applications as _apps
+
+_PREPROCESS_MAP = {
+    'InceptionV3': _apps.inception_v3.preprocess_input,
+    'Xception': _apps.xception.preprocess_input,
+    'EfficientNetB0': _apps.efficientnet.preprocess_input,
+    'EfficientNetB1': _apps.efficientnet.preprocess_input,
+    'EfficientNetB2': _apps.efficientnet.preprocess_input,
+    'EfficientNetB3': _apps.efficientnet.preprocess_input,
+    'EfficientNetB4': _apps.efficientnet.preprocess_input,
+    'EfficientNetB5': _apps.efficientnet.preprocess_input,
+    'EfficientNetB6': _apps.efficientnet.preprocess_input,
+    'EfficientNetB7': _apps.efficientnet.preprocess_input,
+    'ResNet50': _apps.resnet.preprocess_input,
+    'ResNet101': _apps.resnet.preprocess_input,
+    'ResNet152': _apps.resnet.preprocess_input,
+    'ResNet50V2': _apps.resnet_v2.preprocess_input,
+    'ResNet101V2': _apps.resnet_v2.preprocess_input,
+    'ResNet152V2': _apps.resnet_v2.preprocess_input,
+    'VGG16': _apps.vgg16.preprocess_input,
+    'VGG19': _apps.vgg19.preprocess_input,
+    'DenseNet121': _apps.densenet.preprocess_input,
+    'DenseNet169': _apps.densenet.preprocess_input,
+    'DenseNet201': _apps.densenet.preprocess_input,
+    'MobileNet': _apps.mobilenet.preprocess_input,
+    'MobileNetV2': _apps.mobilenet_v2.preprocess_input,
+    'MobileNetV3Small': _apps.mobilenet_v3.preprocess_input,
+    'MobileNetV3Large': _apps.mobilenet_v3.preprocess_input,
+    'NASNetMobile': _apps.nasnet.preprocess_input,
+    'NASNetLarge': _apps.nasnet.preprocess_input,
+    'ConvNeXtTiny': _apps.convnext.preprocess_input,
+    'ConvNeXtSmall': _apps.convnext.preprocess_input,
+    'ConvNeXtBase': _apps.convnext.preprocess_input,
+    'ConvNeXtLarge': _apps.convnext.preprocess_input,
+    'ConvNeXtXLarge': _apps.convnext.preprocess_input,
+}
+
+def get_preprocess_fn(model_name: str):
+    return _PREPROCESS_MAP.get(model_name, None)
+
+# ---------------------------
+# TFRecord loader (PyTorch) — leitor por offsets do .idx
+# ---------------------------
+class RetinaTFRecord(Dataset):
+    """
+    Lê TFRecord com chaves:
+      - "imagem": bytes JPEG
+      - "retinopatia": int (0/1)
+    Implementa Dataset indexável usando offsets armazenados nos arquivos .idx.
+    """
+    def __init__(self, tfrecord_paths, index_paths, img_size=299,
+                 model_name='InceptionV3', normalize_mode='preprocess',
+                 augment=False):
+        if len(tfrecord_paths) != len(index_paths):
+            raise ValueError("Listas de TFRecords e índices possuem tamanhos distintos.")
+
+        self.img_size = img_size
+        self.normalize_mode = normalize_mode
+        self.pre_fn = get_preprocess_fn(model_name) if normalize_mode == 'preprocess' else None
+        self.augment = augment
+        self._entries = []         # lista de tuplas (path, offset)
+        self._file_handles = {}    # cache de file handles
+
+        for tf_path, idx_path in zip(tfrecord_paths, index_paths):
+            tf_path = Path(tf_path)
+            idx_path = Path(idx_path)
+
+            if not tf_path.exists():
+                raise FileNotFoundError(f"TFRecord ausente: {tf_path}")
+            if not idx_path.exists():
+                raise FileNotFoundError(f"Arquivo .idx ausente: {idx_path}")
+
+            offsets = np.loadtxt(str(idx_path), dtype=np.int64, usecols=0, ndmin=1)
+            offsets = np.atleast_1d(offsets).astype(np.int64).tolist()
+            for off in offsets:
+                self._entries.append((tf_path, int(off)))
+
+        if len(self._entries) == 0:
+            raise RuntimeError("Nenhuma entrada encontrada no conjunto de TFRecords/idx.")
+
+    def _apply_augmentations(self, img: Image.Image) -> Image.Image:
+        if not self.augment:
+            return img
+        if random.random() < 0.5:
+            img = ImageOps.mirror(img)
+        if random.random() < 0.15:
+            img = ImageOps.flip(img)
+        if random.random() < 0.3:
+            angle = random.uniform(-15.0, 15.0)
+            img = img.rotate(angle, resample=Image.BILINEAR)
+        if random.random() < 0.35:
+            img = ImageEnhance.Brightness(img).enhance(random.uniform(0.85, 1.15))
+        if random.random() < 0.35:
+            img = ImageEnhance.Contrast(img).enhance(random.uniform(0.85, 1.15))
+        if random.random() < 0.3:
+            img = ImageEnhance.Color(img).enhance(random.uniform(0.85, 1.15))
+        return img
+
+    def __len__(self):
+        return len(self._entries)
+
+    def _open(self, path: Path):
+        p = str(path)
+        fh = self._file_handles.get(p)
+        if fh is None:
+            fh = open(p, "rb")
+            self._file_handles[p] = fh
+        return fh
+
+    def _read_record_at(self, tf_path: Path, offset: int) -> bytes:
+        fh = self._open(tf_path)
+        fh.seek(offset)
+        length_bytes = fh.read(8)
+        if len(length_bytes) != 8:
+            raise EOFError(f"Offset inválido: {offset}")
+        length = struct.unpack('<Q', length_bytes)[0]
+        _ = fh.read(4)     # crc len
+        data = fh.read(length)
+        _ = fh.read(4)     # crc data
+        return data
+
+    def __getitem__(self, idx):
+        tf_path, offset = self._entries[idx]
+        data = self._read_record_at(tf_path, offset)
+        ex = example_pb2.Example()
+        ex.ParseFromString(data)
+
+        feats = ex.features.feature
+        if ("imagem" not in feats) or ("retinopatia" not in feats):
+            raise KeyError("TFRecord não contém as chaves esperadas 'imagem'/'retinopatia'.")
+
+        img_bytes = feats["imagem"].bytes_list.value[0]
+        label = int(feats["retinopatia"].int64_list.value[0])
+
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        if self.img_size and img.size != (self.img_size, self.img_size):
+            img = img.resize((self.img_size, self.img_size), Image.BILINEAR)
+
+        img = self._apply_augmentations(img)
+
+        x = np.asarray(img, dtype=np.float32)  # [H,W,C], 0..255
+        # Normalização escolhida:
+        if self.normalize_mode == 'preprocess' and self.pre_fn is not None:
+            x = self.pre_fn(x)                  # [-1,1] ou caffe-mode (depende do backbone)
+        elif self.normalize_mode == 'unit':
+            x = x / 255.0                       # 0..1 (não recomendado p/ weights ImageNet)
+        # raw255: mantém 0..255
+
+        # Importantíssimo: manter NHWC (channels_last) p/ Keras Applications
+        x = torch.from_numpy(x).contiguous()
+        y = torch.tensor(label, dtype=torch.long)
+        return x, y
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_file_handles"] = {}
+        return state
+
+    def __del__(self):
+        try:
+            for fh in self._file_handles.values():
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+# ---------------------------
+# Modelo (Keras 3 sobre torch)
+# ---------------------------
+def create_backbone(model_name: str, input_shape):
+    """
+    Usa keras.applications (compatível com Keras 3) para criar o backbone sem topo.
+    """
+    apps = keras.applications
+    factory = {
+        'Xception': apps.Xception,
+        'VGG16': apps.VGG16, 'VGG19': apps.VGG19,
+        'ResNet50': apps.ResNet50, 'ResNet50V2': apps.ResNet50V2,
+        'ResNet101': apps.ResNet101, 'ResNet101V2': apps.ResNet101V2,
+        'ResNet152': apps.ResNet152, 'ResNet152V2': apps.ResNet152V2,
+        'InceptionV3': apps.InceptionV3, 'InceptionResNetV2': apps.InceptionResNetV2,
+        'MobileNet': apps.MobileNet, 'MobileNetV2': apps.MobileNetV2,
+        'MobileNetV3Small': apps.MobileNetV3Small, 'MobileNetV3Large': apps.MobileNetV3Large,
+        'DenseNet121': apps.DenseNet121, 'DenseNet169': apps.DenseNet169, 'DenseNet201': apps.DenseNet201,
+        'NASNetMobile': apps.NASNetMobile, 'NASNetLarge': apps.NASNetLarge,
+        'EfficientNetB0': apps.EfficientNetB0, 'EfficientNetB1': apps.EfficientNetB1,
+        'EfficientNetB2': apps.EfficientNetB2, 'EfficientNetB3': apps.EfficientNetB3,
+        'EfficientNetB4': apps.EfficientNetB4, 'EfficientNetB5': apps.EfficientNetB5,
+        'EfficientNetB6': apps.EfficientNetB6, 'EfficientNetB7': apps.EfficientNetB7,
+        'ConvNeXtTiny': apps.ConvNeXtTiny, 'ConvNeXtSmall': apps.ConvNeXtSmall,
+        'ConvNeXtBase': apps.ConvNeXtBase, 'ConvNeXtLarge': apps.ConvNeXtLarge, 'ConvNeXtXLarge': apps.ConvNeXtXLarge,
+    }
+    if model_name not in factory:
+        raise ValueError(f"Backbone desconhecido: {model_name}")
+
+    # Keras 3 (backend torch) aceita NHWC; input_shape=(H,W,C)
+    inputs = keras.Input(shape=input_shape)
+    base = factory[model_name](weights="imagenet", include_top=False, input_tensor=inputs)
+    x = layers.GlobalAveragePooling2D()(base.output)
+    # Saída BINÁRIA: 1 logit (sem ativação) → usaremos BCEWithLogitsLoss
+    outputs = layers.Dense(1, activation=None, dtype="float32")(x)
+    model = keras.Model(inputs, outputs)
+    model.base_model = base
+    return model
+
+def set_trainable_from(model, idx_start: int):
+    """Habilita treino a partir de idx_start no backbone; anterior fica congelado"""
+    base = model.base_model
+    for i, layer in enumerate(base.layers):
+        layer.trainable = (i >= idx_start)
+
+def set_all_trainable(model, flag: bool):
+    base = model.base_model
+    for layer in base.layers:
+        layer.trainable = flag
+
+def freeze_batchnorm_layers(model):
+    """Congela camadas BatchNorm para preservar estatísticas."""
+    for layer in model.base_model.layers:
+        if isinstance(layer, layers.BatchNormalization):
+            layer.trainable = False
+
+def unfreeze_batchnorm_layers(model):
+    """Libera camadas BatchNorm."""
+    for layer in model.base_model.layers:
+        if isinstance(layer, layers.BatchNormalization):
+            layer.trainable = True
+
+def set_optimizer_lr(opt, lr: float):
+    for group in opt.param_groups:
+        group["lr"] = lr
+
+def cosine_lr(base_lr: float, min_lr: float, epoch_idx: int, total_epochs: int, warmup_epochs: int) -> float:
+    if total_epochs <= 0:
+        return base_lr
+    if warmup_epochs > 0 and epoch_idx < warmup_epochs:
+        scaled = base_lr * float(epoch_idx + 1) / float(max(1, warmup_epochs))
+        return max(min_lr, scaled)
+    if total_epochs <= warmup_epochs:
+        return max(min_lr, base_lr)
+    progress = float(epoch_idx - warmup_epochs) / float(max(1, total_epochs - warmup_epochs))
+    progress = min(max(progress, 0.0), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr + (base_lr - min_lr) * cosine
+
+def parameters_of_trainable(model):
+    """Retorna iterável de parâmetros treináveis como **torch.Tensor** (Keras 3 backend torch).
+    Torch optimizers exigem `torch.Tensor` leaf com `requires_grad=True`. As variáveis
+    do Keras (keras.backend.Variable) expõem o tensor PyTorch em `value`.
+    """
+    import torch as _torch
+    for w in model.weights:
+        if not getattr(w, "trainable", False):
+            continue
+        t = getattr(w, "value", None)
+        if isinstance(t, _torch.Tensor):
+            if not t.requires_grad:
+                t.requires_grad = True
+            yield t
+        elif isinstance(w, _torch.Tensor):
+            if not w.requires_grad:
+                w.requires_grad = True
+            yield w
+        # outros backends não são suportados neste loop PyTorch
+
+
+def print_trainables(model, label="freeze"):
+    layers = [layer.name for layer in model.base_model.layers if layer.trainable]
+    header = f"[{label}] camadas treináveis no backbone:"
+    if not layers:
+        print(f"{header} nenhuma")
+        return
+    preview = ", ".join(layers[:10])
+    suffix = "" if len(layers) <= 10 else ", ..."
+    print(f"{header} {len(layers)} ({preview}{suffix})")
+
+def _format_shape(shape):
+    if shape is None:
+        return "?"
+    if isinstance(shape, (list, tuple)):
+        return "x".join(str(s) for s in shape)
+    return str(shape)
+
+def parse_fine_tune_schedule(schedule: str):
+    events = []
+    if not schedule:
+        return events
+    for token in schedule.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        parts = token.split(":")
+        if len(parts) < 2:
+            raise ValueError(f"Entrada inválida na agenda: '{token}' (esperado epoch:layer[:bn])")
+        epoch = int(parts[0])
+        layer_idx = int(parts[1])
+        bn_flag = None
+        if len(parts) >= 3:
+            flag = parts[2].strip().lower()
+            if flag in ("freeze_bn", "bn_freeze", "freeze"):
+                bn_flag = True
+            elif flag in ("unfreeze_bn", "bn_unfreeze", "unfreeze"):
+                bn_flag = False
+            elif flag in ("keep", "auto"):
+                bn_flag = None
+            else:
+                raise ValueError(f"Flag BN desconhecida '{parts[2]}' em '{token}'")
+        events.append((epoch, layer_idx, bn_flag))
+    events.sort(key=lambda x: x[0])
+    return events
+
+# ---------------------------
+# Main
+# ---------------------------
+def main():
+    args = parse_args()
+
+    IMG = int(args.img_sizes)
+    GLOBAL_BS = int(args.batch_size)
+    EPOCHS = int(args.epochs)
+    NUM_CLASSES = int(args.num_classes)
+    LR1 = float(args.lrate)
+    LR2_OVERRIDE = float(args.fine_tune_lr)
+    LR2_FACTOR = float(args.fine_tune_lr_factor)
+    GRAD_CLIP = max(0.0, float(args.grad_clip_norm))
+    WAIT = int(args.wait_epochs)
+    FINE_TUNE_AT = int(args.fine_tune_at)
+    VERBOSE = args.verbose
+    MODEL_NAME = args.model
+    SCHEDULER = args.scheduler.lower()
+    WARMUP = max(0, int(args.warmup_epochs))
+    MIN_LR = max(1e-8, float(args.min_lr))
+    MIXUP_ALPHA = max(0.0, float(args.mixup_alpha))
+
+    IMAGE_SIZE = (IMG, IMG, 3)
+
+    # rank & device
+    if not dist.is_initialized():
+        if "RANK" in os.environ:
+            dist.init_process_group(backend="nccl")
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank if torch.cuda.is_available() else 0)
+    device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
+
+    assert GLOBAL_BS % max(world_size,1) == 0, f"batch_size ({GLOBAL_BS}) deve ser múltiplo de world_size ({world_size})"
+    LOCAL_BS = GLOBAL_BS // max(world_size,1)
+
+    dataset_name = f"{args.dataset}"
+    results = Path(args.results)
+    results.mkdir(parents=True, exist_ok=True)
+    exec_id = int(args.exec)
+
+    # listar TFRecords e idx
+    tfrec_dir = Path(args.tfrec_dir)
+    train_paths = sorted(tfrec_dir.glob("train*.tfrec"))
+    valid_paths = (
+    sorted(tfrec_dir.glob("test*.tfrec")) +
+    sorted(tfrec_dir.glob("val*.tfrec")) + 
+    sorted(tfrec_dir.glob("valid*.tfrec"))
+    )
+    # train_idx = [p.with_suffix(".idx") for p in train_paths]
+    # valid_idx = [p.with_suffix(".idx") for p in valid_paths]
+
+    def infer_idx(p):
+    # tenta .../train00-100.idx (antigo)
+        cand1 = p.with_suffix(".idx")
+    # tenta .../train00-100.tfrec.idx (o que você tem)
+        cand2 = Path(str(p) + ".idx")
+        return cand2 if cand2.exists() else cand1
+
+    train_idx = [infer_idx(p) for p in train_paths]
+    valid_idx = [infer_idx(p) for p in valid_paths]
+
+
+    if rank == 0:
+        print(f"Encontrados {len(train_paths)} TFRecords de treino e {len(valid_paths)} de validação.")
+
+    # datasets
+    train_ds = RetinaTFRecord([str(p) for p in train_paths], [str(p) for p in train_idx],
+                              img_size=IMG, model_name=MODEL_NAME, normalize_mode=args.normalize,
+                              augment=args.augment)
+    valid_ds = RetinaTFRecord([str(p) for p in valid_paths], [str(p) for p in valid_idx],
+                              img_size=IMG, model_name=MODEL_NAME, normalize_mode=args.normalize,
+                              augment=False)
+
+    # samplers (shard por processo)
+    train_sampler = DistributedSampler(train_ds, shuffle=True) if world_size > 1 else None
+    valid_sampler = DistributedSampler(valid_ds, shuffle=False) if world_size > 1 else None
+
+    # dataloaders
+    train_loader = DataLoader(train_ds, batch_size=LOCAL_BS, sampler=train_sampler,
+                              shuffle=(train_sampler is None),
+                              num_workers=8, pin_memory=True, drop_last=False)
+    valid_loader = DataLoader(valid_ds, batch_size=LOCAL_BS, sampler=valid_sampler,
+                              shuffle=False, num_workers=8, pin_memory=True, drop_last=False)
+
+    # modelo
+    model = create_backbone(MODEL_NAME, IMAGE_SIZE)
+
+    # Fase 1: congelado (mover summary depois do freeze)
+    set_all_trainable(model, False)
+    if rank == 0 and VERBOSE:
+        model.summary()
+        desc = f"Input: {_format_shape(IMAGE_SIZE)} | Output: {_format_shape(model.output_shape)}"
+        print(desc)
+
+    print_trainables(model, label="freeze")
+    if torch.cuda.is_available():
+        amp_device_type = "cuda"
+    else:
+        amp_device_type = "cpu"
+
+    ddp_model = model.to(device)
+    if world_size > 1:
+        ddp_model = DDP(ddp_model, device_ids=[local_rank] if torch.cuda.is_available() else None)
+    core_model = ddp_model.module if isinstance(ddp_model, DDP) else ddp_model
+
+    # Otimizador/Fase 1 (só cabeça)
+    opt = torch.optim.Adam(
+        parameters_of_trainable(core_model),
+        lr=LR1, betas=(0.9, 0.999), eps=1e-7
+    )
+    loss_fn = torch.nn.BCEWithLogitsLoss()
+    scaler = amp.GradScaler(amp_device_type, enabled=(amp_device_type == "cuda"))
+    scheduler = ReduceLROnPlateau(opt, mode="max", factor=0.2, patience=WAIT, min_lr=MIN_LR) if SCHEDULER == "plateau" else None
+
+    t0 = time.time()
+    best_val_auc = -1.0
+    ckpt_path = join(results, f"{MODEL_NAME}-{exec_id}.pt")
+    best_keras_path = join(results, f"{MODEL_NAME}-{exec_id}-best.keras")
+    try:
+        schedule_events = parse_fine_tune_schedule(args.fine_tune_schedule)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+
+    def run_epoch(loader, train: bool, epoch: int):
+        if train and isinstance(loader.sampler, DistributedSampler):
+            loader.sampler.set_epoch(epoch)
+        running_loss = 0.0
+        n_samples = 0
+
+        if train:
+            ddp_model.train()
+        else:
+            ddp_model.eval()
+
+        t_start = time.time()
+        all_probs = []
+        all_labels = []
+
+        for xb, yb in loader:
+            xb = xb.to(device, non_blocking=True)      # [B,H,W,C]
+            yb = yb.to(device, non_blocking=True).float()
+
+            if train and MIXUP_ALPHA > 0.0 and xb.shape[0] > 1:
+                lam = np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA)
+                perm = torch.randperm(xb.size(0), device=xb.device)
+                xb = lam * xb + (1.0 - lam) * xb[perm]
+                yb = lam * yb + (1.0 - lam) * yb[perm]
+
+            # forward
+            with torch.set_grad_enabled(train):
+                with amp.autocast(device_type=amp_device_type, enabled=(amp_device_type == "cuda")):
+                    logits = ddp_model(xb)  # shape [B,1]
+                    loss = loss_fn(logits.squeeze(1), yb)
+
+                if train:
+                    scaler.scale(loss).backward()
+                    if GRAD_CLIP > 0:
+                        scaler.unscale_(opt)
+                        params_to_clip = []
+                        for group in opt.param_groups:
+                            params_to_clip.extend(
+                                [p for p in group["params"] if p.grad is not None]
+                            )
+                        if params_to_clip:
+                            torch.nn.utils.clip_grad_norm_(params_to_clip, GRAD_CLIP)
+                    scaler.step(opt)
+                    scaler.update()
+                    opt.zero_grad(set_to_none=True)
+
+            running_loss += loss.item() * xb.shape[0]
+            n_samples += xb.shape[0]
+
+            # probs p/ AUC (fora do grad)
+            with torch.no_grad():
+                probs = torch.sigmoid(logits).squeeze(1)
+                all_probs.append(probs.detach().cpu())
+                all_labels.append(yb.detach().cpu())
+
+        # concat
+        all_probs = torch.cat(all_probs, dim=0)
+        all_labels = torch.cat(all_labels, dim=0)
+
+        # (opcional) Em DDP, poderíamos fazer all_gather_object para juntar, mas para 1 GPU está ok.
+        epoch_loss = running_loss / max(n_samples, 1)
+        # AUC local
+        try:
+            auc_val = roc_auc_score(all_labels.numpy(), all_probs.numpy())
+        except Exception:
+            auc_val = float('nan')
+
+        elapsed = time.time() - t_start
+        imgs_per_s = n_samples / elapsed if elapsed > 0 else 0.0
+        return epoch_loss, (auc_val, imgs_per_s, elapsed)
+
+    # Fase 1 — treino congelado
+    for epoch in range(args.freeze_epochs):
+        if SCHEDULER == "cosine":
+            current_lr = cosine_lr(LR1, MIN_LR, epoch, args.freeze_epochs, WARMUP)
+            set_optimizer_lr(opt, current_lr)
+        else:
+            current_lr = opt.param_groups[0]["lr"]
+
+        train_loss, (_, thpt, elap) = run_epoch(train_loader, train=True, epoch=epoch)
+        _, (val_auc, thpt_v, elap_v) = run_epoch(valid_loader, train=False, epoch=epoch)
+        if rank == 0:
+            print(f"[E{epoch}/{EPOCHS}] freeze: loss={train_loss:.4f}  valAUC={val_auc:.6f}  lr={current_lr:.2e}  thr={thpt:.1f} img/s")
+
+        if scheduler is not None:
+            scheduler.step(val_auc)
+        if (rank == 0) and (val_auc > best_val_auc):
+            best_val_auc = val_auc
+            torch.save(core_model.state_dict(), ckpt_path)
+            keras.models.save_model(core_model, best_keras_path, include_optimizer=False)
+
+    # Fase 2 — liberar backbone (parcial ou total)
+    total_layers = len(core_model.base_model.layers)
+    def resolve_ft_index(idx: int) -> int:
+        if total_layers == 0:
+            return 0
+        if idx < 0:
+            return max(total_layers + idx, 0)
+        return idx
+
+    def apply_trainable_index(idx: int):
+        if total_layers == 0:
+            set_all_trainable(core_model, True)
+        elif idx <= 0:
+            set_all_trainable(core_model, True)
+        elif idx >= total_layers:
+            set_all_trainable(core_model, False)
+        else:
+            set_trainable_from(core_model, idx)
+
+    current_ft_start = resolve_ft_index(FINE_TUNE_AT)
+    current_freeze_bn = bool(args.freeze_bn)
+
+    def apply_finetune_settings(start_idx=None, freeze_bn_flag=None, announce=False):
+        nonlocal current_ft_start, current_freeze_bn
+        if start_idx is not None:
+            resolved = resolve_ft_index(start_idx)
+            current_ft_start = resolved
+            apply_trainable_index(resolved)
+        if freeze_bn_flag is not None:
+            current_freeze_bn = bool(freeze_bn_flag)
+        if current_freeze_bn:
+            freeze_batchnorm_layers(core_model)
+        else:
+            unfreeze_batchnorm_layers(core_model)
+        if announce:
+            trainable_layers = [layer for layer in core_model.base_model.layers if layer.trainable]
+            if rank == 0:
+                print(f"[finetune-setup] start_layer={current_ft_start}  trainable_layers={len(trainable_layers)}/{total_layers}  freeze_bn={current_freeze_bn}")
+            print_trainables(core_model, label="finetune")
+
+    apply_finetune_settings(start_idx=current_ft_start, freeze_bn_flag=current_freeze_bn, announce=False)
+
+    LR2 = LR2_OVERRIDE if LR2_OVERRIDE > 0 else LR1 * LR2_FACTOR
+    trainable_layers = [layer for layer in core_model.base_model.layers if layer.trainable]
+    if rank == 0:
+        print(f"[fine-tune] lr={LR2:.4e}  trainable_layers={len(trainable_layers)}/{total_layers}  start_layer={current_ft_start}  freeze_bn={current_freeze_bn}")
+
+    print_trainables(core_model, label="finetune")
+
+    def build_finetune_optimizer(lr_value: float):
+        optimizer = torch.optim.Adam(
+            parameters_of_trainable(core_model),
+            lr=lr_value, betas=(0.9, 0.999), eps=1e-7
+        )
+        optimizer.zero_grad(set_to_none=True)
+        return optimizer
+
+    opt = build_finetune_optimizer(LR2)
+    scheduler = ReduceLROnPlateau(opt, mode="max", factor=0.2, patience=WAIT, min_lr=MIN_LR) if SCHEDULER == "plateau" else None
+    schedule_ptr = 0
+
+    def maybe_update_schedule(epoch: int):
+        nonlocal opt, scheduler, schedule_ptr
+        updated = False
+        while schedule_ptr < len(schedule_events) and schedule_events[schedule_ptr][0] <= epoch:
+            _, layer_idx, bn_flag = schedule_events[schedule_ptr]
+            apply_finetune_settings(start_idx=layer_idx, freeze_bn_flag=bn_flag, announce=True)
+            updated = True
+            schedule_ptr += 1
+        if updated:
+            opt = build_finetune_optimizer(LR2)
+            if SCHEDULER == "plateau":
+                scheduler = ReduceLROnPlateau(opt, mode="max", factor=0.2, patience=WAIT, min_lr=MIN_LR)
+        return updated
+
+    ft_total_epochs = max(EPOCHS - args.freeze_epochs, 1)
+
+    for epoch in range(args.freeze_epochs, EPOCHS):
+        maybe_update_schedule(epoch)
+        phase_epoch = epoch - args.freeze_epochs
+        if SCHEDULER == "cosine":
+            current_lr = cosine_lr(LR2, MIN_LR, phase_epoch, ft_total_epochs, WARMUP)
+            set_optimizer_lr(opt, current_lr)
+        else:
+            current_lr = opt.param_groups[0]["lr"]
+
+        train_loss, (_, thpt, elap) = run_epoch(train_loader, train=True, epoch=epoch)
+        _, (val_auc, thpt_v, elap_v) = run_epoch(valid_loader, train=False, epoch=epoch)
+        if rank == 0:
+            print(f"[E{epoch}/{EPOCHS}] finetune: loss={train_loss:.4f}  valAUC={val_auc:.6f}  lr={current_lr:.2e}  thr={thpt:.1f} img/s")
+
+        if scheduler is not None:
+            scheduler.step(val_auc)
+        if (rank == 0) and (val_auc > best_val_auc):
+            best_val_auc = val_auc
+            torch.save(core_model.state_dict(), ckpt_path)
+            keras.models.save_model(core_model, best_keras_path, include_optimizer=False)
+
+    if rank == 0:
+        # carrega melhor modelo salvo durante o treino
+        final_model = None
+        if os.path.exists(best_keras_path):
+            try:
+                final_model = keras.models.load_model(best_keras_path)
+                final_model = final_model.to(device)
+            except Exception as exc:
+                print(f"[WARN] falha ao carregar {best_keras_path}: {exc}")
+
+        if final_model is None:
+            print("[WARN] fallback para checkpoint .pt (sem garantia de incluir todas as camadas).")
+            final_model = create_backbone(MODEL_NAME, IMAGE_SIZE).to(device)
+            if os.path.exists(ckpt_path):
+                try:
+                    sd = torch.load(ckpt_path, map_location=device, weights_only=True)
+                except TypeError:
+                    sd = torch.load(ckpt_path, map_location=device)
+                missing, unexpected = final_model.load_state_dict(sd, strict=False)
+                if missing or unexpected:
+                    print(f"[WARN] state_dict mismatch. missing={missing}, unexpected={unexpected}")
+            else:
+                print("[WARN] checkpoint não encontrado para avaliação final.")
+
+        # avaliação final ROC AUC (CPU)
+        final_model.eval()
+        y_true = []
+        y_score = []
+        with torch.no_grad():
+            for xb, yb in valid_loader:
+                xb = xb.to(device)
+                logits = final_model(xb)
+                probs = torch.sigmoid(logits).squeeze(1).cpu().numpy()
+                y_score.append(probs)
+                y_true.append(yb.numpy())
+        y_true = np.concatenate(y_true)
+        y_score = np.concatenate(y_score)
+        auc_val = roc_auc_score(y_true, y_score)
+        fpr, tpr, thresholds = roc_curve(y_true, y_score)
+
+        thresholds_df = pd.DataFrame({
+            "thresholds": thresholds,
+            "tpr": tpr,
+            "fpr": fpr,
+        })
+        thresholds_df["sens"] = thresholds_df["tpr"]
+        thresholds_df["spec"] = 1.0 - thresholds_df["fpr"]
+        thresholds_path = results / f"{dataset_name}-{exec_id}-thresholds.csv"
+        thresholds_df.to_csv(thresholds_path, index=False, encoding="utf-8")
+
+        plt.figure()
+        plt.plot([0, 1], [0, 1], "k--")
+        plt.plot(fpr, tpr, label=f"AUC = {auc_val:.4f}")
+        plt.xlabel("False positive rate")
+        plt.ylabel("True positive rate")
+        plt.title("ROC curve")
+        plt.legend(loc="best")
+        pdf_path = results / f"{dataset_name}-{exec_id}.pdf"
+        plt.savefig(pdf_path, format="pdf", bbox_inches="tight")
+        plt.close()
+
+        # salvar em formato .keras (Keras 3 salva pesos/arquitetura cross-backend)
+        keras.models.save_model(final_model, join(results, f"{dataset_name}-{exec_id}.keras"))
+
+        print(f"Valid AUC: {auc_val:.4f}")
+        print(f"{dataset_name},{exec_id},AUC={auc_val:.6f},elapsed={round(time.time()-t0,1)}s")
+
+    # limpeza DDP
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
+
+if __name__ == "__main__":
+    main()

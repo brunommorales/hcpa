@@ -1,0 +1,16 @@
+absl-py
+crc32c
+google-crc32c
+h5py
+Jinja2
+joblib
+keras>=3.11
+matplotlib
+numpy
+pandas
+pillow
+rich
+scikit-learn
+scipy
+tfrecord
+typing_extensions
