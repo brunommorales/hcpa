@@ -70,6 +70,10 @@ venv.bak/
 # ---- Accidental / stray files ----
 =0.9,
 
+# ---- Core dumps ----
+core
+**/core
+
 # ---- Python standard ignores ----
 __pycache__/
 *.py[cod]
