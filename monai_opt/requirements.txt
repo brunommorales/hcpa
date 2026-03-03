@@ -1,0 +1,28 @@
+# Core
+numpy<2
+pandas
+scikit-learn
+opencv-python-headless
+pillow
+matplotlib
+rich
+psutil
+
+# PyTorch / MONAI stack
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch
+torchvision
+monai
+# optional performant backend (install manually if needed)
+# nvidia-dali-cuda120  # from https://developer.download.nvidia.com/compute/redist
+
+# Models
+timm
+
+# TFRecord reader
+crc32c
+google-crc32c
+tfrecord
+
+# Typing
+typing_extensions

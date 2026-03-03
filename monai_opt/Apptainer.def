@@ -1,0 +1,34 @@
+# Apptainer definition for monai_opt (PyTorch/MONAI)
+# Optional DALI install: build with `WITH_DALI=1 apptainer build ...`
+
+Bootstrap: docker
+From: nvcr.io/nvidia/pytorch:24.12-py3
+
+%labels
+    Maintainer bmmorales
+    App monai_opt
+
+%files
+    requirements.txt /tmp/requirements.txt
+
+%post
+    set -eux
+    python -m pip install --upgrade pip
+    python -m pip install -r /tmp/requirements.txt
+    if [ "${WITH_DALI:-0}" = "1" ]; then
+        python -m pip install --extra-index-url https://developer.download.nvidia.com/compute/redist nvidia-dali-cuda120
+    fi
+    rm -rf /root/.cache/pip
+    mkdir -p /workspace
+    chmod 777 /workspace
+
+%environment
+    export PYTHONPATH=/workspace
+    export TF_CPP_MIN_LOG_LEVEL=1
+    export TORCH_HOME=/workspace/.cache/torch
+    export TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/inductor
+    export TRANSFORMERS_CACHE=/workspace/.cache/hf
+    export HF_HOME=/workspace/.cache/hf
+
+%runscript
+    exec /bin/bash "$@"
