@@ -40,6 +40,16 @@ tfdata_cache/
 __pycache__/
 .ipynb_checkpoints/
 
+# ---- Model weights / checkpoints ----
+*.h5
+*.hdf5
+*.pth
+*.ckpt
+*.ckpt.*
+*.keras/
+.keras/
+checkpoints/
+
 # ---- Virtual environments ----
 .venv/
 .env/

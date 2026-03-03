@@ -1,0 +1,39 @@
+# Apptainer definition generated from tensorflow_opt/Dockerfile
+# Build hint: export SINGULARITY_DOCKER_USERNAME=$oauthtoken and SINGULARITY_DOCKER_PASSWORD=<NGC_API_KEY> before `apptainer build --fakeroot tensorflow_opt_tf.sif Apptainer.def`
+
+Bootstrap: docker
+From: nvcr.io/nvidia/tensorflow:25.02-tf2-py3
+
+%labels
+    Maintainer bmmorales
+    App tensorflow_opt_tf
+
+%files
+    requirements /tmp/requirements.txt
+
+%post
+    set -eux
+    python -m pip install --upgrade pip
+    if [ -f /etc/pip/constraint.txt ]; then
+        python -m pip install -r /tmp/requirements.txt -c /etc/pip/constraint.txt
+        python -m pip install --extra-index-url https://developer.download.nvidia.com/compute/redist \
+            -c /etc/pip/constraint.txt \
+            nvidia-dali-cuda120 \
+            nvidia-dali-tf-plugin-cuda120
+    else
+        python -m pip install -r /tmp/requirements.txt
+        python -m pip install --extra-index-url https://developer.download.nvidia.com/compute/redist \
+            nvidia-dali-cuda120 \
+            nvidia-dali-tf-plugin-cuda120
+    fi
+    rm -rf /root/.cache/pip
+    mkdir -p /workspace
+    chmod 777 /workspace
+
+%environment
+    export KERAS_BACKEND=tensorflow
+    export TF_CPP_MIN_LOG_LEVEL=1
+    export TF_GPU_ALLOCATOR=cuda_malloc_async
+
+%runscript
+    exec /bin/bash "$@"
