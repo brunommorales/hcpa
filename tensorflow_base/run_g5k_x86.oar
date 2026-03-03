@@ -1,0 +1,57 @@
+#!/bin/bash
+#OAR -n hcpa_clean_tf_x86
+#OAR -l nodes=1,walltime=4:00:00
+#OAR -p cluster='sirius' or cluster='gemini'
+#OAR -t exotic
+#OAR -O logs/g5k_clean_tf_%jobid%.stdout
+#OAR -E logs/g5k_clean_tf_%jobid%.stderr
+
+###############################################################################
+# Script OAR - tensorflow_base (TensorFlow) - x86_64
+# Clusters: Sirius (A100) ou Gemini (V100)
+###############################################################################
+
+set -euxo pipefail
+
+IMAGE="tf_distributed_x86:latest"
+PROJ_DIR="$HOME/projects/hcpa/tensorflow_base"
+TFREC_DIR="${PROJ_DIR}/data/all-tfrec"
+CONT_WORKDIR="/workspace"
+LOG_DIR="${PROJ_DIR}/logs"
+
+mkdir -p "${LOG_DIR}"
+
+echo "=========================================="
+echo "HCPA - tensorflow_base (TensorFlow x86)"
+echo "=========================================="
+echo "Job ID: ${OAR_JOB_ID}"
+echo "Architecture: x86_64"
+echo "Node: $(hostname)"
+echo "Start: $(date)"
+echo "=========================================="
+
+cd "${PROJ_DIR}"
+
+if ! docker images | grep -q "${IMAGE%:*}"; then
+    echo "Building Docker image for x86..."
+    docker build -t ${IMAGE} .
+fi
+
+nvidia-smi || echo "WARNING: nvidia-smi failed"
+
+echo "Starting TensorFlow training..."
+
+docker run --gpus all --rm \
+    -v "${PROJ_DIR}:${CONT_WORKDIR}" \
+    -v "${TFREC_DIR}:${CONT_WORKDIR}/data/all-tfrec" \
+    --network host \
+    --ipc=host \
+    ${IMAGE} \
+    python3 ${CONT_WORKDIR}/dr_hcpa_v2_2024.py \
+        --batch_size 96 \
+        --epochs 100 \
+        --data_dir ${CONT_WORKDIR}/data/all-tfrec
+
+echo "=========================================="
+echo "Completed: $(date)"
+echo "=========================================="
