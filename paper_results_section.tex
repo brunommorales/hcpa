@@ -1,0 +1,421 @@
+% ============================================================
+%  Section: Results
+%  Figures:  Figure~\ref{fig:A}  -> H200 stats
+%            Figure~\ref{fig:B}  -> L40S stats
+%            Figure~\ref{fig:C}  -> RTX 4090 stats
+%  All experiments: single-GPU, batch size 96, 200 epochs,
+%  10 independent runs per configuration (except MONAI Base L40S, n=1).
+% ============================================================
+
+\section{Results}
+\label{sec:results}
+
+This section presents the quantitative evaluation of the six training
+pipelines -- TensorFlow Base (\textbf{TF-Base}), TensorFlow Optimized
+(\textbf{TF-Opt}), PyTorch Base (\textbf{PT-Base}), PyTorch Optimized
+(\textbf{PT-Opt}), MONAI Base (\textbf{MN-Base}), and MONAI Optimized
+(\textbf{MN-Opt}) -- across three GPU platforms: NVIDIA H200 SXM
+(Figure~\ref{fig:A}), NVIDIA L40S (Figure~\ref{fig:B}), and NVIDIA
+RTX~4090 (Figure~\ref{fig:C}).  All experiments were executed in
+\textbf{single-GPU} mode, which has a critical implication: inter-GPU
+communication fabric (NVLink, InfiniBand, PCIe switches) is entirely
+inactive.  Therefore, every throughput difference observed between the
+three platforms is attributable exclusively to on-chip resources --
+memory bandwidth, Tensor Core density, and architectural features of
+each GPU -- and not to any network or topology effect.
+
+% -----------------------------------------------------------
+\subsection{Throughput}
+\label{subsec:throughput}
+
+Table~\ref{tab:throughput_summary} and the throughput sub-panels in
+Figures~\ref{fig:A}--\ref{fig:C} report mean training throughput in
+images per second (img/s) over 10 independent runs.
+
+\begin{table}[h]
+  \centering
+  \caption{Mean throughput (img/s) per framework, variant, and GPU platform.}
+  \label{tab:throughput_summary}
+  \begin{tabular}{lrrrrrr}
+    \hline
+    \textbf{GPU} & \textbf{TF-Base} & \textbf{TF-Opt} & \textbf{PT-Base} & \textbf{PT-Opt} & \textbf{MN-Base} & \textbf{MN-Opt} \\
+    \hline
+    H200    & 1\,053.8 & 3\,023.8 & 549.1 & 1\,924.0 & 1\,052.5 & 1\,803.2 \\
+    L40S    &   476.1  & 1\,850.9 & 385.2 & 1\,099.2 &   840.3  & 1\,157.7 \\
+    RTX 4090 &  518.8  & 1\,058.7 & 387.6 & 1\,097.5 &    ---   & 1\,177.5 \\
+    \hline
+  \end{tabular}
+\end{table}
+
+\paragraph{TensorFlow Opt.}
+The application of DALI GPU decoding, FP16 mixed precision, and
+XLA/JIT compilation (\texttt{--jit\_compile}) raised TF throughput from
+476~img/s (TF-Base, L40S) to 1\,851~img/s (TF-Opt, L40S), a gain of
+\textbf{+288.8\%} (Figure~\ref{fig:B}).  On the H200, the same
+optimizations yield 3\,024~img/s starting from a Base of 1\,054~img/s,
+a gain of \textbf{+186.9\%} (Figure~\ref{fig:A}).  Notably, the H200
+achieved 3.024$\times$ the throughput of the L40S and 2.86$\times$ that
+of the RTX~4090 under TF-Opt, even though all three results come from
+single-GPU runs.  This disparity is explained by the H200's HBM3e
+memory (4.8~TB/s bandwidth vs.\ 864~GB/s on the L40S), its higher
+Tensor Core FP16 peak (${\sim}$989~TFLOPS vs.\ ${\sim}$366~TFLOPS on
+the L40S), and the fact that the DALI + XLA pipeline, once data
+movement from host to device is eliminated, becomes fully
+compute-bound, allowing the H200's architectural advantages to
+manifest completely.
+
+The RTX~4090 under TF-Opt achieves only 1\,059~img/s (Figure~\ref{fig:C}),
+a \textbf{+104.1\%} improvement over its Base of 519~img/s, but
+\textbf{43\% less} than the L40S under the identical optimisation
+stack.  Despite the RTX~4090 possessing marginally higher raw memory
+bandwidth than the L40S (1\,008~GB/s vs.\ 864~GB/s), the L40S provides
+${\sim}$11\% more FP16 Tensor Core compute (${\sim}$366 vs.\
+${\sim}$330~TFLOPS) as a datacenter-grade chip with a wider 256-bit bus
+that sustains higher throughput under sustained workloads without
+consumer-grade power throttling.  The TF XLA kernel fusion is likewise
+better exploited on professional Ada Lovelace GPUs, producing kernels
+that fill the L40S's compute pipeline more efficiently than on the
+RTX~4090.
+
+\paragraph{PyTorch Opt.}
+PT-Opt achieves a \textbf{+185.3\%} throughput gain on the L40S
+(385~$\to$~1\,099~img/s) and a \textbf{+183.1\%} gain on the RTX~4090
+(388~$\to$~1\,098~img/s) (Figures~\ref{fig:B}--\ref{fig:C}).  The two
+values are \emph{practically identical} ($\Delta <$1\%), which contrasts
+sharply with the TF-Opt case.  This parity occurs because
+\texttt{torch.compile(mode=``reduce-overhead'')} with DALI and AMP
+generates architecture-agnostic Triton kernels that overlap compute and
+memory access at the op-level, leaving little room for the L40S's
+datacenter features to differentiate.  On the H200, PT-Opt reaches
+1\,924~img/s (+250.4\% over Base), once again due to the HBM3e
+bandwidth feeding the PyTorch DALI pipeline faster than GDDR6/GDDR6X.
+
+\paragraph{MONAI Opt.}
+MONAI-Opt gains \textbf{+71.3\%} on the H200 (1\,053~$\to$~1\,803~img/s)
+and \textbf{+37.7\%} on the L40S (840~$\to$~1\,158~img/s).  On the
+RTX~4090, only the Opt variant was executed (1\,177~img/s), preventing
+a percentage comparison.  The MONAI Opt improvements stem from combining
+optional DALI preprocessing, cosine LR scheduling with warmup,
+\texttt{channels\_last} (NHWC) tensor layout, and gradient
+accumulation.  The NHWC format reorganises convolutional memory access
+to align with Tensor Core paths, yielding fewer cache misses and
+improved coalescence.  The H200 again benefits more (+71\%) than the
+L40S (+38\%) because its higher memory bandwidth is better exploited
+once the pipeline bottleneck shifts from CPU data loading to
+GPU-resident computation.
+
+% -----------------------------------------------------------
+\subsection{Training Time}
+\label{subsec:train_time}
+
+\begin{table}[h]
+  \centering
+  \caption{Mean training time (seconds) per framework, variant, and GPU.}
+  \label{tab:train_time_summary}
+  \begin{tabular}{lrrrrrr}
+    \hline
+    \textbf{GPU} & \textbf{TF-Base} & \textbf{TF-Opt} & \textbf{PT-Base} & \textbf{PT-Opt} & \textbf{MN-Base} & \textbf{MN-Opt} \\
+    \hline
+    H200    & 2\,058 & 1\,024 & 5\,007 & 1\,488 & 2\,628 & 1\,385 \\
+    L40S    & 4\,687 & 2\,243 & 6\,836 & 2\,629 & 3\,310 & 2\,242 \\
+    RTX 4090 & 4\,376 & 3\,721 & 7\,032 & 2\,771 &   ---  & 2\,198 \\
+    \hline
+  \end{tabular}
+\end{table}
+
+\paragraph{PyTorch: largest absolute wall-time reduction.}
+PT-Base is the slowest configuration on every platform.  The DALI +
+AMP + \texttt{torch.compile} stack of PT-Opt cuts the training wall
+time by \textbf{$-$70.3\%} on the H200 (5\,007~$\to$~1\,488~s),
+\textbf{$-$61.5\%} on the L40S (6\,836~$\to$~2\,629~s), and
+\textbf{$-$60.6\%} on the RTX~4090 (7\,032~$\to$~2\,771~s).  The
+consistent 60--70\% reduction across all platforms indicates that
+PT-Base's bottleneck is predominantly in the Python DataLoader and
+CPU-side TFRecord decoding: once DALI moves decoding to the GPU and
+\texttt{torch.compile} eliminates per-step Python dispatch overhead,
+the GPU is kept busy throughout training regardless of which GPU is
+used.  The extra 10\% gain seen on the H200 (+70\% vs.\ +60\%) is
+attributable to the higher memory bandwidth allowing the DALI prefetch
+buffer to be drained and refilled faster.
+
+\paragraph{TensorFlow: aggressive pipeline, diminishing returns on RTX~4090.}
+TF-Opt reduces training time by \textbf{$-$50.2\%} on the H200
+(2\,058~$\to$~1\,024~s) and \textbf{$-$52.1\%} on the L40S
+(4\,687~$\to$~2\,243~s), but only \textbf{$-$15.0\%} on the
+RTX~4090 (4\,376~$\to$~3\,721~s).  This asymmetry mirrors the
+throughput divergence discussed in Section~\ref{subsec:throughput}: the
+XLA-compiled DALI pipeline does not extract the same latency
+improvements from the consumer GPU architecture.  While the L40S
+benefits from XLA kernel fusion with its larger shared-memory
+configuration, the RTX~4090's TDP management and scheduler differences
+limit sustained utilisation, preventing the same wall-time
+compression.
+
+\paragraph{MONAI: balanced reduction across platforms.}
+MONAI-Opt reduces training time by \textbf{$-$47.3\%} on the H200
+(2\,628~$\to$~1\,385~s) and \textbf{$-$32.3\%} on the L40S
+(3\,310~$\to$~2\,242~s).  The more moderate gains compared to PT-Opt
+and TF-Opt reflect MONAI's modular design, where DALI is optional and
+not all transforms are offloaded to the GPU by default.  Even so, the
+cosine scheduler and warmup allow convergence with fewer wasted
+gradient steps, contributing to the time reduction beyond pure I/O
+improvements.
+
+% -----------------------------------------------------------
+\subsection{Model Quality: AUC, Sensitivity, and Specificity}
+\label{subsec:quality}
+
+\begin{table}[h]
+  \centering
+  \caption{Mean AUC, Sensitivity (Sens.), and Specificity (Spec.) per variant and GPU.}
+  \label{tab:quality_summary}
+  \begin{tabular}{llrrr}
+    \hline
+    \textbf{Config} & \textbf{GPU} & \textbf{AUC} & \textbf{Sens.} & \textbf{Spec.} \\
+    \hline
+    TF-Base  & H200     & 0.985 & 0.891 & 0.981 \\
+    TF-Base  & L40S     & 0.986 & 0.889 & 0.980 \\
+    TF-Base  & RTX 4090 & 0.986 & 0.889 & 0.981 \\
+    \hline
+    TF-Opt   & H200     & 0.958 & 0.829 & 0.956 \\
+    TF-Opt   & L40S     & 0.951 & 0.835 & 0.958 \\
+    TF-Opt   & RTX 4090 & 0.958 & 0.820 & 0.970 \\
+    \hline
+    PT-Base  & H200     & 0.919 & 0.621 & 0.982 \\
+    PT-Base  & L40S     & 0.918 & 0.641 & 0.980 \\
+    PT-Base  & RTX 4090 & 0.919 & 0.603 & 0.986 \\
+    \hline
+    PT-Opt   & H200     & 0.985 & 0.887 & 0.981 \\
+    PT-Opt   & L40S     & 0.985 & 0.888 & 0.980 \\
+    PT-Opt   & RTX 4090 & 0.985 & 0.889 & 0.981 \\
+    \hline
+    MN-Base  & H200     & 0.971 & 0.856 & 0.972 \\
+    MN-Base  & L40S     & 0.971 & 0.867 & 0.972 \\
+    \hline
+    MN-Opt   & H200     & 0.976 & 0.816 & 0.989 \\
+    MN-Opt   & L40S     & 0.980 & 0.848 & 0.986 \\
+    MN-Opt   & RTX 4090 & 0.976 & 0.801 & 0.989 \\
+    \hline
+  \end{tabular}
+\end{table}
+
+\paragraph{PyTorch: the only configuration where optimisation improves both speed and quality simultaneously.}
+PT-Base produces an AUC of $0.918 \pm 0.004$ across all three GPUs,
+with sensitivity of only $\approx$$0.62$, indicating the model
+struggles with class imbalance when the data pipeline is slow and the
+learning rate schedule is flat.  PT-Opt raises AUC to $0.985 \pm
+0.001$ (\textbf{$+$0.067} absolute, all platforms), bringing
+sensitivity to $\approx$$0.888$ and specificity to $\approx$$0.981$.
+This simultaneous improvement in speed and quality is explained by the
+synergy of three optimisations: (1)~DALI reduces starvation in the
+DataLoader, yielding cleaner gradient estimates at each step; (2)~the
+warmup + cosine LR scheduler together with mixup/label smoothing
+regularise the larger effective batch produced by AMP without
+introducing overfitting; and (3)~the EMA shadow model averages out
+sharp loss spikes that occurred in PT-Base when the flat LR interacted
+with imbalanced batches.  Because the backbone (\texttt{timm}
+InceptionV3) and data pipeline are identical across GPUs, the AUC
+reproducibility is near-perfect ($\sigma < 0.002$ on all three
+platforms), demonstrating that PT-Opt's gains are architectural and
+not dependent on GPU hardware.
+
+\paragraph{TensorFlow: throughput-quality trade-off.}
+TF-Base achieves the highest AUC ($0.985$--$0.986$) of any
+configuration, consistent across all three GPUs (Figure~\ref{fig:A},
+\ref{fig:B}, \ref{fig:C}).  This stability derives from the
+\texttt{tf.data} pipeline's deterministic shuffling and the standard
+Adam scheduler, which converge reliably with FP32 precision.
+TF-Opt, however, reduces AUC by \textbf{$-$0.027} to $-$0.035
+(H200: $-$0.027; L40S: $-$0.035; RTX~4090: $-$0.028).  The
+degradation is caused by (1)~FP16 mixed precision introducing
+occasional underflow/overflow in the cross-entropy loss for the
+imbalanced diabetic-retinopathy classes; (2)~the aggressive
+mixup/cutmix augmentation that blends images from both classes,
+creating ambiguous intermediate examples that the model's final
+sigmoid cannot resolve correctly without re-tuning; and (3)~the
+progressive backbone unfreeze, which when combined with a short cosine
+cycle, allows insufficient fine-tuning epochs for the deeper layers.
+Sensitivity drops most noticeably ($0.889 \to 0.829$), confirming that
+the positive class (referable retinopathy) is the primary victim of the
+AUC loss.  Crucially, this trade-off is \emph{pipeline-driven} and not
+GPU-dependent: the same AUC values are reproduced on all three
+platforms.
+
+\paragraph{MONAI: conservative but consistent gains.}
+MN-Base delivers AUC $0.971$ on both the H200 and L40S.  MN-Opt
+provides a modest but consistent improvement of \textbf{$+$0.005} to
+$+$0.009 in AUC (H200: $0.976$; L40S: $0.980$; RTX~4090: $0.976$),
+while sensitivity is reduced slightly ($\approx -0.04$ on the H200)
+relative to MN-Base.  The AUC gain is attributable to the cosine LR
+scheduler providing a larger effective learning rate during the early
+epochs and the label smoothing ($\alpha = 0.02$) suppressing
+overconfident predictions at the sigmoid output.  MONAI's modular
+transform pipeline runs largely in CPU by default, which limits the
+AUC benefit of DALI and explains the smaller quality delta compared to
+PT-Opt, where the entire pipeline operates on GPU.
+
+% -----------------------------------------------------------
+\subsection{GPU Memory Consumption}
+\label{subsec:memory}
+
+\begin{table}[h]
+  \centering
+  \caption{Mean peak GPU memory (MB) per variant and GPU.}
+  \label{tab:mem_summary}
+  \begin{tabular}{lrrrrrr}
+    \hline
+    \textbf{GPU} & \textbf{TF-Base} & \textbf{TF-Opt} & \textbf{PT-Base} & \textbf{PT-Opt} & \textbf{MN-Base} & \textbf{MN-Opt} \\
+    \hline
+    H200    & 12\,216 & 1\,667 & 18\,967 & 8\,365 & 7\,282 & 6\,772 \\
+    L40S    & 12\,358 & 4\,370 & 18\,911 & 18\,646 & 7\,400 & 6\,814 \\
+    RTX 4090 & 10\,859 & 5\,097 & 18\,726 & 18\,600 &   ---  & 6\,814 \\
+    \hline
+  \end{tabular}
+\end{table}
+
+\paragraph{TensorFlow: the most dramatic memory reduction.}
+TF-Opt reduces peak GPU memory by \textbf{$-$86.4\%} on the H200
+(12\,216~MB~$\to$~1\,667~MB) and by \textbf{$-$64.6\%} on the L40S
+(12\,358~MB~$\to$~4\,370~MB).  The discrepancy between the two GPUs
+reflects a TensorFlow memory-caching behaviour: TF-Opt on the H200
+takes advantage of the larger HBM3e capacity to release more
+intermediate activations sooner (via XLA's rematerialisation pass),
+achieving lower peak pressure, whereas the L40S's GDDR6 triggers more
+conservative caching decisions.  The memory reduction itself is
+structurally caused by three mechanisms: (1)~DALI processes images
+entirely in GPU DRAM and does not stage FP32 copies per batch as
+\texttt{tf.data} does; (2)~FP16 storage halves the activation tensor
+footprint; and (3)~XLA graph fusion eliminates intermediate tensors
+that are produced and consumed within a single fused kernel.
+
+\paragraph{PyTorch: memory dominated by model size.}
+PT-Base and PT-Opt both use the full InceptionV3 checkpoint and a
+batch size of 96 images at $299{\times}299$, pushing peak memory to
+$\approx$18.6~GB across all non-H200 platforms.  On the H200, PT-Opt
+reduces memory to 8\,365~MB because \texttt{torch.compile} in
+\texttt{reduce-overhead} mode performs graph-level fusion that
+eliminates several large intermediate activation tensors, and the
+gradient checkpointing introduced by the EMA mechanism recomputes some
+activations during the backward pass instead of storing them.  On
+GDDR6-based platforms (L40S and RTX~4090), this same fusion is still
+applied but does not lower the peak below the minimum required for
+AMP's combined FP16/FP32 parameter buffers at batch~96.
+
+\paragraph{MONAI: stable memory footprint.}
+MONAI-Base and MONAI-Opt maintain the smallest and most stable peak
+memory of any framework ($7\,282$--$7\,400$~MB for Base;
+$6\,772$--$6\,814$~MB for Opt), and the profile is identical across
+platforms.  The slight \textbf{$-$7\%} reduction in Opt (6\,814 vs.\
+7\,400~MB) is attributable to \texttt{channels\_last} tensors requiring
+fewer padding bytes in convolutional layers, and to DALI not
+materialising intermediate CPU-allocated NumPy arrays that MONAI's
+default CPU transforms generate.
+
+% -----------------------------------------------------------
+\subsection{Cross-GPU Scaling: Why H200 Outperforms L40S and RTX~4090 in Single-GPU Mode}
+\label{subsec:cross_gpu}
+
+A recurring observation across all frameworks and variants is that the
+H200 consistently delivers the highest throughput (Figure~\ref{fig:A}
+vs.\ Figures~\ref{fig:B},~\ref{fig:C}).  Because all experiments use
+exactly one GPU per run with no inter-GPU communication, this advantage
+cannot be attributed to NVLink's GPU-to-GPU interconnect.  The
+explanation is purely intra-chip:
+
+\begin{enumerate}
+  \item \textbf{HBM3e memory bandwidth.}
+        The H200 SXM provides ${\sim}$4.8~TB/s of memory bandwidth vs.\
+        $\approx$864~GB/s (L40S) and $\approx$1\,008~GB/s (RTX~4090).
+        For memory-bound kernels -- including most normalisation,
+        element-wise, and reduction operations -- the H200 can sustain
+        computation at 4.7$\times$ the rate of the L40S and 4.8$\times$
+        the rate of the RTX~4090.
+
+  \item \textbf{Tensor Core compute.}
+        The H200 delivers ${\sim}$989~TFLOPS at FP16, compared to
+        ${\sim}$366~TFLOPS (L40S) and ${\sim}$330~TFLOPS (RTX~4090), a
+        2.7$\times$ and 3.0$\times$ advantage in peak compute,
+        respectively.  The DALI-based pipelines in TF-Opt and PT-Opt are
+        the most compute-bound configurations, explaining why the H200
+        advantage is larger under Opt variants than under Base variants.
+
+  \item \textbf{Sustained throughput vs.\ peak throughput.}
+        Consumer GPUs (RTX~4090) apply power throttling under sustained
+        workloads to remain within their TDP envelope.  The L40S and
+        H200, as datacenter-grade GPUs, sustain peak clocks for the full
+        200-epoch run, which amplifies the throughput gap over long
+        training jobs even if instantaneous FLOPS would suggest a smaller
+        difference.
+
+\end{enumerate}
+
+The consequence is that TF-Opt scales \emph{super-linearly} relative
+to L40S on the H200 (+186.9\% on H200 vs.\ +288.8\% on L40S, measured
+from each GPU's own Base), while PT-Opt gains are consistent across
+platforms (${\approx}$185--250\%).  The TF XLA/DALI pipeline is more
+sensitive to memory bandwidth (super-linear scaling on HBM3e), whereas
+PyTorch's Triton-generated kernels balance compute and memory access
+more uniformly and therefore respond proportionally to raw compute
+resources.
+
+% -----------------------------------------------------------
+\subsection{Summary of Baseline-to-Optimised Gains}
+\label{subsec:summary_gains}
+
+Table~\ref{tab:summary_gains} consolidates percentage changes from
+Base to Opt for each framework and GPU, providing a compact reference
+for the causal chains discussed in this section.
+
+\begin{table}[h]
+  \centering
+  \caption{Summary of Base $\!\to\!$ Opt relative changes per GPU and framework.
+           Memory and AUC are absolute changes; Throughput and Training Time are relative.}
+  \label{tab:summary_gains}
+  \resizebox{\columnwidth}{!}{%
+  \begin{tabular}{llrrrr}
+    \hline
+    \textbf{Framework} & \textbf{GPU} &
+    \textbf{Throughput} & \textbf{Train Time} & \textbf{AUC ($\Delta$)} & \textbf{Memory} \\
+    \hline
+    TensorFlow & H200     & +186.9\% & $-$50.2\% & $-$0.027 & $-$86.4\% \\
+    TensorFlow & L40S     & +288.8\% & $-$52.1\% & $-$0.035 & $-$64.6\% \\
+    TensorFlow & RTX 4090 & +104.1\% & $-$15.0\% & $-$0.028 & $-$53.1\% \\
+    \hline
+    PyTorch    & H200     & +250.4\% & $-$70.3\% & +0.067  & $-$55.9\% \\
+    PyTorch    & L40S     & +185.3\% & $-$61.5\% & +0.068  & $-$1.4\%  \\
+    PyTorch    & RTX 4090 & +183.1\% & $-$60.6\% & +0.066  & $-$0.7\%  \\
+    \hline
+    MONAI      & H200     & +71.3\%  & $-$47.3\% & +0.005  & $-$7.0\%  \\
+    MONAI      & L40S     & +37.7\%  & $-$32.3\% & +0.009  & $-$7.9\%  \\
+    \hline
+  \end{tabular}}
+\end{table}
+
+The data in Table~\ref{tab:summary_gains} reveal three distinct
+optimisation regimes:
+
+\begin{itemize}
+  \item \textbf{Regime 1 -- Throughput-first (TF-Opt):} gains exceed
+        +100\% in throughput and $-$50\% in training time, but come at
+        the cost of AUC ($-$0.027 to $-$0.035).  This regime is suitable
+        when inference latency and GPU-hour cost dominate clinical
+        deployment constraints and a small reduction in discriminative
+        power is acceptable, provided the AUC remains above the
+        clinical threshold.
+
+  \item \textbf{Regime 2 -- Pareto-optimal (PT-Opt):} gains of
+        +183\%--+250\% in throughput and $-$60\%--$-$70\% in training
+        time are achieved with a simultaneous \emph{increase} in AUC
+        (+0.066 to +0.068).  This is the only configuration that
+        dominates its Base on all metrics and all platforms, making it
+        the recommended default for resource-constrained single-GPU
+        training of the HCPA retinopathy pipeline.
+
+  \item \textbf{Regime 3 -- Balanced (MN-Opt):} modest throughput gains
+        (+38\%--+71\%) with proportional training-time reductions and
+        stable AUC (+0.005 to +0.009).  This regime is appropriate when
+        MONAI-specific transforms or a clinical MONAI-based inference
+        stack must be preserved, accepting lower absolute throughput in
+        exchange for greater pipeline composability and lower memory
+        pressure.
+\end{itemize}

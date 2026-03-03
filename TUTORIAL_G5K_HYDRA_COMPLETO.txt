@@ -1,0 +1,450 @@
+================================================================================
+        TUTORIAL COMPLETO: EXECUTAR JOBS HCPA NO GRID'5000 - CLUSTER HYDRA
+                            (ARM aarch64 + NVIDIA H200)
+================================================================================
+
+Data: Janeiro 2026
+Autor: Gerado para projeto HCPA
+Cluster alvo: Hydra (Lyon) - ARM aarch64 - NVIDIA H200 96GB
+
+================================================================================
+                              INFORMAÇÕES IMPORTANTES
+================================================================================
+
+HYDRA - Especificações:
+  - Arquitetura: ARM (aarch64) - NVIDIA Grace Hopper
+  - CPU: NVIDIA/ARM Grace A02, 72 cores/CPU
+  - GPU: 1x NVIDIA H200 (96 GiB) - Compute Capability 9.0
+  - Memória: 480 GiB RAM
+  - Nós disponíveis: 4
+  - Tipo: EXOTIC (requer flag -t exotic)
+
+DOCKER NO G5K:
+  - NÃO vem instalado por padrão no ambiente standard
+  - PRECISA executar o script g5k-setup-nvidia-docker
+  - NÃO é necessário kadeploy3 para usar Docker!
+
+================================================================================
+                    PASSO 1: CONEXÃO AO GRID'5000 (LYON)
+================================================================================
+
+1.1. Conectar ao access do Grid'5000:
+-------------------------------------
+    ssh bmorales@access.grid5000.fr 
+
+
+1.2. Conectar ao site Lyon (onde está o Hydra):
+----------------------------------------------
+    ssh lyon
+
+1.3. Verificar disponibilidade do Hydra:
+---------------------------------------
+    # Ver status dos nós
+    oarstat -f
+    
+    # Ver Gantt chart (pelo navegador)
+    # https://intranet.grid5000.fr/oar/Lyon/drawgantt-svg/?filter=hydra%20only
+
+================================================================================
+                    PASSO 2: PREPARAR SEUS DADOS E SCRIPTS
+================================================================================
+
+2.1. Criar estrutura de diretórios (no frontend Lyon):
+-----------------------------------------------------
+    mkdir -p ~/projects/hcpa
+    mkdir -p ~/projects/hcpa/tensorflow_base/logs
+    mkdir -p ~/projects/hcpa/pytorch_base/logs
+    mkdir -p ~/projects/hcpa/tensorflow_opt/logs
+    mkdir -p ~/projects/hcpa/pytorch_opt/logs
+
+2.2. Copiar seus arquivos do seu computador para o G5K:
+------------------------------------------------------
+    # Do seu computador local:
+    scp -r projects/hcpa <usuario>@access.grid5000.fr:lyon/projects/
+    
+    # Ou usando rsync (mais eficiente):
+    rsync -avz --progress projects/hcpa/ <usuario>@access.grid5000.fr:lyon/projects/hcpa/
+    rsync -avz --progress projects/hcpa/ bmorales@access.grid5000.fr:lyon/projects/hcpa/
+
+
+2.3. Verificar se os dados TFRecord estão disponíveis:
+-----------------------------------------------------
+    ls -la ~/projects/hcpa/*/data/all-tfrec/
+    
+    # Se não existir, copiar os dados:
+    # scp -r /caminho/local/all-tfrec <usuario>@access.grid5000.fr:lyon/projects/hcpa/tensorflow_base/data/
+
+================================================================================
+            PASSO 3: RESERVAR NÓ DO HYDRA (MODO INTERATIVO)
+================================================================================
+
+IMPORTANTE: Hydra é um cluster EXOTIC, precisa do flag -t exotic!
+
+
+oarsub -I -t exotic -t deploy -l "nodes=1,walltime=02:00:00" -p "cluster='hydra'"
+
+
+Reserva interativa para TESTE (2 horas)
+
+---Roda apenas à noite (pode ser adiada para a próxima noite se não houver recurso)
+oarsub -I -t exotic -t night -p "cluster='hydra'" -l host=1,walltime=2:00:00
+
+
+---Se você quiser “ou roda nesta noite ou dá erro” (não tenta nas próximas noites):
+oarsub -I -t exotic -t night=noretry -p "cluster='hydra'" -l host=1,walltime=2:00:00
+
+
+3.1. Reserva interativa para TESTE (2 horas):
+--------------------------------------------
+    oarsub -I -t exotic -p "cluster='hydra'" -l host=1,walltime=2:00:00
+
+3.2. Reserva interativa para TREINAMENTO (6 horas):
+--------------------------------------------------
+    oarsub -I -t exotic -p "cluster='hydra'" -l host=1,walltime=6:00:00
+
+3.3. Após a reserva, você será conectado automaticamente ao nó:
+--------------------------------------------------------------
+    # O prompt mudará para algo como:
+    # [usuario@hydra-1 ~]$
+    
+    # Verificar informações do nó:
+    hostname
+    uname -m     # Deve mostrar: aarch64
+    
+    # Verificar GPU:
+    nvidia-smi
+
+================================================================================
+                    PASSO 4: CONFIGURAR DOCKER COM GPU
+================================================================================
+
+IMPORTANTE: Docker NÃO vem instalado. Use o script do G5K!
+
+4.1. Instalar Docker + NVIDIA Docker:
+------------------------------------
+    g5k-setup-nvidia-docker -t
+
+    # O flag -t usa /tmp/ para armazenar imagens (mais espaço)
+    # Este comando:
+    #   - Instala Docker
+    #   - Instala nvidia-docker
+    #   - Configura o docker-cache do G5K
+    #   - Dá permissões para usar docker sem sudo
+
+4.2. Verificar se Docker está funcionando:
+-----------------------------------------
+    docker --version
+    docker info
+
+4.3. Verificar se GPU está acessível pelo Docker:
+------------------------------------------------
+    docker run --rm --gpus all ubuntu:22.04 nvidia-smi
+
+    # Deve mostrar a H200 com 96GB
+
+================================================================================
+                    PASSO 5: BUILD DAS IMAGENS DOCKER (ARM)
+================================================================================
+
+IMPORTANTE: As imagens precisam ser compiladas para ARM (aarch64)!
+            Os Dockerfiles usam imagens base da NVIDIA que suportam ARM.
+
+5.1. Build - tensorflow_base (TensorFlow):
+---------------------------------------
+    cd ~/projects/hcpa/tensorflow_base
+    
+    # Build (pode demorar 10-20 minutos na primeira vez)
+    docker build -t tf_distributed_arm:latest .
+    
+    # Verificar se foi criada:
+    docker images | grep tf_distributed_arm
+
+5.2. Build - pytorch_base (PyTorch):
+-----------------------------------------
+    cd ~/projects/hcpa/pytorch_base
+    
+    docker build \
+        --build-arg UID=$(id -u) \
+        --build-arg GID=$(id -g) \
+        -t pytorch_distributed_arm:latest .
+
+5.3. Build - tensorflow_opt (TensorFlow Original):
+------------------------------------------------
+    cd ~/projects/hcpa/tensorflow_opt
+    
+    docker build -t tf_original_arm:latest .
+
+5.4. Build - pytorch_opt (PyTorch):
+-----------------------------------
+    cd ~/projects/hcpa/pytorch_opt
+    
+    docker build \
+        --build-arg UID=$(id -u) \
+        --build-arg GID=$(id -g) \
+        -t pytorch_hcpa_arm:latest .
+
+5.5. Listar todas as imagens criadas:
+------------------------------------
+    docker images
+
+================================================================================
+            PASSO 6: EXECUTAR TREINAMENTOS (INDIVIDUAL)
+================================================================================
+
+Agora você pode executar cada abordagem individualmente.
+DICA: Use tmux ou screen para não perder a sessão se desconectar!
+
+6.0. (RECOMENDADO) Iniciar tmux para persistência:
+-------------------------------------------------
+    tmux new -s hcpa
+    
+    # Para reconectar depois: tmux attach -t hcpa
+    # Para desanexar sem fechar: Ctrl+b, depois d
+
+-----------------------------------------------------------------------------
+6.1. EXECUTAR: tensorflow_base
+-----------------------------------------------------------------------------
+    cd ~/projects/hcpa/tensorflow_base
+    
+    docker run --gpus all --rm \
+        -v $(pwd):/workspace \
+        -v $(pwd)/data/all-tfrec:/workspace/data/all-tfrec \
+        --network host \
+        --ipc=host \
+        --shm-size=16g \
+        -e TF_CPP_MIN_LOG_LEVEL=1 \
+        tf_distributed_arm:latest \
+        python3 /workspace/dr_hcpa_v2_2024.py \
+            --batch_size 96 \
+            --epochs 200 \
+            --data_dir /workspace/data/all-tfrec
+
+-----------------------------------------------------------------------------
+6.2. EXECUTAR: pytorch_base
+-----------------------------------------------------------------------------
+    cd ~/projects/hcpa/pytorch_base
+    
+    docker run --gpus all --rm \
+        -v $(pwd):/workspace \
+        -v $(pwd)/data/all-tfrec:/workspace/data/all-tfrec \
+        --network host \
+        --ipc=host \
+        --shm-size=16g \
+        -u $(id -u):$(id -g) \
+        -e KERAS_BACKEND=torch \
+        pytorch_distributed_arm:latest \
+        python3 /workspace/dr_hcpa_v2_2024.py \
+            --batch_size 96 \
+            --epochs 200 \
+            --data_dir /workspace/data/all-tfrec
+
+-----------------------------------------------------------------------------
+6.3. EXECUTAR: tensorflow_opt (COM TODAS AS OTIMIZAÇÕES)
+-----------------------------------------------------------------------------
+    cd ~/projects/hcpa/tensorflow_opt
+    
+    docker run --gpus all --rm \
+        -v $(pwd):/workspace \
+        -v $(pwd)/data/all-tfrec:/workspace/data/all-tfrec \
+        --network host \
+        --ipc=host \
+        --shm-size=16g \
+        -e TF_CPP_MIN_LOG_LEVEL=1 \
+        -e TF_GPU_THREAD_MODE=gpu_private \
+        -e TF_FORCE_GPU_ALLOW_GROWTH=true \
+        tf_original_arm:latest \
+        python3 /workspace/dr_hcpa_v2_2024.py \
+            --batch_size 96 \
+            --model InceptionV3 \
+            --normalize preprocess \
+            --epochs 200 \
+            --freeze_epochs 1 \
+            --fine_tune_at -200 \
+            --fine_tune_lr 2e-4 \
+            --lrate 0.003 \
+            --mixup_alpha 0.3 \
+            --cutmix_alpha 0.6 \
+            --label_smoothing 0.1 \
+            --focal_gamma 2.0 \
+            --pos_weight 2.0 \
+            --fundus_crop_ratio 0.9 \
+            --warmup_epochs 5 \
+            --min_lr 1e-6 \
+            --tta_views 2 \
+            --recompute_backbone \
+            --jit_compile \
+            --auc_target 0.95 \
+            --data_dir /workspace/data/all-tfrec
+
+-----------------------------------------------------------------------------
+6.4. EXECUTAR: pytorch_opt (COM TODAS AS OTIMIZAÇÕES)
+-----------------------------------------------------------------------------
+    cd ~/projects/hcpa/pytorch_opt
+    
+    docker run --gpus all --rm \
+        -v $(pwd):/workspace \
+        -v $(pwd)/data/all-tfrec:/workspace/data/all-tfrec \
+        --network host \
+        --ipc=host \
+        --shm-size=16g \
+        -u $(id -u):$(id -g) \
+        -e KERAS_BACKEND=torch \
+        -e PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512 \
+        pytorch_hcpa_arm:latest \
+        python3 /workspace/dr_hcpa_v2_2024.py \
+            --model inception_v3 \
+            --normalize preprocess \
+            --batch_size 96 \
+            --epochs 200 \
+            --lrate 3e-3 \
+            --freeze_epochs 1 \
+            --fine_tune_lr_factor 0.1 \
+            --fine_tune_lr 2e-4 \
+            --warmup_epochs 2 \
+            --min_lr 1e-6 \
+            --mixup_alpha 0.3 \
+            --cutmix_alpha 0.0 \
+            --label_smoothing 0.01 \
+            --focal_gamma 0.0 \
+            --pos_weight 1.0 \
+            --fundus_crop_ratio 0.9 \
+            --tta_views 1 \
+            --data_dir /workspace/data/all-tfrec
+
+            PARAMETROS CORRETOS:
+             --model inception_v3          # timm nome canonical (PyTorch puro)
+  --normalize preprocess
+  --batch_size 96
+  --epochs 200
+  --lrate 5e-4
+  --freeze_epochs 0
+  --fine_tune_lr_factor 0.1
+  --fine_tune_lr 5e-4
+  --warmup_epochs 5
+  --min_lr 1e-6
+  --mixup_alpha 0.0
+  --cutmix_alpha 0.0
+  --label_smoothing 0.0
+  --focal_gamma 0.0
+  --pos_weight 1.0
+  --fundus_crop_ratio 1.0
+  --tta_views 1
+
+================================================================================
+            PASSO 7: USAR SCRIPTS OAR (MODO BATCH - OPCIONAL)
+================================================================================
+
+Se preferir submeter jobs em batch ao invés de interativo:
+
+7.1. Submeter job individual:
+----------------------------
+    cd ~/projects/hcpa/tensorflow_base
+    oarsub -S ./run_g5k_arm.oar
+
+7.2. Verificar status do job:
+----------------------------
+    oarstat -u
+
+7.3. Cancelar job se necessário:
+-------------------------------
+    oardel <JOB_ID>
+
+7.4. Ver logs do job:
+--------------------
+    cat logs/g5k_*_<JOB_ID>.stdout
+    cat logs/g5k_*_<JOB_ID>.stderr
+
+================================================================================
+                        COMANDOS ÚTEIS
+================================================================================
+
+# Verificar seus jobs
+oarstat -u
+
+# Verificar tempo restante
+oarstat -u -f
+
+# Estender tempo do job (se recursos disponíveis)
+oarwalltime <JOB_ID> +2:00
+
+# Cancelar job
+oardel <JOB_ID>
+
+# Conectar a um job existente
+oarsub -C <JOB_ID>
+
+# Ver uso de GPU em tempo real
+watch -n1 nvidia-smi
+
+# Ver uso de memória do container
+docker stats
+
+# Salvar imagem Docker para reutilizar
+docker save -o ~/tf_distributed_arm.tar tf_distributed_arm:latest
+
+# Carregar imagem salva
+docker load -i ~/tf_distributed_arm.tar
+
+================================================================================
+                        TROUBLESHOOTING
+================================================================================
+
+PROBLEMA: "g5k-setup-nvidia-docker: command not found"
+SOLUÇÃO:  Você está no frontend, não no nó. Faça oarsub -I primeiro.
+
+PROBLEMA: Docker build falha com erro de arquitetura
+SOLUÇÃO:  Verifique se o Dockerfile usa imagens base que suportam ARM.
+          Use: FROM nvcr.io/nvidia/tensorflow:XX.XX-tf2-py3
+          (imagens NGC suportam ARM)
+
+PROBLEMA: GPU não detectada no container
+SOLUÇÃO:  Use --gpus all no docker run
+          Verifique se nvidia-docker foi instalado: g5k-setup-nvidia-docker -t
+
+PROBLEMA: Permissão negada nos arquivos de saída
+SOLUÇÃO:  Use -u $(id -u):$(id -g) no docker run
+
+PROBLEMA: Out of memory (OOM)
+SOLUÇÃO:  Reduza batch_size ou use --shm-size maior
+
+PROBLEMA: Job terminou antes de completar
+SOLUÇÃO:  Aumente walltime na reserva ou use oarwalltime para estender
+
+================================================================================
+                    RESUMO - SEQUÊNCIA MÍNIMA
+================================================================================
+
+# 1. Conectar
+ssh <user>@access.grid5000.fr
+ssh lyon
+
+# 2. Reservar nó Hydra (6h)
+oarsub -I -t exotic -p "cluster='hydra'" -l host=1,walltime=6:00:00
+
+# 3. Instalar Docker+GPU
+g5k-setup-nvidia-docker -t
+
+# 4. Build da imagem
+cd ~/projects/hcpa/tensorflow_opt
+docker build -t tf_original_arm:latest .
+
+# 5. Executar treinamento
+docker run --gpus all --rm \
+    -v $(pwd):/workspace \
+    --network host --ipc=host --shm-size=16g \
+    tf_original_arm:latest \
+    python3 /workspace/dr_hcpa_v2_2024.py --batch_size 96 --epochs 200
+
+================================================================================
+                    LINKS ÚTEIS
+================================================================================
+
+- Grid'5000 Getting Started: https://www.grid5000.fr/w/Getting_Started
+- Grid'5000 Docker: https://www.grid5000.fr/w/Docker
+- Hydra Hardware: https://www.grid5000.fr/w/Lyon:Hardware#hydra
+- OAR Documentation: https://oar.imag.fr/docs/latest/
+- Status Lyon: https://intranet.grid5000.fr/oar/Lyon/drawgantt-svg/
+
+================================================================================
+                            FIM DO TUTORIAL
+================================================================================
