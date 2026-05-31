@@ -45,8 +45,8 @@ CSV_FIELDNAMES = [
     "std_throughput_img_s",
     "mean_train_time_s",
     "std_train_time_s",
-    "mean_peak_gpu_mem_mb",
-    "std_peak_gpu_mem_mb",
+    "mean_avg_gpu_mem_mb",
+    "std_avg_gpu_mem_mb",
 ]
 CSV_FIELDNAMES_EXTENDED = CSV_FIELDNAMES + [
     "mean_specificity",
@@ -68,7 +68,7 @@ GPU2_BS96_RUN_FIELDS = [
     "val_auc_best",
     "train_time_s",
     "throughput_img_s",
-    "peak_gpu_mem_mb",
+    "avg_gpu_mem_mb",
 ]
 GPU2_BS96_SUMMARY_FIELDS = [
     "pair",
@@ -87,8 +87,8 @@ GPU2_BS96_SUMMARY_FIELDS = [
     "std_throughput_img_s",
     "mean_train_time_s",
     "std_train_time_s",
-    "mean_peak_gpu_mem_mb",
-    "std_peak_gpu_mem_mb",
+    "mean_avg_gpu_mem_mb",
+    "std_avg_gpu_mem_mb",
 ]
 BATCH96_RUN_FIELDS = [
     "project",
@@ -102,7 +102,7 @@ BATCH96_RUN_FIELDS = [
     "val_auc_best",
     "train_time_s",
     "throughput_img_s",
-    "peak_gpu_mem_mb",
+    "avg_gpu_mem_mb",
     "time_to_auc_0_95_s",
 ]
 OUTPUT_FIELDS_BATCH96_GPU2 = [
@@ -117,8 +117,8 @@ OUTPUT_FIELDS_BATCH96_GPU2 = [
     "std_throughput_img_s",
     "mean_train_time_s",
     "std_train_time_s",
-    "mean_peak_gpu_mem_mb",
-    "std_peak_gpu_mem_mb",
+    "mean_avg_gpu_mem_mb",
+    "std_avg_gpu_mem_mb",
 ]
 
 SINGLE_GPU_RUN_FIELDS = [
@@ -138,7 +138,7 @@ SINGLE_GPU_RUN_FIELDS = [
     "val_sens_best",
     "train_time_s",
     "throughput_img_s",
-    "peak_gpu_mem_mb",
+    "avg_gpu_mem_mb",
     "time_to_auc_0_95_s",
 ]
 
@@ -159,8 +159,8 @@ SINGLE_GPU_SUMMARY_FIELDS = [
     "std_throughput_img_s",
     "mean_train_time_s",
     "std_train_time_s",
-    "mean_peak_gpu_mem_mb",
-    "std_peak_gpu_mem_mb",
+    "mean_avg_gpu_mem_mb",
+    "std_avg_gpu_mem_mb",
 ]
 
 
@@ -181,7 +181,8 @@ class RunMetrics:
 
 
 SummaryKey = Tuple[str, str, int, int]
-RESULT_DIR_RE = re.compile(r"^result(\d+)_([a-z0-9._-]+)_gpu(\d+)_bs(\d+)$")
+RESULT_DIR_RE = re.compile(r"^result(\d+)_(.+)_(\d+)x(.+)_bs(\d+)$")
+LEGACY_RESULT_DIR_RE = re.compile(r"^result(\d+)_([a-z0-9._-]+)_gpu(\d+)_bs(\d+)$")
 
 
 def parse_manifest(path: Path) -> Dict[str, str]:
@@ -217,6 +218,13 @@ def extract_result_dir_info(result_dir: Path) -> Dict[str, Optional[str]]:
         info["job_id"] = match.group(1)
         info["partition"] = match.group(2)
         info["gpus"] = match.group(3)
+        info["batch_size"] = match.group(5)
+        return info
+    match = LEGACY_RESULT_DIR_RE.match(result_dir.name)
+    if match:
+        info["job_id"] = match.group(1)
+        info["partition"] = match.group(2)
+        info["gpus"] = match.group(3)
         info["batch_size"] = match.group(4)
     return info
 
@@ -240,9 +248,9 @@ def extract_job_id(result_dir: Path) -> int:
     return name_job or 0
 
 
-def extract_peak_mem_from_logs(result_dir: Path) -> Optional[float]:
+def extract_avg_mem_from_logs(result_dir: Path) -> Optional[float]:
     """
-    Procura pico de memória em logs (nvidia-smi) associados ao job.
+    Procura amostras de memória em logs (nvidia-smi) associados ao job.
     """
     job_id = extract_job_id(result_dir)
     if not job_id:
@@ -269,7 +277,7 @@ def extract_peak_mem_from_logs(result_dir: Path) -> Optional[float]:
             numbers.append(val)
     if not numbers:
         return None
-    return float(max(numbers))
+    return float(sum(numbers) / len(numbers))
 
 
 def extract_train_throughput_from_csv(csv_path: Path) -> Optional[float]:
@@ -323,15 +331,18 @@ def extract_throughput_from_logs(result_dir: Path) -> Optional[float]:
 def find_result_dirs(results_root: Path, gpu_count: int, target_batches: Iterable[int]) -> Dict[int, Path]:
     """Pick the most recent (largest job_id) runs per batch for the given GPU count."""
     selected: Dict[int, Tuple[int, Path]] = {}
-    for base in sorted(results_root.glob(f"result*_*_gpu{gpu_count}_bs*")):
+    for base in sorted(results_root.glob("result*_bs*")):
+        if not base.is_dir():
+            continue
         manifest = parse_manifest(base / "env_manifest.txt")
         world_size = safe_int(manifest.get("world_size"))
-        if world_size not in (None, gpu_count):
+        info = extract_result_dir_info(base)
+        name_gpus = safe_int(info.get("gpus"))
+        if world_size not in (None, gpu_count) and name_gpus not in (None, gpu_count):
             continue
         batch = manifest.get("global_batch_size")
         if batch is None:
-            m = re.search(r"_bs(\d+)", base.name)
-            batch = m.group(1) if m else None
+            batch = info.get("batch_size")
         batch_size = safe_int(batch)
         if batch_size not in target_batches:
             continue
@@ -611,8 +622,11 @@ def parse_val_metrics(
     csv_path: Path,
 ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
     """
-    Retorna (auc_final, auc_best, spec_final, spec_best, sens_final, sens_best)
-    a partir das colunas val_auc, val_spec, val_sens (case-insensitive).
+    Retorna (auc_final, auc_best, spec_final, spec_best, sens_final, sens_best).
+
+    A métrica final vem de stage=final_test/test_* quando disponível; caso
+    contrário cai para final_eval/val_* e, por fim, para a última validação.
+    Os valores best continuam vindo somente das épocas de validação.
     """
     last_auc: Optional[float] = None
     best_auc: Optional[float] = None
@@ -637,7 +651,10 @@ def parse_val_metrics(
                     last_auc = val_auc
                     best_auc = val_auc if best_auc is None else max(best_auc, val_auc)
 
-                val_spec = _safe_float(_get_row_value_case_insensitive(row, "val_spec"))
+                val_spec = _safe_float(
+                    _get_row_value_case_insensitive(row, "val_spec_at_sens95")
+                    or _get_row_value_case_insensitive(row, "val_spec")
+                )
                 if val_spec is not None and 0.0 <= val_spec <= 1.0:
                     last_spec = val_spec
                     best_spec = val_spec if best_spec is None else max(best_spec, val_spec)
@@ -647,7 +664,20 @@ def parse_val_metrics(
                     last_sens = val_sens
                     best_sens = val_sens if best_sens is None else max(best_sens, val_sens)
 
-                if stage == "final_eval":
+                if stage == "final_test":
+                    test_auc = _safe_float(_get_row_value_case_insensitive(row, "test_auc"))
+                    test_spec = _safe_float(
+                        _get_row_value_case_insensitive(row, "test_spec_at_sens95")
+                        or _get_row_value_case_insensitive(row, "test_spec")
+                    )
+                    test_sens = _safe_float(_get_row_value_case_insensitive(row, "test_sens"))
+                    if test_auc is not None and 0.0 <= test_auc <= 1.0:
+                        final_auc = test_auc
+                    if test_spec is not None and 0.0 <= test_spec <= 1.0:
+                        final_spec = test_spec
+                    if test_sens is not None and 0.0 <= test_sens <= 1.0:
+                        final_sens = test_sens
+                elif stage == "final_eval":
                     final_auc = val_auc if val_auc is not None else final_auc
                     final_spec = val_spec if val_spec is not None else final_spec
                     final_sens = val_sens if val_sens is not None else final_sens
@@ -740,21 +770,21 @@ def analyze_tensorflow_result(result_dir: Path, use_logs: bool) -> Tuple[int, Li
         # Se throughput veio de logs/CSV e ainda não temos elapsed, podemos recalcular tempo pelo throughput.
         if elapsed is None and throughput is not None and epochs is not None and throughput > 0:
             elapsed = (train_images * epochs) / throughput
-        mem = extract_peak_gpu_mem_mb(csv_path) if csv_path is not None else None
+        mem = extract_avg_gpu_mem_mb(csv_path) if csv_path is not None else None
         if mem is None:
-            mem = extract_peak_mem_from_logs(result_dir)
+            mem = extract_avg_mem_from_logs(result_dir)
         time_to_target = time_to_target_auc(csv_path, TARGET_AUC, total_time_s=elapsed, epochs=epochs)
         metrics.append(
             RunMetrics(
                 run_id=rid,
-                auc=auc_best or auc_final,
+                auc=auc_final,
                 throughput_img_s=throughput,
                 train_time_s=elapsed,
                 gpu_mem_mb=mem,
                 auc_best=auc_best,
-                spec=spec_best or spec_final,
+                spec=spec_final,
                 spec_best=spec_best,
-                sens=sens_best or sens_final,
+                sens=sens_final,
                 sens_best=sens_best,
                 epochs=epochs,
                 time_to_target_auc_s=time_to_target,
@@ -810,21 +840,21 @@ def analyze_pytorch_result(result_dir: Path) -> Tuple[int, List[RunMetrics]]:
             throughput = (train_images * epochs) / elapsed
         if elapsed is None and throughput is not None and epochs is not None and throughput > 0:
             elapsed = (train_images * epochs) / throughput
-        gpu_mem = extract_peak_gpu_mem_mb(csv_path)
+        gpu_mem = extract_avg_gpu_mem_mb(csv_path)
         if gpu_mem is None:
-            gpu_mem = extract_peak_mem_from_logs(result_dir)
+            gpu_mem = extract_avg_mem_from_logs(result_dir)
         time_to_target = time_to_target_auc(csv_path, TARGET_AUC, total_time_s=elapsed, epochs=epochs)
         metrics.append(
             RunMetrics(
                 run_id=run_id,
-                auc=val_auc_best or val_auc_final,
+                auc=val_auc_final,
                 throughput_img_s=throughput,
                 train_time_s=elapsed,
                 gpu_mem_mb=gpu_mem,
                 auc_best=val_auc_best,
-                spec=val_spec_best or val_spec_final,
+                spec=val_spec_final,
                 spec_best=val_spec_best,
-                sens=val_sens_best or val_sens_final,
+                sens=val_sens_final,
                 sens_best=val_sens_best,
                 epochs=epochs,
                 time_to_target_auc_s=time_to_target,
@@ -904,16 +934,13 @@ def sum_elapsed_seconds_from_csv(csv_path: Path) -> Optional[float]:
     return extract_total_train_time(csv_path)
 
 
-def extract_peak_gpu_mem_mb(csv_path: Path) -> Optional[float]:
+def extract_avg_gpu_mem_mb(csv_path: Path) -> Optional[float]:
     preferred_columns = [
-        "train_gpu_mem_alloc_mb",
-        "val_gpu_mem_alloc_mb",
-        "gpu_mem_peak_mb",
-        "gpu_mem_current_mb",
-        "train_gpu_mem_reserved_mb",
-        "val_gpu_mem_reserved_mb",
+        "train_gpu_mem_avg_mb",
+        "val_gpu_mem_avg_mb",
+        "test_gpu_mem_avg_mb",
     ]
-    max_val: Optional[float] = None
+    values: List[float] = []
     try:
         with csv_path.open("r", newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
@@ -924,10 +951,12 @@ def extract_peak_gpu_mem_mb(csv_path: Path) -> Optional[float]:
                         continue
                     if val <= 0 or val > MAX_MEM_MB:
                         continue
-                    max_val = val if max_val is None else max(max_val, val)
+                    values.append(val)
     except (FileNotFoundError, Exception):
         return None
-    return max_val
+    if not values:
+        return None
+    return float(sum(values) / len(values))
 
 
 def _mean_and_stdev(values: Iterable[Optional[float]]) -> Tuple[float, float]:
@@ -973,8 +1002,8 @@ def summarize_metrics(variant: str, framework: str, batch_size: int, gpus: int, 
         "std_throughput_img_s": std_thr,
         "mean_train_time_s": mean_times,
         "std_train_time_s": std_times,
-        "mean_peak_gpu_mem_mb": mean_mem,
-        "std_peak_gpu_mem_mb": std_mem,
+        "mean_avg_gpu_mem_mb": mean_mem,
+        "std_avg_gpu_mem_mb": std_mem,
     }
 
 
@@ -1071,7 +1100,7 @@ def collect_gpu2_bs96_runs(
                         "val_auc_best": run.auc_best,
                         "train_time_s": run.train_time_s,
                         "throughput_img_s": run.throughput_img_s,
-                        "peak_gpu_mem_mb": run.gpu_mem_mb,
+                        "avg_gpu_mem_mb": run.gpu_mem_mb,
                         "time_to_auc_0_95_s": run.time_to_target_auc_s,
                     }
                 )
@@ -1124,7 +1153,7 @@ def collect_batch96_all_runs(
                             "val_sens_best": run.sens_best,
                             "train_time_s": run.train_time_s,
                             "throughput_img_s": run.throughput_img_s,
-                            "peak_gpu_mem_mb": run.gpu_mem_mb,
+                            "avg_gpu_mem_mb": run.gpu_mem_mb,
                             "time_to_auc_0_95_s": run.time_to_target_auc_s,
                         }
                     )
@@ -1147,7 +1176,7 @@ def summarize_gpu2_bs96_runs(rows: List[Dict[str, float]]) -> List[Dict[str, flo
         mean_val_auc_best, std_val_auc_best = _mean_and_stdev([i.get("val_auc_best") for i in items])
         mean_thr, std_thr = _mean_and_stdev([i.get("throughput_img_s") for i in items])
         mean_time, std_time = _mean_and_stdev([i.get("train_time_s") for i in items])
-        mean_mem, std_mem = _mean_and_stdev([i.get("peak_gpu_mem_mb") for i in items])
+        mean_mem, std_mem = _mean_and_stdev([i.get("avg_gpu_mem_mb") for i in items])
         summaries.append(
             {
                 "pair": pair,
@@ -1166,8 +1195,8 @@ def summarize_gpu2_bs96_runs(rows: List[Dict[str, float]]) -> List[Dict[str, flo
                 "std_throughput_img_s": std_thr,
                 "mean_train_time_s": mean_time,
                 "std_train_time_s": std_time,
-                "mean_peak_gpu_mem_mb": mean_mem,
-                "std_peak_gpu_mem_mb": std_mem,
+                "mean_avg_gpu_mem_mb": mean_mem,
+                "std_avg_gpu_mem_mb": std_mem,
             }
         )
     return summaries
@@ -1176,7 +1205,7 @@ def summarize_gpu2_bs96_runs(rows: List[Dict[str, float]]) -> List[Dict[str, flo
 def summarize_single_gpu_runs(rows: List[Dict[str, float]]) -> List[Dict[str, float]]:
     """
     Agrega todas as execuções (run_*), agrupando por projeto/framework/variant/gpus/batch_size.
-    Usa os valores \"best\" quando disponíveis (AUC, sens, spec).
+    Usa os valores finais/teste para o resumo; os valores best ficam apenas como diagnóstico por run.
     """
     grouped: Dict[Tuple[str, str, str, int, int], List[Dict[str, float]]] = {}
     for row in rows:
@@ -1185,12 +1214,12 @@ def summarize_single_gpu_runs(rows: List[Dict[str, float]]) -> List[Dict[str, fl
 
     summaries: List[Dict[str, float]] = []
     for (project, framework, variant, gpus, batch_size), items in grouped.items():
-        mean_auc, std_auc = _mean_and_stdev([i.get("val_auc_best") or i.get("val_auc_final") for i in items])
-        mean_spec, std_spec = _mean_and_stdev([i.get("val_spec_best") or i.get("val_spec_final") for i in items])
-        mean_sens, std_sens = _mean_and_stdev([i.get("val_sens_best") or i.get("val_sens_final") for i in items])
+        mean_auc, std_auc = _mean_and_stdev([i.get("val_auc_final") for i in items])
+        mean_spec, std_spec = _mean_and_stdev([i.get("val_spec_final") for i in items])
+        mean_sens, std_sens = _mean_and_stdev([i.get("val_sens_final") for i in items])
         mean_thr, std_thr = _mean_and_stdev([i.get("throughput_img_s") for i in items])
         mean_time, std_time = _mean_and_stdev([i.get("train_time_s") for i in items])
-        mean_mem, std_mem = _mean_and_stdev([i.get("peak_gpu_mem_mb") for i in items])
+        mean_mem, std_mem = _mean_and_stdev([i.get("avg_gpu_mem_mb") for i in items])
 
         summaries.append(
             {
@@ -1210,8 +1239,8 @@ def summarize_single_gpu_runs(rows: List[Dict[str, float]]) -> List[Dict[str, fl
                 "std_throughput_img_s": std_thr,
                 "mean_train_time_s": mean_time,
                 "std_train_time_s": std_time,
-                "mean_peak_gpu_mem_mb": mean_mem,
-                "std_peak_gpu_mem_mb": std_mem,
+                "mean_avg_gpu_mem_mb": mean_mem,
+                "std_avg_gpu_mem_mb": std_mem,
             }
         )
 

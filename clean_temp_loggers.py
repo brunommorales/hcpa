@@ -44,6 +44,8 @@ ALWAYS_FILE_NAMES = {
 TARGET_FILE_PATTERNS = (
     re.compile(r"events\.out\.tfevents\..+"),
     re.compile(r"checkpoint.*\.(msgpack|ckpt|pkl|pt|pth|npz)$"),
+    re.compile(r"(best|last|model).*\.(msgpack|ckpt|pkl|pt|pth|npz)$"),
+    re.compile(r".*_model.*\.(msgpack|ckpt|pkl|pt|pth|npz)$"),
 )
 
 # Logger directories that are safe to drop.
@@ -53,6 +55,8 @@ TARGET_DIR_NAMES = {
     "wandb",  # Weights & Biases run folders
     "triton_cache",  # PyTorch Triton compilation cache
     "tfdata_cache",  # TensorFlow tf.data cache
+    "keras_cache",  # TensorFlow/Keras model cache
+    "tmp",  # per-run scratch created inside result folders
 }
 
 
