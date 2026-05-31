@@ -19,6 +19,16 @@ fi
 SIF="${SIF:-hcpa.sif}"
 TF_PORT_BASE="${TF_PORT_BASE:-12345}"
 WORKDIR="${WORKDIR:-/workspace}"
+EPOCHS="${EPOCHS:-200}"
+OPTIMIZER="${OPTIMIZER:-adamw}"
+LRATE="${LRATE:-5e-4}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-1e-5}"
+CLIPNORM="${CLIPNORM:-1.0}"
+WARMUP_EPOCHS="${WARMUP_EPOCHS:-5}"
+MIN_LR="${MIN_LR:-1e-6}"
+LABEL_SMOOTHING="${LABEL_SMOOTHING:-0.0}"
+EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-0}"
+EARLY_STOP_MIN_DELTA="${EARLY_STOP_MIN_DELTA:-0.0001}"
 
 HOST_PROJ_DIR="${HOST_PROJ_DIR:-$PWD}"
 HOST_TFREC_DIR="${HOST_TFREC_DIR:-$PWD/data/all-tfrec}"
@@ -77,7 +87,18 @@ for i in "${!NODES[@]}"; do
         --tfrec_dir ${WORKDIR}/data \
         --results ${WORKDIR}/results/runs/${RUN_ID} \
         --batch_size 96 \
-        --epochs 200 \
+        --epochs ${EPOCHS} \
+        --optimizer ${OPTIMIZER} \
+        --lrate ${LRATE} \
+        --weight_decay ${WEIGHT_DECAY} \
+        --clipnorm ${CLIPNORM} \
+        --warmup_epochs ${WARMUP_EPOCHS} \
+        --min_lr ${MIN_LR} \
+        --label_smoothing ${LABEL_SMOOTHING} \
+        --early_stop_patience ${EARLY_STOP_PATIENCE} \
+        --early_stop_min_delta ${EARLY_STOP_MIN_DELTA} \
+        --exact-val-every-epoch \
+        --verbose 2 \
   " >"${log}" 2>&1 &
 
   PIDS+=($!)

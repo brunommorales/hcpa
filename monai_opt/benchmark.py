@@ -10,7 +10,7 @@ from hcpa_monai_optimized.config import TrainConfig
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Benchmark otimizado (PyTorch/MONAI)")
     p.add_argument("--results", type=Path, default=Path("./results/opt_bench"))
-    p.add_argument("--tfrec_dir", type=Path, default=Path("./data/all-tfrec"))
+    p.add_argument("--tfrec_dir", type=Path, default=Path("/home/users/bmmorales/projects/hcpa/data/all-tfrec"))
     p.add_argument("--image_size", type=int, default=299)
     p.add_argument("--batch_size", type=int, default=96)
     p.add_argument("--model", dest="model_name", type=str, default="inception_v3")

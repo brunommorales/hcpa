@@ -1,15 +1,34 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=monai_opt
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --time=04:00:00
-#SBATCH --array=1-10%1
+#SBATCH --array=0-9%1
 #SBATCH --partition=grace
-#SBATCH --nodelist=grace1,grace2
+#SBATCH --nodelist=grace1
 #SBATCH --output=logs/%x_%j_%N.out
 #SBATCH --error=logs/%x_%j_%N.err
 
 set -euxo pipefail
+
+MODULE_NAME="monai_opt"
+SSD_BASE_DIR="${SSD_BASE_DIR:-/ssd/bmmorales}"
+PERSISTENT_ROOT_DIR="${PERSISTENT_ROOT_DIR:-${HOME:-/home/users/bmmorales}/projects/hcpa}"
+REQUIRE_SSD="${REQUIRE_SSD:-1}"
+FINAL_SYNC="${FINAL_SYNC:-0}"
+SYNC_LOGS_TO_HOME="${SYNC_LOGS_TO_HOME:-0}"
+RUNTIME_HELPER="${PERSISTENT_ROOT_DIR}/tools/hcpa_ssd_runtime.sh"
+if [[ ! -f "${RUNTIME_HELPER}" ]]; then
+  echo "[CHECK][FAIL] helper de runtime ausente: ${RUNTIME_HELPER}" >&2
+  exit 91
+fi
+source "${RUNTIME_HELPER}"
+hcpa_runtime_init_paths "${MODULE_NAME}"
+CLEAN_TEMP_HELPER="$(hcpa_runtime_resolve_support_file "clean_temp_loggers.py" "${CLEAN_TEMP_HELPER:-}")"
+if [[ ! -f "${CLEAN_TEMP_HELPER}" ]]; then
+  echo "[CHECK][FAIL] helper de limpeza ausente: ${CLEAN_TEMP_HELPER}" >&2
+  exit 91
+fi
 
 sanitize_tag() {
   local s="${1:-}"
@@ -42,7 +61,7 @@ sanitize_tag() {
 : "${GRAD_ACC:=1}"
 : "${SEED:=2026}"
 : "${USE_DALI:=1}"
-: "${USE_COMPILE:=0}"
+: "${USE_COMPILE:=1}"
 : "${RUN_EVAL:=1}"
 : "${RUN_BENCHMARK:=0}"
 : "${BENCH_WARMUP:=20}"
@@ -84,20 +103,33 @@ if [[ -z "${RESULTS_SUBDIR:-}" ]]; then
   RESULTS_SUBDIR="${RESULTS_ROOT}/result${JOB_TAG}_${NODEGROUP_TAG}_${GPU_DESC}_${BATCH_TAG}"
 fi
 
-: "${APP_DIR:=${SLURM_SUBMIT_DIR}}"
-HOST_PROJ_DIR="${HOST_PROJ_DIR:-${APP_DIR}}"
 CONT_WORKDIR="/workspace"
-: "${TFREC_DIR:=${HOST_PROJ_DIR}/data/all-tfrec}"
-HOST_TFREC_DIR="${TFREC_DIR}"
 CONT_TFREC_DIR="${CONT_WORKDIR}/data/all-tfrec"
-: "${RUN_ID:=$(( (${SLURM_ARRAY_TASK_ID:-1}-1) ))}"
+DEFAULT_TFREC_SOURCE_DIR="${DEFAULT_TFREC_SOURCE_DIR:-${HOME_ROOT_DIR}/data/all-tfrec}"
+if [[ -n "${TFREC_DIR:-}" ]]; then
+  HOST_TFREC_DIR="${TFREC_DIR}"
+  if [[ -d "${HOST_TFREC_DIR}" ]]; then
+    HOST_TFREC_DIR="$(hcpa_runtime_resolve_dir_path "${HOST_TFREC_DIR}")"
+  fi
+else
+  if ! HOST_TFREC_DIR="$(hcpa_runtime_stage_shared_tfrec_to_ssd "${DEFAULT_TFREC_SOURCE_DIR}" "all-tfrec")"; then
+    echo "[SSD][WARN] stage dos TFRecords falhou; usando ${DEFAULT_TFREC_SOURCE_DIR} diretamente" >&2
+    HOST_TFREC_DIR="${DEFAULT_TFREC_SOURCE_DIR}"
+  fi
+fi
+: "${RUN_ID:=${SLURM_ARRAY_TASK_ID:-0}}"
 if (( RUN_ID < 0 )); then RUN_ID=0; fi
-RUN_DIR_BASE="${HOST_PROJ_DIR}/${RESULTS_SUBDIR}"
+HOST_RESULTS_DIR="${HOST_RESULTS_DIR:-${HOST_PROJ_DIR}/${RESULTS_SUBDIR}}"
+HOME_RESULTS_DIR="${HOME_RESULTS_DIR:-${HOME_PROJ_DIR}/${RESULTS_SUBDIR}}"
+HOST_LOGS_DIR="${HOST_PROJ_DIR}/logs"
+HOME_LOGS_DIR="${HOME_PROJ_DIR}/logs"
+RUN_DIR_BASE="${HOST_RESULTS_DIR}"
 RUN_DIR_HOST="${RUN_DIR_BASE}/run_${RUN_ID}"
 RUN_DIR_CONT="${CONT_WORKDIR}/${RESULTS_SUBDIR}/run_${RUN_ID}"
-mkdir -p "${RUN_DIR_HOST}" "${RUN_DIR_BASE}" "${HOST_PROJ_DIR}/logs"
+mkdir -p "${RUN_DIR_HOST}" "${RUN_DIR_BASE}" "${HOST_LOGS_DIR}"
 : "${HOST_UID:=$(id -u)}"
 : "${HOST_GID:=$(id -g)}"
+trap 'exit_code=$?; trap - EXIT; hcpa_runtime_cleanup_and_sync "${exit_code}"; exit "$?"' EXIT
 
 DOCKER_GPU_ARGS="--gpus all"
 CACHE_DIR="${CONT_WORKDIR}/.cache"
@@ -184,7 +216,7 @@ export MASTER_PORT MASTER_ADDR OMP_NUM_THREADS NCCL_DEBUG TORCH_DISTRIBUTED_DEBU
 echo "[monai_opt][${SLURM_JOB_ID:-manual}] RUN_ID=${RUN_ID} BATCH=${BATCH_SIZE} EPOCHS=${EPOCHS} MODEL=${MODEL} DALI=${USE_DALI} COMPILE=${USE_COMPILE} GPU=${GPU_NAME} JOB=${JOB_TAG} NNODES=${NNODES} GPUS_PER_NODE=${GPU_COUNT} WORLD_SIZE=${WORLD_SIZE}"
 
 # Export variables for srun heredoc
-export IMAGE HOST_PROJ_DIR HOST_TFREC_DIR CONT_WORKDIR CONT_TFREC_DIR HOST_UID HOST_GID
+export IMAGE HOST_PROJ_DIR HOST_TFREC_DIR CONT_WORKDIR CONT_TFREC_DIR HOST_UID HOST_GID HOST_RESULTS_DIR HOME_RESULTS_DIR HOST_LOGS_DIR HOME_LOGS_DIR
 export CACHE_DIR MPL_DIR HF_CACHE TORCH_CACHE RESULTS_SUBDIR RUN_ID RUN_DIR_CONT
 export BATCH_SIZE EPOCHS LR WEIGHT_DECAY IMAGE_SIZE MODEL NORMALIZE FUNDUS_CROP
 export MIXUP CUTMIX LABEL_SMOOTH EMA_DECAY GRAD_CLIP GRAD_ACC SEED
@@ -274,7 +306,13 @@ fi
 CONTAINER_NAME="monai_opt_${SLURM_JOB_ID}_${SLURM_NODEID}_r${RUN_ID}"
 CACHE_ROOT="/tmp/monai_opt_${SLURM_JOB_ID}_r${RUN_ID}_${SLURM_NODEID}/cache"
 
+DOCKER_USERNS_ARGS=()
+if docker --version 2>/dev/null | grep -qi podman; then
+  DOCKER_USERNS_ARGS=(--userns=keep-id)
+fi
+
 docker run --rm --name "${CONTAINER_NAME}" \
+  "${DOCKER_USERNS_ARGS[@]}" \
   ${DOCKER_GPU_ARGS} \
   --ipc=host \
   --ulimit memlock=-1 --ulimit stack=67108864 \
@@ -359,7 +397,7 @@ docker run --rm --name "${CONTAINER_NAME}" \
         --channels_last \\
         --amp \\
         \$([ ${USE_DALI} -eq 1 ] && echo --use_dali || echo --no_dali) \\
-        \$([ ${USE_COMPILE} -eq 1 ] || echo --no_compile) \\
+        \$([ ${USE_COMPILE} -eq 1 ] && echo --compile || echo --no_compile) \\
         \$([ ${AUGMENT} -eq 1 ] && echo --augment || echo --no_augment) \\
         --seed ${SEED} \\
     | tee '${RUN_DIR_CONT}/train.log';
@@ -382,5 +420,7 @@ docker run --rm --name "${CONTAINER_NAME}" \
     fi
   "
 EOS
+
+python3 "${CLEAN_TEMP_HELPER}" --root "${RUN_DIR_BASE}" --scope results-only --max-print 0 || true
 
 echo "[monai_opt] Finalizado run_${RUN_ID}"

@@ -10,7 +10,7 @@ From: nvcr.io/nvidia/pytorch:24.11-py3
     App pytorch_opt
 
 %files
-    requirements-ngc.txt /tmp/requirements-ngc.txt
+    requirements-ngc.txt /opt/requirements-ngc.txt
 
 %post
     set -eux
@@ -20,7 +20,7 @@ From: nvcr.io/nvidia/pytorch:24.11-py3
         C=""
     fi
     python -m pip install --upgrade pip
-    python -m pip install -r /tmp/requirements-ngc.txt ${C}
+    python -m pip install -r /opt/requirements-ngc.txt ${C}
     # Enable DALI if/when needed:
     # python -m pip install --extra-index-url https://developer.download.nvidia.com/compute/redist nvidia-dali-cuda120
     rm -rf /root/.cache/pip

@@ -9,19 +9,19 @@ From: nvcr.io/nvidia/tensorflow:25.02-tf2-py3
     App tensorflow_opt_tf
 
 %files
-    requirements /tmp/requirements.txt
+    requirements /opt/requirements.txt
 
 %post
     set -eux
     python -m pip install --upgrade pip
     if [ -f /etc/pip/constraint.txt ]; then
-        python -m pip install -r /tmp/requirements.txt -c /etc/pip/constraint.txt
+        python -m pip install -r /opt/requirements.txt -c /etc/pip/constraint.txt
         python -m pip install --extra-index-url https://developer.download.nvidia.com/compute/redist \
             -c /etc/pip/constraint.txt \
             nvidia-dali-cuda120 \
             nvidia-dali-tf-plugin-cuda120
     else
-        python -m pip install -r /tmp/requirements.txt
+        python -m pip install -r /opt/requirements.txt
         python -m pip install --extra-index-url https://developer.download.nvidia.com/compute/redist \
             nvidia-dali-cuda120 \
             nvidia-dali-tf-plugin-cuda120

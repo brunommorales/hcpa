@@ -36,6 +36,9 @@ echo ""
 # 2. Executar docker build em TODOS os nós alocados, em paralelo
 IMAGE_TAG="hcpa_nvidia"
 NNODES="${SLURM_JOB_NUM_NODES:-1}"
+HOST_UID="${HOST_UID:-$(id -u)}"
+HOST_GID="${HOST_GID:-$(id -g)}"
+BUILD_ARGS="--build-arg UID=${HOST_UID} --build-arg GID=${HOST_GID}"
 
 echo "Iniciando build paralelo em ${NNODES} nó(s): ${SLURM_NODELIST}"
 
@@ -53,7 +56,7 @@ srun -N "${NNODES}" -n "${NNODES}" --ntasks-per-node=1 --label bash -lc \
       echo '[INFO]' \"\$(hostname)\": imagem já presente, pulando build; \
    else \
       echo '[INFO]' \"\$(hostname)\": construindo imagem ${IMAGE_TAG}; \
-      docker build -t ${IMAGE_TAG} .; \
+      docker build ${BUILD_ARGS} -t ${IMAGE_TAG} .; \
    fi"
 
 # Verificação final: garante que a imagem existe em todos os nós

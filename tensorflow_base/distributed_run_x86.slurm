@@ -4,10 +4,10 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1
 #SBATCH --cpus-per-task=8
-#SBATCH --array=1-10%2
+#SBATCH --array=0-9%1
 #SBATCH --time=24:00:00
 #SBATCH --partition=tupi
-#SBATCH --nodelist=tupi4
+#SBATCH --nodelist=tupi6
 #SBATCH --output=logs/%x_%j_%N.out
 #SBATCH --error=logs/%x_%j_%N.err
 
@@ -54,9 +54,37 @@ EOS
 
 # ========================== CONFIG ==========================
 IMAGE="tf_distributed_x86:latest"
+MODULE_NAME="tensorflow_base"
 
-HOST_PROJ_DIR="${SLURM_SUBMIT_DIR}"
-HOST_TFREC_DIR="${HOST_TFREC_DIR:-${HOST_PROJ_DIR}/data/all-tfrec}"
+SSD_BASE_DIR="${SSD_BASE_DIR:-/ssd/bmmorales}"
+PERSISTENT_ROOT_DIR="${PERSISTENT_ROOT_DIR:-${HOME:-/home/users/bmmorales}/projects/hcpa}"
+REQUIRE_SSD="${REQUIRE_SSD:-1}"
+FINAL_SYNC="${FINAL_SYNC:-0}"
+SYNC_LOGS_TO_HOME="${SYNC_LOGS_TO_HOME:-0}"
+RUNTIME_HELPER="${PERSISTENT_ROOT_DIR}/tools/hcpa_ssd_runtime.sh"
+if [[ ! -f "${RUNTIME_HELPER}" ]]; then
+  echo "[CHECK][FAIL] helper de runtime ausente: ${RUNTIME_HELPER}"
+  exit 91
+fi
+source "${RUNTIME_HELPER}"
+hcpa_runtime_init_paths "${MODULE_NAME}"
+
+DEFAULT_TFREC_SOURCE_DIR="${DEFAULT_TFREC_SOURCE_DIR:-${HOME_ROOT_DIR}/data/all-tfrec}"
+if [[ -n "${HOST_TFREC_DIR:-}" ]]; then
+  if [[ -d "${HOST_TFREC_DIR}" ]]; then
+    HOST_TFREC_DIR="$(hcpa_runtime_resolve_dir_path "${HOST_TFREC_DIR}")"
+  fi
+else
+  if ! HOST_TFREC_DIR="$(hcpa_runtime_stage_shared_tfrec_to_ssd "${DEFAULT_TFREC_SOURCE_DIR}" "all-tfrec")"; then
+    echo "[SSD][WARN] stage dos TFRecords falhou; usando ${DEFAULT_TFREC_SOURCE_DIR} diretamente" >&2
+    HOST_TFREC_DIR="${DEFAULT_TFREC_SOURCE_DIR}"
+  fi
+fi
+CLEAN_TEMP_HELPER="$(hcpa_runtime_resolve_support_file "clean_temp_loggers.py" "${CLEAN_TEMP_HELPER:-}")"
+if [[ ! -f "${CLEAN_TEMP_HELPER}" ]]; then
+  echo "[CHECK][FAIL] helper de limpeza ausente: ${CLEAN_TEMP_HELPER}"
+  exit 91
+fi
 CONT_WORKDIR="/workspace"
 
 # Usa tmp local para build/cache do Docker (evita encher /usr/NFS)
@@ -68,12 +96,12 @@ INTERNAL_IFACE="${INTERNAL_IFACE:-}"
 export INTERNAL_IFACE
 HOST_UID="${HOST_UID:-$(id -u)}"
 HOST_GID="${HOST_GID:-$(id -g)}"
-ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:-1}"
+ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 ARRAY_TASK_MAX="${SLURM_ARRAY_TASK_MAX:-${ARRAY_TASK_ID}}"
 ARRAY_JOB_ID="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-manual}}"
-if ! [[ "${ARRAY_TASK_ID}" =~ ^[0-9]+$ ]]; then ARRAY_TASK_ID=1; fi
+if ! [[ "${ARRAY_TASK_ID}" =~ ^[0-9]+$ ]]; then ARRAY_TASK_ID=0; fi
 if ! [[ "${ARRAY_TASK_MAX}" =~ ^[0-9]+$ ]]; then ARRAY_TASK_MAX="${ARRAY_TASK_ID}"; fi
-RUN_ID=$((ARRAY_TASK_ID-1))
+RUN_ID=${ARRAY_TASK_ID}
 JOB_ID_TAG="${ARRAY_JOB_ID}"
 CHECK_VERBOSE="${HCPA_PRECHECK_VERBOSE:-0}"
 
@@ -158,8 +186,18 @@ TRAIN_STATIC_ARGS=(
   --model InceptionV3
   --normalize preprocess
   --batch_size 96
-  --epochs 200
-  --lrate 0.001
+  --epochs "${EPOCHS:-200}"
+  --optimizer adamw
+  --lrate 5e-4
+  --weight_decay 1e-5
+  --clipnorm 1.0
+  --warmup_epochs 5
+  --min_lr 1e-6
+  --label_smoothing 0.0
+  --early_stop_patience "${EARLY_STOP_PATIENCE:-0}"
+  --early_stop_min_delta "${EARLY_STOP_MIN_DELTA:-0.0001}"
+  --exact-val-every-epoch
+  --verbose 2
 )
 
 DOCKER_GPU_ARGS=(--gpus all)
@@ -205,12 +243,17 @@ if [[ -z "${RESULTS_SUBDIR:-}" ]]; then
   RESULTS_SUBDIR="results/result${JOB_ID_TAG}_${NODEGROUP_TAG}_${GPU_DESC}_${BATCH_TAG}"
 fi
 HOST_RESULTS_DIR="${HOST_RESULTS_DIR:-${HOST_PROJ_DIR}/${RESULTS_SUBDIR}}"
+HOME_RESULTS_DIR="${HOME_RESULTS_DIR:-${HOME_PROJ_DIR}/${RESULTS_SUBDIR}}"
 RUNS_DIR_HOST="${HOST_RESULTS_DIR}"
 RUN_DIR_BASE="${HOST_RESULTS_DIR}"
+HOST_LOGS_DIR="${HOST_PROJ_DIR}/logs"
+HOME_LOGS_DIR="${HOME_PROJ_DIR}/logs"
 TRAIN_STATIC_ARGS_STR="$(printf '%s ' "${TRAIN_STATIC_ARGS[@]}")"
 TRAIN_STATIC_ARGS_STR="${TRAIN_STATIC_ARGS_STR% }"
 
-export IMAGE HOST_PROJ_DIR HOST_TFREC_DIR CONT_WORKDIR HOST_UID HOST_GID HOST_RESULTS_DIR RUNS_DIR_HOST RUN_DIR_BASE RESULTS_SUBDIR TOTAL_GPUS
+trap 'exit_code=$?; trap - EXIT; hcpa_runtime_cleanup_and_sync "${exit_code}"; exit "$?"' EXIT
+
+export IMAGE HOST_PROJ_DIR HOST_TFREC_DIR CONT_WORKDIR HOST_UID HOST_GID HOST_RESULTS_DIR HOME_RESULTS_DIR HOST_LOGS_DIR HOME_LOGS_DIR RUNS_DIR_HOST RUN_DIR_BASE RESULTS_SUBDIR TOTAL_GPUS
 export TRAIN_STATIC_ARGS_STR TRAIN_BATCH_SIZE DOCKER_GPU_ARGS_STR
 
 
@@ -276,7 +319,7 @@ fi
 
 echo "[CHECK] Pré-checagem local concluída com sucesso."
 
-mkdir -p logs
+mkdir -p "${HOST_LOGS_DIR}"
 
 NNODES="${SLURM_JOB_NUM_NODES:-2}"
 readarray -t SLURM_HOSTS < <(scontrol show hostnames "$SLURM_NODELIST")
@@ -384,7 +427,7 @@ if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
   [[ -d "${BUILD_DIR}" ]] || { echo "Diretório de build ausente em ${HOSTNAME}: ${BUILD_DIR}"; exit 128; }
   (
     cd "${BUILD_DIR}"
-    docker build -t "${IMAGE}" .
+    docker build --build-arg UID="${HOST_UID}" --build-arg GID="${HOST_GID}" -t "${IMAGE}" .
   )
 fi
 
@@ -506,8 +549,20 @@ cfg = {"cluster": {"worker": workers}, "task": {"type": "worker", "index": rank}
 print(json.dumps(cfg))
 PY
 )"
+DOCKER_TF_CONFIG_ARGS=()
+if [[ "${WORLD_SIZE}" =~ ^[0-9]+$ ]] && (( WORLD_SIZE > 1 )); then
+	DOCKER_TF_CONFIG_ARGS=(-e TF_CONFIG="${TF_CONFIG_JSON}")
+else
+	echo "[${LOCAL_NODE}] TF_CONFIG omitido para execução single-worker."
+fi
+
+DOCKER_USERNS_ARGS=()
+if docker --version 2>/dev/null | grep -qi podman; then
+  DOCKER_USERNS_ARGS=(--userns=keep-id)
+fi
 
 docker run --rm --name "${CONTAINER_NAME}" \
+  "${DOCKER_USERNS_ARGS[@]}" \
   "${DOCKER_GPU_ARGS[@]}" \
   --ipc=host \
   --ulimit memlock=-1 --ulimit stack=67108864 \
@@ -529,18 +584,22 @@ docker run --rm --name "${CONTAINER_NAME}" \
   -e WORLD_SIZE="${WORLD_SIZE}" \
   -e MASTER_ADDR="${MASTER_ADDR}" \
   -e MASTER_PORT="${MASTER_PORT}" \
-  -e NODE_RANK="${NODE_RANK}" \
-  -e TF_WORKER_ADDRESSES="${TF_WORKER_ADDRESSES}" \
-  -e TF_WORKER_ADDRESSES_LOCAL="${TF_WORKER_ADDRESSES}" \
-  -e TF_CONFIG="${TF_CONFIG_JSON}" \
-  "${IMAGE}" \
+	  -e NODE_RANK="${NODE_RANK}" \
+	  -e TF_WORKER_ADDRESSES="${TF_WORKER_ADDRESSES}" \
+	  -e TF_WORKER_ADDRESSES_LOCAL="${TF_WORKER_ADDRESSES}" \
+	  "${DOCKER_TF_CONFIG_ARGS[@]}" \
+	  "${IMAGE}" \
   bash -lc "
     echo \"[$(hostname)] rank=${NODE_RANK}/${WORLD_SIZE} subindo\";
     export TF_CPP_MIN_LOG_LEVEL=\"${TF_CPP_MIN_LOG_LEVEL:-2}\";
     export TF_CPP_MIN_VLOG_LEVEL=0;
     export TF_ENABLE_GPU_GC=1;
     export TF_FORCE_GPU_ALLOW_GROWTH=true;
-    export TF_GPU_ALLOCATOR=cuda_malloc_async;
+    if [[ -n "${TF_GPU_ALLOCATOR:-}" ]]; then
+      export TF_GPU_ALLOCATOR="${TF_GPU_ALLOCATOR:-}";
+    else
+      unset TF_GPU_ALLOCATOR;
+    fi;
     export TF_NUM_INTEROP_THREADS=\"${TF_NUM_INTEROP_THREADS:-0}\";
     export PYTHONWARNINGS=\"ignore::UserWarning,ignore::RuntimeWarning\";
     results_dir=\"./${RESULTS_SUBDIR}/run_${RUN_ID}\";
@@ -566,6 +625,6 @@ EOS
 echo "[RUN ${RUN_LABEL} | run_id ${RUN_ID}] concluido."
 
 # Limpa logs/caches volumosos, preservando CSVs/PDFs
-python3 "${HOST_PROJ_DIR}/../clean_temp_loggers.py" --root "${RUN_DIR_BASE}" --scope results-only --max-print 0 || true
+python3 "${CLEAN_TEMP_HELPER}" --root "${RUN_DIR_BASE}" --scope results-only --max-print 0 || true
 
 echo "Job complete."

@@ -4,13 +4,32 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1
 #SBATCH --cpus-per-task=8
-#SBATCH --array=1-10%1
+#SBATCH --array=0-9%1
 #SBATCH --time=24:00:00
 #SBATCH --partition=tupi
 #SBATCH --nodelist=tupi5
 #SBATCH --output=logs/%x_%j_%N.out
 #SBATCH --error=logs/%x_%j_%N.err
 set -euo pipefail
+
+MODULE_NAME="monai_base"
+SSD_BASE_DIR="${SSD_BASE_DIR:-/ssd/bmmorales}"
+PERSISTENT_ROOT_DIR="${PERSISTENT_ROOT_DIR:-${HOME:-/home/users/bmmorales}/projects/hcpa}"
+REQUIRE_SSD="${REQUIRE_SSD:-1}"
+FINAL_SYNC="${FINAL_SYNC:-0}"
+SYNC_LOGS_TO_HOME="${SYNC_LOGS_TO_HOME:-0}"
+RUNTIME_HELPER="${PERSISTENT_ROOT_DIR}/tools/hcpa_ssd_runtime.sh"
+if [[ ! -f "${RUNTIME_HELPER}" ]]; then
+  echo "[CHECK][FAIL] helper de runtime ausente: ${RUNTIME_HELPER}" >&2
+  exit 91
+fi
+source "${RUNTIME_HELPER}"
+hcpa_runtime_init_paths "${MODULE_NAME}"
+CLEAN_TEMP_HELPER="$(hcpa_runtime_resolve_support_file "clean_temp_loggers.py" "${CLEAN_TEMP_HELPER:-}")"
+if [[ ! -f "${CLEAN_TEMP_HELPER}" ]]; then
+  echo "[CHECK][FAIL] helper de limpeza ausente: ${CLEAN_TEMP_HELPER}" >&2
+  exit 91
+fi
 
 sanitize_tag() {
   local s="${1:-}"
@@ -35,9 +54,9 @@ sanitize_tag() {
 : "${NORMALIZE:=inception}"
 : "${FUNDUS_CROP:=0.9}"
 : "${AUGMENT:=1}"
-: "${MIXUP:=0.2}"
+: "${MIXUP:=0.0}"
 : "${CUTMIX:=0.0}"
-: "${LABEL_SMOOTH:=0.02}"
+: "${LABEL_SMOOTH:=0.0}"
 : "${EMA_DECAY:=0.0}"
 : "${GRAD_CLIP:=1.0}"
 : "${GRAD_ACC:=1}"
@@ -84,24 +103,41 @@ if [[ -z "${RESULTS_SUBDIR:-}" ]]; then
   RESULTS_SUBDIR="${RESULTS_ROOT}/result${JOB_TAG}_${NODEGROUP_TAG}_${GPU_DESC}_${BATCH_TAG}"
 fi
 
-: "${APP_DIR:=${SLURM_SUBMIT_DIR}}"
-HOST_PROJ_DIR="${HOST_PROJ_DIR:-${APP_DIR}}"
 CONT_WORKDIR="/workspace"
-: "${TFREC_DIR:=${HOST_PROJ_DIR}/data/all-tfrec}"
-HOST_TFREC_DIR="${TFREC_DIR}"
 CONT_TFREC_DIR="${CONT_WORKDIR}/data/all-tfrec"
-: "${RUN_ID:=$(( (${SLURM_ARRAY_TASK_ID:-1}-1) ))}"
+DEFAULT_TFREC_SOURCE_DIR="${DEFAULT_TFREC_SOURCE_DIR:-${HOME_ROOT_DIR}/data/all-tfrec}"
+if [[ -n "${TFREC_DIR:-}" ]]; then
+  HOST_TFREC_DIR="${TFREC_DIR}"
+  if [[ -d "${HOST_TFREC_DIR}" ]]; then
+    HOST_TFREC_DIR="$(hcpa_runtime_resolve_dir_path "${HOST_TFREC_DIR}")"
+  fi
+else
+  if ! HOST_TFREC_DIR="$(hcpa_runtime_stage_shared_tfrec_to_ssd "${DEFAULT_TFREC_SOURCE_DIR}" "all-tfrec")"; then
+    echo "[SSD][WARN] stage dos TFRecords falhou; usando ${DEFAULT_TFREC_SOURCE_DIR} diretamente" >&2
+    HOST_TFREC_DIR="${DEFAULT_TFREC_SOURCE_DIR}"
+  fi
+fi
+: "${RUN_ID:=${SLURM_ARRAY_TASK_ID:-0}}"
 if (( RUN_ID < 0 )); then RUN_ID=0; fi
-RUN_DIR_BASE="${HOST_PROJ_DIR}/${RESULTS_SUBDIR}"
+HOST_RESULTS_DIR="${HOST_RESULTS_DIR:-${HOST_PROJ_DIR}/${RESULTS_SUBDIR}}"
+HOME_RESULTS_DIR="${HOME_RESULTS_DIR:-${HOME_PROJ_DIR}/${RESULTS_SUBDIR}}"
+HOST_LOGS_DIR="${HOST_PROJ_DIR}/logs"
+HOME_LOGS_DIR="${HOME_PROJ_DIR}/logs"
+RUN_DIR_BASE="${HOST_RESULTS_DIR}"
 RUN_DIR_HOST="${RUN_DIR_BASE}/run_${RUN_ID}"
 RUN_DIR_CONT="${CONT_WORKDIR}/${RESULTS_SUBDIR}/run_${RUN_ID}"
-mkdir -p "${RUN_DIR_HOST}" "${RUN_DIR_BASE}" "${HOST_PROJ_DIR}/logs"
+mkdir -p "${RUN_DIR_HOST}" "${RUN_DIR_BASE}" "${HOST_LOGS_DIR}"
 : "${HOST_UID:=$(id -u)}"
 : "${HOST_GID:=$(id -g)}"
+trap 'exit_code=$?; trap - EXIT; hcpa_runtime_cleanup_and_sync "${exit_code}"; exit "$?"' EXIT
 
 DOCKER_GPU_ARGS=(--gpus all)
 DOCKER_RUNTIME_ARG=(docker)
 DOCKER_USER_ARGS=(-u "${HOST_UID}:${HOST_GID}")
+DOCKER_USERNS_ARGS=()
+if docker --version 2>/dev/null | grep -qi podman; then
+  DOCKER_USERNS_ARGS=(--userns=keep-id)
+fi
 CACHE_DIR="${CONT_WORKDIR}/.cache"
 MPL_DIR="${CACHE_DIR}/matplotlib"
 HF_CACHE="${CACHE_DIR}/huggingface"
@@ -127,6 +163,7 @@ echo "[monai_base][${SLURM_JOB_ID:-manual}] RUN_ID=${RUN_ID} BATCH=${BATCH_SIZE}
 
 srun --ntasks=${NNODES} --ntasks-per-node=1 \
   "${DOCKER_RUNTIME_ARG[@]}" run --rm \
+  "${DOCKER_USERNS_ARGS[@]}" \
   "${DOCKER_GPU_ARGS[@]}" \
   "${DOCKER_USER_ARGS[@]}" \
   --ipc=host \
@@ -203,5 +240,7 @@ srun --ntasks=${NNODES} --ntasks-per-node=1 \
         --measure_steps ${BENCH_STEPS} \
      | tee -a '${RUN_DIR_CONT}/train.log'; \
     fi"
+
+python3 "${CLEAN_TEMP_HELPER}" --root "${RUN_DIR_BASE}" --scope results-only --max-print 0 || true
 
 echo "[monai_base] Finalizado run_${RUN_ID}"

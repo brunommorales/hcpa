@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Versão simplificada do treinamento PyTorch distribuído.
-- Sem fases de fine-tuning ou agendas especiais.
-- Sem DALI, mixup, EMA, AMP ou outras otimizações.
-- Mantém leitura direta de TFRecords e DDP para usar múltiplas GPUs.
+Treinamento PyTorch distribuído com leitura direta de TFRecords.
+
+Este script mantém o pipeline base sem DALI/EMA, mas permite alinhar a
+receita de treino com a versão otimizada para comparações controladas.
 """
 import argparse
 import io
@@ -17,26 +17,74 @@ from typing import Iterable, Optional, Tuple
 from os.path import join
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-os.environ.setdefault("KERAS_BACKEND", "torch")
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
 import torch.distributed as dist
-from keras import applications as _apps
-from keras import layers
-import keras
+import timm
 from PIL import Image, ImageEnhance, ImageOps
 from sklearn.metrics import auc, roc_auc_score, roc_curve
 from tfrecord import example_pb2
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
-from torch.optim import Adam
+from torch.optim import Adam, AdamW, SGD, RMSprop, Adadelta
 from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR, SequentialLR
 from torch.cuda.amp import GradScaler, autocast
 import torchvision.transforms.v2 as T
-import torchvision.transforms.functional as TF
+
+from lib.runtime_profiling import RuntimeProfiler
+
+
+COMMON_CSV_FIELDS = [
+    "epoch",
+    "stage",
+    "train_loss",
+    "train_auc",
+    "train_precision",
+    "train_recall",
+    "train_f1",
+    "train_sens",
+    "train_spec",
+    "train_spec_at_sens95",
+    "train_throughput_img_s",
+    "train_elapsed_s",
+    "train_avg_batch_time_ms",
+    "train_inference_latency_ms_img",
+    "train_inference_latency_ms_batch",
+    "train_gpu_mem_avg_mb",
+    "val_loss",
+    "val_auc",
+    "val_precision",
+    "val_recall",
+    "val_f1",
+    "val_sens",
+    "val_spec",
+    "val_spec_at_sens95",
+    "val_throughput_img_s",
+    "val_elapsed_s",
+    "val_avg_batch_time_ms",
+    "val_inference_latency_ms_img",
+    "val_inference_latency_ms_batch",
+    "val_gpu_mem_avg_mb",
+    "test_loss",
+    "test_auc",
+    "test_precision",
+    "test_recall",
+    "test_f1",
+    "test_sens",
+    "test_spec",
+    "test_spec_at_sens95",
+    "test_throughput_img_s",
+    "test_elapsed_s",
+    "test_avg_batch_time_ms",
+    "test_inference_latency_ms_img",
+    "test_inference_latency_ms_batch",
+    "test_gpu_mem_avg_mb",
+    "lr",
+    "total_train_time_s",
+]
 
 
 # ---------------------------
@@ -44,17 +92,27 @@ import torchvision.transforms.functional as TF
 # ---------------------------
 def parse_args():
     parser = argparse.ArgumentParser(description="Treino básico em GPU com DDP")
-    parser.add_argument("--tfrec_dir", type=str, default="./data/all", help="Diretório com TFRecords")
+    parser.add_argument("--tfrec_dir", type=str, default="/home/users/bmmorales/projects/hcpa/data/all-tfrec", help="Diretório com TFRecords")
     parser.add_argument("--dataset", type=str, default="all", help="Nome lógico do dataset")
     parser.add_argument("--results", type=str, default="./results/all", help="Diretório de saída dos resultados")
     parser.add_argument("--exec", type=int, default=0, help="ID da execução")
     parser.add_argument("--img_sizes", type=int, default=299, help="Tamanho das imagens (quadradas)")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch por GPU (batch global = batch_size * GPUs)")
-    parser.add_argument("--epochs", type=int, default=50, help="Épocas totais")
+    parser.add_argument("--batch_size", type=int, default=96, help="Batch por GPU (batch global = batch_size * GPUs)")
+    parser.add_argument("--epochs", type=int, default=200, help="Épocas totais")
     parser.add_argument("--lrate", type=float, default=5e-4, help="Learning rate")
+    parser.add_argument(
+        "--optimizer", type=str, default="adamw",
+        choices=["adam", "adamw", "sgd_mom", "rmsprop", "adadelta"],
+        help="Otimizador a usar (padrão: adamw)"
+    )
     parser.add_argument("--num_thresholds", type=int, default=200, help="Número de thresholds para ROC")
     parser.add_argument("--verbose", type=int, default=1, help="Verbosity (apenas no rank 0)")
-    parser.add_argument("--model", type=str, default="InceptionV3", help="Backbone keras.applications")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="inception_v3",
+        help="Backbone timm (ex.: inception_v3)",
+    )
     parser.add_argument(
         "--normalize",
         type=str,
@@ -81,25 +139,25 @@ def parse_args():
     parser.add_argument(
         "--freeze_epochs",
         type=int,
-        default=3,
+        default=0,
         help="Épocas iniciais treinando apenas a cabeça (backbone congelado)",
     )
     parser.add_argument(
         "--fine_tune_lr_factor",
         type=float,
-        default=0.01,
+        default=0.1,
         help="Fator aplicado ao LR ao liberar o backbone (<=0 mantém o mesmo LR)",
     )
     parser.add_argument(
         "--fine_tune_lr",
         type=float,
-        default=-1.0,
+        default=5e-4,
         help="Learning rate absoluto para o fine-tune (sobrepõe o fator se >0)",
     )
     parser.add_argument(
         "--warmup_epochs",
         type=int,
-        default=3,
+        default=5,
         help="Número de épocas de warmup para o learning rate scheduler",
     )
     parser.add_argument(
@@ -114,48 +172,70 @@ def parse_args():
         default=0.0,
         help="Label smoothing para regularização (0.0 desativa, 0.1 recomendado)",
     )
+    parser.add_argument(
+        "--fundus_crop_ratio",
+        type=float,
+        default=1.0,
+        help="Crop central antes do resize (<=0 ou >1 desativa)",
+    )
+    parser.add_argument("--enable_amp", dest="use_amp", action="store_true", help="Habilita AMP/FP16")
+    parser.add_argument("--disable_amp", dest="use_amp", action="store_false", help="Desabilita AMP/FP16")
+    parser.set_defaults(use_amp=False)
+    parser.add_argument(
+        "--enable_cosine",
+        dest="use_cosine_scheduler",
+        action="store_true",
+        help="Habilita warmup + cosine annealing",
+    )
+    parser.add_argument(
+        "--disable_cosine",
+        dest="use_cosine_scheduler",
+        action="store_false",
+        help="Mantém learning rate constante",
+    )
+    parser.set_defaults(use_cosine_scheduler=False)
     return parser.parse_args()
 
 
 # --- Normalização por backbone ---
-_PREPROCESS_MAP = {
-    "InceptionV3": _apps.inception_v3.preprocess_input,
-    "Xception": _apps.xception.preprocess_input,
-    "EfficientNetB0": _apps.efficientnet.preprocess_input,
-    "EfficientNetB1": _apps.efficientnet.preprocess_input,
-    "EfficientNetB2": _apps.efficientnet.preprocess_input,
-    "EfficientNetB3": _apps.efficientnet.preprocess_input,
-    "EfficientNetB4": _apps.efficientnet.preprocess_input,
-    "EfficientNetB5": _apps.efficientnet.preprocess_input,
-    "EfficientNetB6": _apps.efficientnet.preprocess_input,
-    "EfficientNetB7": _apps.efficientnet.preprocess_input,
-    "ResNet50": _apps.resnet.preprocess_input,
-    "ResNet101": _apps.resnet.preprocess_input,
-    "ResNet152": _apps.resnet.preprocess_input,
-    "ResNet50V2": _apps.resnet_v2.preprocess_input,
-    "ResNet101V2": _apps.resnet_v2.preprocess_input,
-    "ResNet152V2": _apps.resnet_v2.preprocess_input,
-    "VGG16": _apps.vgg16.preprocess_input,
-    "VGG19": _apps.vgg19.preprocess_input,
-    "DenseNet121": _apps.densenet.preprocess_input,
-    "DenseNet169": _apps.densenet.preprocess_input,
-    "DenseNet201": _apps.densenet.preprocess_input,
-    "MobileNet": _apps.mobilenet.preprocess_input,
-    "MobileNetV2": _apps.mobilenet_v2.preprocess_input,
-    "MobileNetV3Small": _apps.mobilenet_v3.preprocess_input,
-    "MobileNetV3Large": _apps.mobilenet_v3.preprocess_input,
-    "NASNetMobile": _apps.nasnet.preprocess_input,
-    "NASNetLarge": _apps.nasnet.preprocess_input,
-    "ConvNeXtTiny": _apps.convnext.preprocess_input,
-    "ConvNeXtSmall": _apps.convnext.preprocess_input,
-    "ConvNeXtBase": _apps.convnext.preprocess_input,
-    "ConvNeXtLarge": _apps.convnext.preprocess_input,
-    "ConvNeXtXLarge": _apps.convnext.preprocess_input,
+IMAGENET_MEAN_255 = [x * 255.0 for x in (0.485, 0.456, 0.406)]
+IMAGENET_STD_255 = [x * 255.0 for x in (0.229, 0.224, 0.225)]
+
+INCEPTION_MEAN_255 = [127.5, 127.5, 127.5]
+INCEPTION_STD_255 = [127.5, 127.5, 127.5]
+
+BACKBONE_NORMALIZATION = {
+    "inceptionv3": (INCEPTION_MEAN_255, INCEPTION_STD_255),
+    "inception_v3": (INCEPTION_MEAN_255, INCEPTION_STD_255),
+    "inceptionresnetv2": (INCEPTION_MEAN_255, INCEPTION_STD_255),
+    "inception_resnet_v2": (INCEPTION_MEAN_255, INCEPTION_STD_255),
+    "xception": (INCEPTION_MEAN_255, INCEPTION_STD_255),
+    "resnet50": (IMAGENET_MEAN_255, IMAGENET_STD_255),
+    "resnet101": (IMAGENET_MEAN_255, IMAGENET_STD_255),
+    "efficientnetb0": (IMAGENET_MEAN_255, IMAGENET_STD_255),
+    "efficientnet_b0": (IMAGENET_MEAN_255, IMAGENET_STD_255),
+    "efficientnetb1": (IMAGENET_MEAN_255, IMAGENET_STD_255),
+    "efficientnet_b1": (IMAGENET_MEAN_255, IMAGENET_STD_255),
+    "efficientnetb2": (IMAGENET_MEAN_255, IMAGENET_STD_255),
+    "efficientnet_b2": (IMAGENET_MEAN_255, IMAGENET_STD_255),
+    "efficientnetb3": (IMAGENET_MEAN_255, IMAGENET_STD_255),
+    "efficientnet_b3": (IMAGENET_MEAN_255, IMAGENET_STD_255),
+    "efficientnetb4": (IMAGENET_MEAN_255, IMAGENET_STD_255),
+    "efficientnet_b4": (IMAGENET_MEAN_255, IMAGENET_STD_255),
 }
 
 
-def get_preprocess_fn(model_name: str):
-    return _PREPROCESS_MAP.get(model_name, None)
+def _canonical_model_key(model_name: str) -> str:
+    return str(model_name).lower().replace("-", "_")
+
+
+def get_normalization_for_backbone(model_name: str):
+    key = _canonical_model_key(model_name)
+    if key in BACKBONE_NORMALIZATION:
+        return BACKBONE_NORMALIZATION[key]
+    if "inception" in key or "xception" in key:
+        return (INCEPTION_MEAN_255, INCEPTION_STD_255)
+    return (IMAGENET_MEAN_255, IMAGENET_STD_255)
 
 
 # ---------------------------
@@ -193,7 +273,8 @@ class GPUAugmentation:
             x = x.permute(0, 3, 1, 2).contiguous()
         if x.dim() == 3 and x.shape[0] not in (1, 3) and x.shape[-1] in (1, 3):
             x = x.permute(2, 0, 1).contiguous()
-        return self.transforms(x)
+        x = self.transforms(x)
+        return x.clamp_(0.0, 255.0)
 
 
 def _read_gpu_used_mb():
@@ -225,14 +306,26 @@ class RetinaTFRecord(Dataset):
       - "retinopatia": int (0/1)
     """
 
-    def __init__(self, tfrecord_paths, index_paths, img_size=299, model_name="InceptionV3", normalize_mode="preprocess",
-                 augment=False):
+    def __init__(
+        self,
+        tfrecord_paths,
+        index_paths,
+        img_size=299,
+        model_name="inception_v3",
+        normalize_mode="preprocess",
+        augment=False,
+        apply_normalization=True,
+        fundus_crop_ratio=1.0,
+    ):
         if len(tfrecord_paths) != len(index_paths):
             raise ValueError("Listas de TFRecords e índices possuem tamanhos distintos.")
 
         self.img_size = img_size
+        self.model_name = model_name
         self.normalize_mode = normalize_mode
-        self.pre_fn = get_preprocess_fn(model_name) if normalize_mode == "preprocess" else None
+        self.apply_normalization = bool(apply_normalization)
+        self.fundus_crop_ratio = fundus_crop_ratio if 0.0 < float(fundus_crop_ratio) <= 1.0 else 1.0
+        self.norm_mean, self.norm_std = get_normalization_for_backbone(model_name)
         self.augment = augment
         self._entries = []  # lista de tuplas (path, offset)
         self._file_handles = {}  # cache de file handles
@@ -254,22 +347,32 @@ class RetinaTFRecord(Dataset):
         if len(self._entries) == 0:
             raise RuntimeError("Nenhuma entrada encontrada no conjunto de TFRecords/idx.")
 
+    def _center_crop_fundus(self, img: Image.Image) -> Image.Image:
+        if self.fundus_crop_ratio >= 0.999:
+            return img
+        width, height = img.size
+        crop_w = max(1, int(round(width * self.fundus_crop_ratio)))
+        crop_h = max(1, int(round(height * self.fundus_crop_ratio)))
+        left = max(0, (width - crop_w) // 2)
+        top = max(0, (height - crop_h) // 2)
+        return img.crop((left, top, left + crop_w, top + crop_h))
+
     def _apply_augmentations(self, img: Image.Image) -> Image.Image:
         if not self.augment:
             return img
         if np.random.rand() < 0.5:
             img = ImageOps.mirror(img)
-        if np.random.rand() < 0.15:
+        if np.random.rand() < 0.1:
             img = ImageOps.flip(img)
+        if np.random.rand() < 0.25:
+            angle = float(np.random.uniform(-10.0, 10.0))
+            img = img.rotate(angle, resample=Image.BILINEAR, fillcolor=(128, 128, 128))
         if np.random.rand() < 0.3:
-            angle = np.random.uniform(-15.0, 15.0)
-            img = img.rotate(angle, resample=Image.BILINEAR)
-        if np.random.rand() < 0.35:
-            img = ImageEnhance.Brightness(img).enhance(np.random.uniform(0.85, 1.15))
-        if np.random.rand() < 0.35:
-            img = ImageEnhance.Contrast(img).enhance(np.random.uniform(0.85, 1.15))
+            img = ImageEnhance.Contrast(img).enhance(float(np.random.uniform(0.9, 1.1)))
         if np.random.rand() < 0.3:
-            img = ImageEnhance.Color(img).enhance(np.random.uniform(0.85, 1.15))
+            img = ImageEnhance.Brightness(img).enhance(float(np.random.uniform(0.9, 1.1)))
+        if np.random.rand() < 0.2:
+            img = ImageEnhance.Color(img).enhance(float(np.random.uniform(0.9, 1.1)))
         return img
 
     def __len__(self):
@@ -306,27 +409,34 @@ class RetinaTFRecord(Dataset):
             raise KeyError("TFRecord não contém as chaves esperadas 'imagem'/'retinopatia'.")
 
         img_bytes = feats["imagem"].bytes_list.value[0]
-        label = int(feats["retinopatia"].int64_list.value[0])
+        label = float(feats["retinopatia"].int64_list.value[0])
 
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        img = self._center_crop_fundus(img)
         if self.img_size and img.size != (self.img_size, self.img_size):
             img = img.resize((self.img_size, self.img_size), Image.BILINEAR)
 
         img = self._apply_augmentations(img)
 
         x = np.asarray(img, dtype=np.float32)  # [H,W,C], 0..255
-        if self.normalize_mode == "preprocess" and self.pre_fn is not None:
-            x = self.pre_fn(x)
-        elif self.normalize_mode == "unit":
-            x = x / 255.0  # 0..1
-        # raw255 mantém 0..255
+        if self.apply_normalization:
+            x = self._normalize_array(x)
 
         x = torch.from_numpy(x)  # [H,W,C]
         # Transforma para channel-first para compatibilidade com PyTorch e augmentação na GPU
         if x.dim() == 3:
             x = x.permute(2, 0, 1).contiguous()  # [C,H,W]
-        y = torch.tensor(label, dtype=torch.long)
+        y = torch.tensor(label, dtype=torch.float32)
         return x, y
+
+    def _normalize_array(self, image: np.ndarray) -> np.ndarray:
+        if self.normalize_mode == "preprocess":
+            mean = np.asarray(self.norm_mean, dtype=np.float32)
+            std = np.asarray(self.norm_std, dtype=np.float32)
+            return (image - mean) / std
+        if self.normalize_mode == "unit":
+            return image / 255.0
+        return image
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -345,76 +455,27 @@ class RetinaTFRecord(Dataset):
 
 
 # ---------------------------
-# Modelo (Keras 3 sobre torch)
+# Modelo
 # ---------------------------
 def create_backbone(model_name: str, input_shape: Tuple[int, int, int]):
-    """
-    Usa keras.applications (compatível com Keras 3) para criar o backbone sem topo.
-    Todos os layers ficam treináveis desde o início.
-    """
-    apps = keras.applications
-    factory = {
-        "Xception": apps.Xception,
-        "VGG16": apps.VGG16,
-        "VGG19": apps.VGG19,
-        "ResNet50": apps.ResNet50,
-        "ResNet50V2": apps.ResNet50V2,
-        "ResNet101": apps.ResNet101,
-        "ResNet101V2": apps.ResNet101V2,
-        "ResNet152": apps.ResNet152,
-        "ResNet152V2": apps.ResNet152V2,
-        "InceptionV3": apps.InceptionV3,
-        "InceptionResNetV2": apps.InceptionResNetV2,
-        "MobileNet": apps.MobileNet,
-        "MobileNetV2": apps.MobileNetV2,
-        "MobileNetV3Small": apps.MobileNetV3Small,
-        "MobileNetV3Large": apps.MobileNetV3Large,
-        "DenseNet121": apps.DenseNet121,
-        "DenseNet169": apps.DenseNet169,
-        "DenseNet201": apps.DenseNet201,
-        "NASNetMobile": apps.NASNetMobile,
-        "NASNetLarge": apps.NASNetLarge,
-        "EfficientNetB0": apps.EfficientNetB0,
-        "EfficientNetB1": apps.EfficientNetB1,
-        "EfficientNetB2": apps.EfficientNetB2,
-        "EfficientNetB3": apps.EfficientNetB3,
-        "EfficientNetB4": apps.EfficientNetB4,
-        "EfficientNetB5": apps.EfficientNetB5,
-        "EfficientNetB6": apps.EfficientNetB6,
-        "EfficientNetB7": apps.EfficientNetB7,
-        "ConvNeXtTiny": apps.ConvNeXtTiny,
-        "ConvNeXtSmall": apps.ConvNeXtSmall,
-        "ConvNeXtBase": apps.ConvNeXtBase,
-        "ConvNeXtLarge": apps.ConvNeXtLarge,
-        "ConvNeXtXLarge": apps.ConvNeXtXLarge,
-    }
-    if model_name not in factory:
-        raise ValueError(f"Backbone desconhecido: {model_name}")
-
-    inputs = keras.Input(shape=input_shape)
-    base = factory[model_name](weights="imagenet", include_top=False, input_tensor=inputs)
-    for layer in base.layers:
-        layer.trainable = True
-    x = layers.GlobalAveragePooling2D()(base.output)
-    outputs = layers.Dense(1, activation=None, dtype="float32")(x)  # logit
-    model = keras.Model(inputs, outputs)
-    model.base_model = base
-    return model
+    """Cria backbone puro PyTorch usando timm com 1 logit de saída."""
+    timm_key = _canonical_model_key(model_name)
+    if not hasattr(timm, "is_model") or not timm.is_model(timm_key):
+        raise ValueError(f"Backbone timm desconhecido: {model_name}")
+    model = timm.create_model(
+        timm_key,
+        pretrained=True,
+        num_classes=1,
+        in_chans=3,
+        global_pool="avg",
+    )
+    return model, "timm"
 
 
 def parameters_of_trainable(model) -> Iterable[torch.Tensor]:
-    for w in model.weights:
-        if not getattr(w, "trainable", False):
-            continue
-        t = getattr(w, "value", None)
-        if isinstance(t, torch.Tensor):
-            if not t.requires_grad:
-                t.requires_grad = True
-            yield t
-        elif isinstance(w, torch.Tensor):
-            if not w.requires_grad:
-                w.requires_grad = True
-            yield w
+    for p in model.parameters():
+        if p.requires_grad:
+            yield p
 
 
 def unwrap_compiled_module(module):
@@ -456,16 +517,83 @@ def ddp_concat_variable_length(t: torch.Tensor):
     return out[mask].detach().cpu()
 
 
-def compute_sens_spec(labels: torch.Tensor, probs: torch.Tensor, threshold: float = 0.5):
-    """Compute sensitivity/specificity at a fixed threshold (default 0.5)."""
+SPECIFICITY_TARGET_SENSITIVITY = 0.95
+
+
+def specificity_at_sensitivity(
+    labels: torch.Tensor,
+    probs: torch.Tensor,
+    target_sensitivity: float = SPECIFICITY_TARGET_SENSITIVITY,
+) -> float:
+    labels = labels.reshape(-1).to(dtype=torch.float32)
+    probs = probs.reshape(-1).to(device=labels.device, dtype=torch.float32)
+    finite = torch.isfinite(labels) & torch.isfinite(probs)
+    labels = labels[finite]
+    probs = probs[finite].clamp(1e-7, 1.0 - 1e-7)
+    if labels.numel() == 0 or probs.numel() == 0:
+        return float("nan")
+
+    positives = labels > 0.5
+    n_pos = int(positives.sum().item())
+    n_neg = int((~positives).sum().item())
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+
+    target = float(target_sensitivity)
+    if target <= 0.0:
+        return 1.0
+    if target > 1.0:
+        return float("nan")
+
+    order = torch.argsort(probs, descending=True, stable=True)
+    sorted_scores = probs[order]
+    sorted_true = positives[order]
+    group_end = torch.ones(sorted_scores.numel(), device=sorted_scores.device, dtype=torch.bool)
+    if sorted_scores.numel() > 1:
+        group_end[:-1] = sorted_scores[:-1] != sorted_scores[1:]
+    threshold_idxs = torch.nonzero(group_end, as_tuple=False).flatten()
+    tp = torch.cumsum(sorted_true.to(torch.float64), dim=0)[threshold_idxs]
+    fp = torch.cumsum((~sorted_true).to(torch.float64), dim=0)[threshold_idxs]
+    tpr = torch.cat([torch.zeros(1, device=probs.device, dtype=torch.float64), tp / float(n_pos)])
+    fpr = torch.cat([torch.zeros(1, device=probs.device, dtype=torch.float64), fp / float(n_neg)])
+
+    target_tensor = torch.tensor(target, device=probs.device, dtype=torch.float64)
+    target_idxs = torch.nonzero(tpr >= target_tensor, as_tuple=False).flatten()
+    if target_idxs.numel() == 0:
+        return 0.0
+    idx = int(target_idxs[0].item())
+    if idx == 0:
+        fpr_at_target = fpr[0]
+    else:
+        tpr_lo, tpr_hi = tpr[idx - 1], tpr[idx]
+        fpr_lo, fpr_hi = fpr[idx - 1], fpr[idx]
+        if float(torch.abs(tpr_hi - tpr_lo).item()) <= 1e-12:
+            fpr_at_target = torch.minimum(fpr_lo, fpr_hi)
+        else:
+            fraction = (target_tensor - tpr_lo) / (tpr_hi - tpr_lo)
+            fpr_at_target = fpr_lo + fraction * (fpr_hi - fpr_lo)
+    return float(max(0.0, min(1.0, 1.0 - float(fpr_at_target.item()))))
+
+
+def compute_binary_metrics(labels: torch.Tensor, probs: torch.Tensor, threshold: float = 0.5):
+    """Compute threshold metrics and specificity at 95% sensitivity."""
     preds = (probs >= threshold).float()
     tp = ((preds == 1) & (labels == 1)).sum()
     fn = ((preds == 0) & (labels == 1)).sum()
     tn = ((preds == 0) & (labels == 0)).sum()
     fp = ((preds == 1) & (labels == 0)).sum()
-    sens = (tp / (tp + fn + 1e-8)).item()
-    spec = (tn / (tn + fp + 1e-8)).item()
-    return sens, spec
+    precision = (tp / (tp + fp + 1e-8)).item()
+    recall = (tp / (tp + fn + 1e-8)).item()
+    specificity = specificity_at_sensitivity(labels, probs)
+    f1 = (2 * tp / (2 * tp + fp + fn + 1e-8)).item()
+    return {
+        "precision": precision,
+        "recall": recall,
+        "sensitivity": recall,
+        "specificity": specificity,
+        "specificity_at_sens95": specificity,
+        "f1": f1,
+    }
 
 
 # ---------------------------
@@ -502,18 +630,10 @@ def init_distributed(use_cuda: bool) -> Tuple[int, int, int]:
 
 
 def set_backbone_trainable(model, trainable: bool):
-    """Congela ou libera apenas o backbone (camadas do modelo base)."""
-    base = getattr(model, "base_model", None)
-    if base is None:
-        return
-    for layer in base.layers:
-        layer.trainable = trainable
-    for w in getattr(base, "weights", []):
-        t = getattr(w, "value", None)
-        if isinstance(t, torch.Tensor):
-            t.requires_grad = trainable
-        elif isinstance(w, torch.Tensor):
-            w.requires_grad = trainable
+    """Congela ou libera apenas o backbone."""
+    for name, param in model.named_parameters():
+        head_like = ("fc" in name) or ("classifier" in name) or ("head" in name)
+        param.requires_grad = True if head_like else trainable
 
 
 # ---------------------------
@@ -545,6 +665,8 @@ def main():
     VERBOSE = args.verbose
     MODEL_NAME = args.model
     IMAGE_SIZE = (IMG, IMG, 3)
+    HEAD_WEIGHT_DECAY = 1e-4
+    FINE_TUNE_WEIGHT_DECAY = 1e-5
 
     cuda_available = torch.cuda.is_available()
     if not cuda_available:
@@ -574,18 +696,21 @@ def main():
     # listar TFRecords e idx
     tfrec_dir = Path(args.tfrec_dir)
     train_paths = sorted(tfrec_dir.glob("train*.tfrec"))
-    valid_paths = (
-        sorted(tfrec_dir.glob("test*.tfrec"))
-        + sorted(tfrec_dir.glob("val*.tfrec"))
-        + sorted(tfrec_dir.glob("valid*.tfrec"))
-    )
+    val_paths = sorted(tfrec_dir.glob("val*.tfrec")) + sorted(tfrec_dir.glob("valid*.tfrec"))
+    test_paths = sorted(tfrec_dir.glob("test*.tfrec"))
+    valid_paths = val_paths or test_paths
+    test_paths = test_paths or valid_paths
     if rank == 0:
-        print(f"Encontrados {len(train_paths)} TFRecords de treino e {len(valid_paths)} de validação.")
-    if not train_paths or not valid_paths:
-        raise SystemExit("É necessário ao menos um TFRecord de treino e um de validação.")
+        print(
+            f"Encontrados {len(train_paths)} TFRecords de treino, "
+            f"{len(valid_paths)} de validação e {len(test_paths)} de teste."
+        )
+    if not train_paths or not valid_paths or not test_paths:
+        raise SystemExit("É necessário ao menos um TFRecord de treino e um de validação/teste.")
 
     train_idx = [infer_idx(p) for p in train_paths]
     valid_idx = [infer_idx(p) for p in valid_paths]
+    test_idx = [infer_idx(p) for p in test_paths]
 
     # Augmentação será feita na GPU, então desabilita no Dataset
     train_ds = RetinaTFRecord(
@@ -594,7 +719,9 @@ def main():
         img_size=IMG,
         model_name=MODEL_NAME,
         normalize_mode=args.normalize,
-        augment=False,  # Augmentação será feita na GPU
+        augment=bool(args.augment),
+        apply_normalization=True,
+        fundus_crop_ratio=float(getattr(args, "fundus_crop_ratio", 1.0)),
     )
     valid_ds = RetinaTFRecord(
         [str(p) for p in valid_paths],
@@ -603,17 +730,34 @@ def main():
         model_name=MODEL_NAME,
         normalize_mode=args.normalize,
         augment=False,
+        apply_normalization=True,
+        fundus_crop_ratio=float(getattr(args, "fundus_crop_ratio", 1.0)),
     )
-    
-    # GPU Augmentation - aplicada no loop de treino
-    gpu_augment = GPUAugmentation(enabled=args.augment)
+    test_ds = RetinaTFRecord(
+        [str(p) for p in test_paths],
+        [str(p) for p in test_idx],
+        img_size=IMG,
+        model_name=MODEL_NAME,
+        normalize_mode=args.normalize,
+        augment=False,
+        apply_normalization=True,
+        fundus_crop_ratio=float(getattr(args, "fundus_crop_ratio", 1.0)),
+    )
+
+    gpu_augment = GPUAugmentation(enabled=False)
     if rank == 0:
-        print(f"[Augmentation] GPU augmentation habilitado: {args.augment}")
+        print(
+            f"[Augmentation] dataset_side={args.augment} gpu_side=False "
+            f"crop_ratio={float(getattr(args, 'fundus_crop_ratio', 1.0)):.2f}"
+        )
 
     train_sampler = DistributedSampler(train_ds, shuffle=True) if world_size > 1 else None
     valid_sampler = DistributedSampler(valid_ds, shuffle=False) if world_size > 1 else None
+    test_sampler = DistributedSampler(test_ds, shuffle=False) if world_size > 1 else None
 
-    num_workers = max(4, cores) if cores > 0 else min(8, os.cpu_count() or 4)
+    num_workers = min(8, os.cpu_count() or 4)
+    if num_workers < 1:
+        num_workers = 1
     train_loader = DataLoader(
         train_ds,
         batch_size=LOCAL_BS,
@@ -621,27 +765,40 @@ def main():
         shuffle=(train_sampler is None),
         num_workers=num_workers,
         pin_memory=use_cuda,
-        drop_last=True,  # Drop last para batches uniformes
-        persistent_workers=True if num_workers > 0 else False,  # Mantém workers vivos
-        prefetch_factor=4 if num_workers > 0 else None,  # Prefetch mais batches
+        drop_last=True,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
     valid_loader = DataLoader(
         valid_ds,
         batch_size=LOCAL_BS,
         sampler=valid_sampler,
         shuffle=False,
-        num_workers=max(2, num_workers // 2),
+        num_workers=num_workers,
         pin_memory=use_cuda,
         drop_last=False,
         persistent_workers=True if num_workers > 0 else False,
-        prefetch_factor=2 if num_workers > 0 else None,
+        prefetch_factor=4 if num_workers > 0 else None,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=LOCAL_BS,
+        sampler=test_sampler,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=use_cuda,
+        drop_last=False,
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
     if rank == 0:
         print(f"[DataLoader] num_workers={num_workers}, persistent_workers=True, prefetch_factor=4")
 
-    model = create_backbone(MODEL_NAME, IMAGE_SIZE)
+    model, model_backend = create_backbone(MODEL_NAME, IMAGE_SIZE)
     if rank == 0 and VERBOSE:
-        model.summary()
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"[Model] backend={model_backend} total_params={total_params} trainable_params={trainable_params_count}")
 
     ddp_model = model.to(device)
     core_model = ddp_model
@@ -649,22 +806,32 @@ def main():
         ddp_model = DDP(ddp_model, device_ids=[local_rank] if use_cuda else None, find_unused_parameters=True)
         core_model = ddp_model.module
 
-    def rebuild_optimizer(lr: float):
+    def rebuild_optimizer(lr: float, weight_decay: float):
         params = list(parameters_of_trainable(core_model))
         if len(params) == 0:
             raise RuntimeError("Nenhum parâmetro treinável encontrado ao criar o otimizador.")
-        # TensorFlow usa epsilon padrão 1e-7; alinhamos para reduzir diferenças numéricas.
-        return Adam(params, lr=lr, eps=1e-7), params
+        opt_name = str(getattr(args, "optimizer", "adamw")).lower()
+        if opt_name in ("adamw", "adam_w"):
+            return AdamW(params, lr=lr, eps=1e-7, weight_decay=weight_decay), params
+        if opt_name == "adam":
+            return Adam(params, lr=lr, eps=1e-7, weight_decay=weight_decay), params
+        if opt_name == "sgd" or opt_name == "sgd_mom" or opt_name == "sgd-mom":
+            return SGD(params, lr=lr, momentum=0.9, nesterov=True, weight_decay=weight_decay), params
+        if opt_name == "rmsprop":
+            return RMSprop(params, lr=lr, alpha=0.99, eps=1e-8, weight_decay=weight_decay), params
+        if opt_name == "adadelta":
+            return Adadelta(params, lr=lr, rho=0.95, eps=1e-6, weight_decay=weight_decay), params
+        return AdamW(params, lr=lr, eps=1e-7, weight_decay=weight_decay), params
 
     # congela backbone se necessário e cria otimizador da fase atual
     if freeze_epochs > 0:
         set_backbone_trainable(core_model, False)
         current_stage = "freeze"
-        opt, trainable_params = rebuild_optimizer(LR)
+        opt, trainable_params = rebuild_optimizer(LR, HEAD_WEIGHT_DECAY)
     else:
         set_backbone_trainable(core_model, True)
         current_stage = "finetune"
-        opt, trainable_params = rebuild_optimizer(fine_tune_lr)
+        opt, trainable_params = rebuild_optimizer(fine_tune_lr, FINE_TUNE_WEIGHT_DECAY)
     if rank == 0:
         print(
             f"[Train] freeze_epochs={freeze_epochs} base_lr={LR:.2e} "
@@ -689,17 +856,21 @@ def main():
     clip_norm = max(0.0, float(getattr(args, "clip_grad_norm", 1.0)))
     
     # Automatic Mixed Precision
-    use_amp = use_cuda
+    amp_requested = bool(getattr(args, "use_amp", False))
+    use_amp = use_cuda and amp_requested
     scaler = GradScaler(enabled=use_amp)
     if rank == 0:
-        print(f"[AMP] Mixed Precision habilitado: {use_amp}")
+        print(f"[AMP] requested={amp_requested} active={use_amp}")
     
     # LR Scheduler com Warmup + Cosine Annealing
     warmup_epochs = max(0, int(getattr(args, "warmup_epochs", 3)))
     min_lr = float(getattr(args, "min_lr", 1e-6))
+    use_cosine_scheduler = bool(getattr(args, "use_cosine_scheduler", False))
     
     def create_scheduler(optimizer, base_lr, total_epochs, warmup_ep):
         """Cria scheduler com warmup linear + cosine annealing."""
+        if not use_cosine_scheduler:
+            return None
         if warmup_ep <= 0:
             return CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=min_lr)
         
@@ -715,34 +886,20 @@ def main():
     
     scheduler = create_scheduler(opt, LR if freeze_epochs > 0 else fine_tune_lr, EPOCHS, warmup_epochs)
     if rank == 0:
-        print(f"[Scheduler] Warmup epochs={warmup_epochs}, min_lr={min_lr:.2e}, Cosine Annealing")
+        if use_cosine_scheduler:
+            print(f"[Scheduler] Warmup epochs={warmup_epochs}, min_lr={min_lr:.2e}, Cosine Annealing")
+        else:
+            print("[Scheduler] Desativado; learning rate constante.")
+
+    def normalize_batch(xb: torch.Tensor) -> torch.Tensor:
+        return xb.float()
 
     results_dir = Path(args.results)
     results_dir.mkdir(parents=True, exist_ok=True)
+    runtime_profiler = RuntimeProfiler(results_dir, rank=rank, project_name="pytorch_base")
     csv_path = results_dir / f"{MODEL_NAME}-{args.exec}.csv"
     csv_writer = None
-    csv_fields = [
-        "epoch",
-        "stage",
-        "train_loss",
-        "train_auc",
-        "train_sens",
-        "train_spec",
-        "train_throughput_img_s",
-        "train_elapsed_s",
-        "train_gpu_mem_alloc_mb",
-        "train_gpu_mem_reserved_mb",
-        "val_loss",
-        "val_auc",
-        "val_sens",
-        "val_spec",
-        "val_throughput_img_s",
-        "val_elapsed_s",
-        "val_gpu_mem_alloc_mb",
-        "val_gpu_mem_reserved_mb",
-        "lr",
-        "total_train_time_s",
-    ]
+    csv_fields = COMMON_CSV_FIELDS
     if rank == 0:
         csv_writer = pd.DataFrame(columns=csv_fields)
 
@@ -750,76 +907,120 @@ def main():
         loader: DataLoader,
         train: bool,
         epoch_idx: Optional[int] = None,
-    ) -> Tuple[float, Optional[float], float, float, float, float, Optional[float], Optional[float]]:
+    ):
+        stage_name = "train" if train else "val"
         if loader is None:
-            return 0.0, float("nan"), float("nan"), float("nan"), 0.0, 0.0, None, None
+            return 0.0, float("nan"), {
+                "precision": float("nan"),
+                "recall": float("nan"),
+                "sensitivity": float("nan"),
+                "specificity": float("nan"),
+                "f1": float("nan"),
+            }, 0.0, 0.0, 0.0, float("nan"), float("nan"), None
         if train:
             ddp_model.train()
         else:
             ddp_model.eval()
 
         track_memory = use_cuda and (device.type == "cuda")
-        if track_memory:
-            torch.cuda.reset_peak_memory_stats(device)
 
         running_loss = 0.0
         n_samples = 0
         all_probs = []
         all_labels = []
+        memory_samples_mb = []
+        inference_time_s = 0.0
+        inference_batches = 0
+        inference_samples = 0
         t_start = time.time()
-        for xb, yb in loader:
-            xb = xb.to(device, non_blocking=True)
-            yb = yb.to(device, non_blocking=True).float()
-            
-            # GPU Augmentation apenas no treino
-            if train:
-                xb = gpu_augment(xb)
+        num_batches = 0
+        loader_iter = iter(loader)
+        while True:
+            try:
+                xb, yb = runtime_profiler.fetch_next(loader_iter, stage_name)
+            except StopIteration:
+                break
 
-            # Modelo Keras (backend torch) espera NHWC; garante conversão sempre
-            if xb.dim() == 4 and xb.shape[1] in (1, 3):
-                xb = xb.permute(0, 2, 3, 1).contiguous()
-            xb = xb.contiguous(memory_format=torch.channels_last)
+            with runtime_profiler.range(f"{stage_name}/batch"):
+                with runtime_profiler.range(f"{stage_name}/h2d"):
+                    xb = xb.to(device, non_blocking=True).float()
+                    yb = yb.to(device, non_blocking=True).float()
 
-            if train:
-                # Aplica label smoothing nos targets de treino
-                yb_smooth = smooth_labels(yb, label_smoothing)
-                opt.zero_grad(set_to_none=True)
-                # AMP: autocast para forward pass
-                with autocast(enabled=use_amp, dtype=torch.float16):
-                    logits = ddp_model(xb)
-                    loss = loss_fn(logits.squeeze(1), yb_smooth)
-                if not torch.isfinite(loss):
-                    if rank == 0:
-                        where = f" epoch={epoch_idx}" if epoch_idx is not None else ""
-                        print(f"[WARN] loss não finita{where}; batch ignorado.")
-                    continue
-                # AMP: scale loss e backward
-                scaler.scale(loss).backward()
-                if clip_norm > 0.0:
-                    scaler.unscale_(opt)
-                    torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=clip_norm)
-                scaler.step(opt)
-                scaler.update()
-            else:
-                with torch.no_grad(), autocast(enabled=use_amp, dtype=torch.float16):
-                    logits = ddp_model(xb)
-                    loss = loss_fn(logits.squeeze(1), yb)
+                if train:
+                    with runtime_profiler.range(f"{stage_name}/augment"):
+                        xb = gpu_augment(xb)
 
-            running_loss += loss.item() * xb.shape[0]
-            n_samples += xb.shape[0]
-            with torch.no_grad():
-                probs = torch.sigmoid(logits).squeeze(1)
-                all_probs.append(probs.detach())
-                all_labels.append(yb.detach())
+                with runtime_profiler.range(f"{stage_name}/preprocess"):
+                    xb = normalize_batch(xb)
+                    xb = xb.contiguous(memory_format=torch.channels_last)
+
+                if train:
+                    yb_smooth = smooth_labels(yb, label_smoothing)
+                    with runtime_profiler.range(f"{stage_name}/optimizer_zero_grad"):
+                        opt.zero_grad(set_to_none=True)
+                    with runtime_profiler.range(f"{stage_name}/forward"):
+                        with autocast(enabled=use_amp, dtype=torch.float16):
+                            logits = ddp_model(xb)
+                            loss = loss_fn(logits.squeeze(1), yb_smooth)
+                    if not torch.isfinite(loss):
+                        if rank == 0:
+                            where = f" epoch={epoch_idx}" if epoch_idx is not None else ""
+                            print(f"[WARN] loss não finita{where}; batch ignorado.")
+                        runtime_profiler.step(stage_name)
+                        continue
+                    with runtime_profiler.range(f"{stage_name}/backward"):
+                        scaler.scale(loss).backward()
+                    with runtime_profiler.range(f"{stage_name}/optimizer_step"):
+                        if clip_norm > 0.0:
+                            scaler.unscale_(opt)
+                            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=clip_norm)
+                        scaler.step(opt)
+                        scaler.update()
+                else:
+                    if track_memory:
+                        torch.cuda.synchronize(device)
+                    inference_start = time.perf_counter()
+                    with runtime_profiler.range(f"{stage_name}/forward"):
+                        with torch.no_grad(), autocast(enabled=use_amp, dtype=torch.float16):
+                            logits = ddp_model(xb)
+                            loss = loss_fn(logits.squeeze(1), yb)
+                    if track_memory:
+                        torch.cuda.synchronize(device)
+                    inference_time_s += time.perf_counter() - inference_start
+                    inference_batches += 1
+                    inference_samples += int(xb.shape[0])
+
+                with runtime_profiler.range(f"{stage_name}/metrics"):
+                    running_loss += loss.item() * xb.shape[0]
+                    n_samples += xb.shape[0]
+                    num_batches += 1
+                    with torch.no_grad():
+                        probs = torch.sigmoid(logits).squeeze(1)
+                        all_probs.append(probs.detach())
+                        all_labels.append(yb.detach())
+
+                if track_memory:
+                    torch.cuda.synchronize(device)
+                    allocated_mb = torch.cuda.memory_allocated(device) / (1024 ** 2)
+                    reserved_mb = torch.cuda.memory_reserved(device) / (1024 ** 2)
+                    memory_samples_mb.append(max(allocated_mb, reserved_mb))
+
+            runtime_profiler.step(stage_name)
 
         all_probs = torch.cat(all_probs, dim=0)
         all_labels = torch.cat(all_labels, dim=0)
         probs_all = ddp_concat_variable_length(all_probs)
         labels_all = ddp_concat_variable_length(all_labels)
 
-        sens_val, spec_val = float("nan"), float("nan")
+        metric_values = {
+            "precision": float("nan"),
+            "recall": float("nan"),
+            "sensitivity": float("nan"),
+            "specificity": float("nan"),
+            "f1": float("nan"),
+        }
         try:
-            sens_val, spec_val = compute_sens_spec(labels_all, probs_all)
+            metric_values.update(compute_binary_metrics(labels_all, probs_all))
         except Exception:
             pass
         try:
@@ -827,27 +1028,62 @@ def main():
         except Exception:
             auc_val = float("nan")
         epoch_loss = running_loss / max(n_samples, 1)
-        if track_memory:
-            torch.cuda.synchronize(device)
-            smi_used = _read_gpu_used_mb()
-            if smi_used is not None:
-                peak_mem_alloc = smi_used
-                peak_mem_reserved = smi_used
-            else:
-                peak_mem_alloc = torch.cuda.memory_allocated(device) / (1024 ** 2)
-                peak_mem_reserved = torch.cuda.memory_reserved(device) / (1024 ** 2)
-        else:
-            peak_mem_alloc = None
-            peak_mem_reserved = None
+        memory_avg_mb = (
+            sum(memory_samples_mb) / len(memory_samples_mb)
+            if memory_samples_mb
+            else (0.0 if not track_memory else None)
+        )
+        inference_latency_ms_img = (
+            inference_time_s / inference_samples * 1000.0 if inference_samples > 0 else float("nan")
+        )
+        inference_latency_ms_batch = (
+            inference_time_s / inference_batches * 1000.0 if inference_batches > 0 else float("nan")
+        )
         elapsed = time.time() - t_start
+        avg_batch_time_ms = (elapsed / max(num_batches, 1)) * 1000.0 if num_batches > 0 else 0.0
         # throughput global: soma samples de todos os ranks
         global_samples = n_samples
         if dist.is_initialized():
             n_samples_tensor = torch.tensor([n_samples], device=device, dtype=torch.float64)
             dist.all_reduce(n_samples_tensor, op=dist.ReduceOp.SUM)
             global_samples = n_samples_tensor.item()
+            elapsed_tensor = torch.tensor([elapsed], device=device, dtype=torch.float64)
+            dist.all_reduce(elapsed_tensor, op=dist.ReduceOp.MAX)
+            elapsed = float(elapsed_tensor.item())
+            mem_tensor = torch.tensor(
+                [0.0 if memory_avg_mb is None else memory_avg_mb],
+                device=device,
+                dtype=torch.float64,
+            )
+            dist.all_reduce(mem_tensor, op=dist.ReduceOp.SUM)
+            memory_avg_mb = float(mem_tensor.item()) / max(world_size, 1)
+            latency_tensor = torch.tensor(
+                [
+                    0.0 if np.isnan(inference_latency_ms_img) else inference_latency_ms_img,
+                    0.0 if np.isnan(inference_latency_ms_batch) else inference_latency_ms_batch,
+                    1.0 if inference_samples > 0 else 0.0,
+                ],
+                device=device,
+                dtype=torch.float64,
+            )
+            dist.all_reduce(latency_tensor, op=dist.ReduceOp.SUM)
+            latency_ranks = max(float(latency_tensor[2].item()), 1.0)
+            if latency_tensor[2].item() > 0:
+                inference_latency_ms_img = float(latency_tensor[0].item()) / latency_ranks
+                inference_latency_ms_batch = float(latency_tensor[1].item()) / latency_ranks
+            avg_batch_time_ms = (elapsed / max(num_batches, 1)) * 1000.0 if num_batches > 0 else 0.0
         throughput = global_samples / elapsed if elapsed > 0 else 0.0
-        return epoch_loss, auc_val, sens_val, spec_val, throughput, elapsed, peak_mem_alloc, peak_mem_reserved
+        return (
+            epoch_loss,
+            auc_val,
+            metric_values,
+            throughput,
+            elapsed,
+            avg_batch_time_ms,
+            inference_latency_ms_img,
+            inference_latency_ms_batch,
+            memory_avg_mb,
+        )
 
     best_val_auc = -1.0
     best_state_dict = None
@@ -856,24 +1092,43 @@ def main():
     for epoch in range(EPOCHS):
         if current_stage == "freeze" and epoch >= freeze_epochs:
             set_backbone_trainable(core_model, True)
-            opt, trainable_params = rebuild_optimizer(fine_tune_lr)
-            # Recria scheduler para fase de fine-tuning
-            scheduler = create_scheduler(opt, fine_tune_lr, EPOCHS - epoch, warmup_ep=1)
+            opt, trainable_params = rebuild_optimizer(fine_tune_lr, FINE_TUNE_WEIGHT_DECAY)
+            scheduler = create_scheduler(opt, fine_tune_lr, EPOCHS - epoch, warmup_ep=warmup_epochs)
             current_stage = "finetune"
             if rank == 0:
                 print(f"[Stage] Liberando backbone no epoch {epoch} | lr={fine_tune_lr:.2e}")
 
         if isinstance(train_sampler, DistributedSampler):
             train_sampler.set_epoch(epoch)
-        train_loss, train_auc, train_sens, train_spec, train_thpt, train_elapsed, train_mem_alloc, train_mem_reserved = run_epoch(
+        (
+            train_loss,
+            train_auc,
+            train_epoch_metrics,
+            train_thpt,
+            train_elapsed,
+            train_avg_batch_time_ms,
+            train_inference_latency_ms_img,
+            train_inference_latency_ms_batch,
+            train_mem_avg,
+        ) = run_epoch(
             train_loader, train=True, epoch_idx=epoch
         )
-        val_loss, val_auc, val_sens, val_spec, val_thpt, val_elapsed, val_mem_alloc, val_mem_reserved = run_epoch(
+        (
+            val_loss,
+            val_auc,
+            val_epoch_metrics,
+            val_thpt,
+            val_elapsed,
+            val_avg_batch_time_ms,
+            val_inference_latency_ms_img,
+            val_inference_latency_ms_batch,
+            val_mem_avg,
+        ) = run_epoch(
             valid_loader, train=False, epoch_idx=epoch
         )
         
-        # Atualiza learning rate scheduler
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
 
         if rank == 0:
             stage_label = current_stage
@@ -887,20 +1142,46 @@ def main():
                     "stage": stage_label,
                     "train_loss": train_loss,
                     "train_auc": train_auc,
-                    "train_sens": train_sens,
-                    "train_spec": train_spec,
+                    "train_precision": train_epoch_metrics["precision"],
+                    "train_recall": train_epoch_metrics["recall"],
+                    "train_f1": train_epoch_metrics["f1"],
+                    "train_sens": train_epoch_metrics["sensitivity"],
+                    "train_spec": train_epoch_metrics["specificity"],
+                    "train_spec_at_sens95": train_epoch_metrics["specificity_at_sens95"],
                     "train_throughput_img_s": train_thpt,
                     "train_elapsed_s": train_elapsed,
-                    "train_gpu_mem_alloc_mb": train_mem_alloc,
-                    "train_gpu_mem_reserved_mb": train_mem_reserved,
+                    "train_avg_batch_time_ms": train_avg_batch_time_ms,
+                    "train_inference_latency_ms_img": train_inference_latency_ms_img,
+                    "train_inference_latency_ms_batch": train_inference_latency_ms_batch,
+                    "train_gpu_mem_avg_mb": train_mem_avg,
                     "val_loss": val_loss,
                     "val_auc": val_auc,
-                    "val_sens": val_sens,
-                    "val_spec": val_spec,
+                    "val_precision": val_epoch_metrics["precision"],
+                    "val_recall": val_epoch_metrics["recall"],
+                    "val_f1": val_epoch_metrics["f1"],
+                    "val_sens": val_epoch_metrics["sensitivity"],
+                    "val_spec": val_epoch_metrics["specificity"],
+                    "val_spec_at_sens95": val_epoch_metrics["specificity_at_sens95"],
                     "val_throughput_img_s": val_thpt,
                     "val_elapsed_s": val_elapsed,
-                    "val_gpu_mem_alloc_mb": val_mem_alloc,
-                    "val_gpu_mem_reserved_mb": val_mem_reserved,
+                    "val_avg_batch_time_ms": val_avg_batch_time_ms,
+                    "val_inference_latency_ms_img": val_inference_latency_ms_img,
+                    "val_inference_latency_ms_batch": val_inference_latency_ms_batch,
+                    "val_gpu_mem_avg_mb": val_mem_avg,
+                    "test_loss": np.nan,
+                    "test_auc": np.nan,
+                    "test_precision": np.nan,
+                    "test_recall": np.nan,
+                    "test_f1": np.nan,
+                    "test_sens": np.nan,
+                    "test_spec": np.nan,
+                    "test_spec_at_sens95": np.nan,
+                    "test_throughput_img_s": np.nan,
+                    "test_elapsed_s": np.nan,
+                    "test_avg_batch_time_ms": np.nan,
+                    "test_inference_latency_ms_img": np.nan,
+                    "test_inference_latency_ms_batch": np.nan,
+                    "test_gpu_mem_avg_mb": np.nan,
                     "lr": opt.param_groups[0]["lr"],
                     "total_train_time_s": None,
                 }
@@ -916,7 +1197,7 @@ def main():
     if rank == 0:
         eval_start = time.time()
         eval_loader = DataLoader(
-            valid_ds,
+            test_ds,
             batch_size=LOCAL_BS,
             shuffle=False,
             num_workers=max(1, num_workers // 2),
@@ -934,23 +1215,65 @@ def main():
 
         y_true = []
         y_score = []
+        eval_num_batches = 0
+        eval_memory_samples_mb = []
+        eval_inference_time_s = 0.0
+        eval_inference_samples = 0
         with torch.no_grad():
-            for xb, yb in eval_loader:
-                xb = xb.to(device, non_blocking=True).float()
-                if xb.dim() == 4 and xb.shape[1] in (1, 3):
-                    xb = xb.permute(0, 2, 3, 1).contiguous()
-                xb = xb.contiguous(memory_format=torch.channels_last)
-                logits = model_for_eval(xb)
-                probs = torch.sigmoid(logits).squeeze(1).cpu().numpy()
-                y_score.append(probs)
-                y_true.append(yb.numpy())
+            eval_iter = iter(eval_loader)
+            while True:
+                try:
+                    xb, yb = runtime_profiler.fetch_next(eval_iter, "eval")
+                except StopIteration:
+                    break
+                with runtime_profiler.range("eval/batch"):
+                    with runtime_profiler.range("eval/h2d"):
+                        xb = xb.to(device, non_blocking=True).float()
+                    with runtime_profiler.range("eval/preprocess"):
+                        xb = normalize_batch(xb)
+                        xb = xb.contiguous(memory_format=torch.channels_last)
+                    if use_cuda and device.type == "cuda":
+                        torch.cuda.synchronize(device)
+                    inference_start = time.perf_counter()
+                    with runtime_profiler.range("eval/forward"):
+                        logits = model_for_eval(xb)
+                    if use_cuda and device.type == "cuda":
+                        torch.cuda.synchronize(device)
+                    eval_inference_time_s += time.perf_counter() - inference_start
+                    eval_inference_samples += int(xb.shape[0])
+                    with runtime_profiler.range("eval/metrics"):
+                        probs = torch.sigmoid(logits).squeeze(1).cpu().numpy()
+                        y_score.append(probs)
+                        y_true.append(yb.numpy())
+                        eval_num_batches += 1
+                    if use_cuda and device.type == "cuda":
+                        allocated_mb = torch.cuda.memory_allocated(device) / (1024 ** 2)
+                        reserved_mb = torch.cuda.memory_reserved(device) / (1024 ** 2)
+                        eval_memory_samples_mb.append(max(allocated_mb, reserved_mb))
+                runtime_profiler.step("eval")
         y_true = np.concatenate(y_true)
         y_score = np.concatenate(y_score)
         auc_val = roc_auc_score(y_true, y_score)
         fpr, tpr, thresholds = roc_curve(y_true, y_score)
-        sens_final, spec_final = compute_sens_spec(torch.from_numpy(y_true), torch.from_numpy(y_score))
+        final_metrics = compute_binary_metrics(torch.from_numpy(y_true), torch.from_numpy(y_score))
         eval_elapsed = time.time() - eval_start
-        val_throughput = (len(valid_ds) / eval_elapsed) if eval_elapsed > 0 else 0.0
+        test_throughput = (len(test_ds) / eval_elapsed) if eval_elapsed > 0 else 0.0
+        test_avg_batch_time_ms = (eval_elapsed / max(eval_num_batches, 1)) * 1000.0 if eval_num_batches > 0 else 0.0
+        test_inference_latency_ms_img = (
+            eval_inference_time_s / eval_inference_samples * 1000.0
+            if eval_inference_samples > 0
+            else float("nan")
+        )
+        test_inference_latency_ms_batch = (
+            eval_inference_time_s / eval_num_batches * 1000.0
+            if eval_num_batches > 0
+            else float("nan")
+        )
+        test_mem_avg = (
+            sum(eval_memory_samples_mb) / len(eval_memory_samples_mb)
+            if eval_memory_samples_mb
+            else None
+        )
 
         thresholds_df = pd.DataFrame(
             {
@@ -979,30 +1302,58 @@ def main():
         if csv_writer is not None:
             final_row = {
                 "epoch": EPOCHS,
-                "stage": "final_eval",
+                "stage": "final_test",
                 "train_loss": np.nan,
                 "train_auc": np.nan,
+                "train_precision": np.nan,
+                "train_recall": np.nan,
+                "train_f1": np.nan,
                 "train_sens": np.nan,
                 "train_spec": np.nan,
+                "train_spec_at_sens95": np.nan,
                 "train_throughput_img_s": np.nan,
                 "train_elapsed_s": np.nan,
-                "train_gpu_mem_alloc_mb": None,
-                "train_gpu_mem_reserved_mb": None,
+                "train_avg_batch_time_ms": np.nan,
+                "train_inference_latency_ms_img": np.nan,
+                "train_inference_latency_ms_batch": np.nan,
+                "train_gpu_mem_avg_mb": np.nan,
                 "val_loss": float("nan"),
-                "val_auc": auc_val,
-                "val_sens": sens_final,
-                "val_spec": spec_final,
-                "val_throughput_img_s": val_throughput,
-                "val_elapsed_s": eval_elapsed,
-                "val_gpu_mem_alloc_mb": None,
-                "val_gpu_mem_reserved_mb": None,
+                "val_auc": np.nan,
+                "val_precision": np.nan,
+                "val_recall": np.nan,
+                "val_f1": np.nan,
+                "val_sens": np.nan,
+                "val_spec": np.nan,
+                "val_spec_at_sens95": np.nan,
+                "val_throughput_img_s": np.nan,
+                "val_elapsed_s": np.nan,
+                "val_avg_batch_time_ms": np.nan,
+                "val_inference_latency_ms_img": np.nan,
+                "val_inference_latency_ms_batch": np.nan,
+                "val_gpu_mem_avg_mb": np.nan,
+                "test_loss": float("nan"),
+                "test_auc": auc_val,
+                "test_precision": final_metrics["precision"],
+                "test_recall": final_metrics["recall"],
+                "test_f1": final_metrics["f1"],
+                "test_sens": final_metrics["sensitivity"],
+                "test_spec": final_metrics["specificity"],
+                "test_spec_at_sens95": final_metrics["specificity_at_sens95"],
+                "test_throughput_img_s": test_throughput,
+                "test_elapsed_s": eval_elapsed,
+                "test_avg_batch_time_ms": test_avg_batch_time_ms,
+                "test_inference_latency_ms_img": test_inference_latency_ms_img,
+                "test_inference_latency_ms_batch": test_inference_latency_ms_batch,
+                "test_gpu_mem_avg_mb": test_mem_avg,
                 "lr": opt.param_groups[0]["lr"],
                 "total_train_time_s": final_elapsed,
             }
             csv_writer.loc[len(csv_writer)] = final_row
             csv_writer.to_csv(csv_path, index=False)
-        print(f"Valid AUC (final): {auc_val:.4f}")
+        print(f"Test AUC (final): {auc_val:.4f}")
         print(f"{args.dataset},{args.exec},{auc_val:.6f},{final_elapsed}")
+
+    runtime_profiler.close()
 
     if dist.is_initialized():
         dist.barrier()

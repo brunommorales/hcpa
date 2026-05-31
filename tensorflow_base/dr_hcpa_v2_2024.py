@@ -7,6 +7,7 @@ Versão básica do treinamento TensorFlow distribuído.
 import argparse
 import csv
 import json
+import math
 import os
 import subprocess
 import tempfile
@@ -49,56 +50,126 @@ class Sensitivity(tf.keras.metrics.Metric):
         self.fn.assign(0.0)
 
 
-class Specificity(tf.keras.metrics.Metric):
-    """Specificity (True Negative Rate) at threshold 0.5."""
-
-    def __init__(self, name="specificity", **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.tn = self.add_weight(name="tn", initializer="zeros")
-        self.fp = self.add_weight(name="fp", initializer="zeros")
-
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.cast(tf.round(y_pred), tf.float32)
-        tn = tf.reduce_sum((1.0 - y_true) * (1.0 - y_pred))
-        fp = tf.reduce_sum((1.0 - y_true) * y_pred)
-        self.tn.assign_add(tn)
-        self.fp.assign_add(fp)
-
-    def result(self):
-        return self.tn / (self.tn + self.fp + tf.keras.backend.epsilon())
-
-    def reset_state(self):
-        self.tn.assign(0.0)
-        self.fp.assign(0.0)
+def _compute_f1_from_precision_recall(precision, recall):
+    if precision is None or recall is None:
+        return None
+    try:
+        precision = float(precision)
+        recall = float(recall)
+    except Exception:
+        return None
+    denom = precision + recall
+    if denom <= 0:
+        return 0.0
+    return (2.0 * precision * recall) / (denom + 1e-8)
 
 
-def compute_sens_spec(y_true: np.ndarray, y_score: np.ndarray, threshold: float = 0.5):
-    """Compute sensitivity/specificity at a fixed threshold (default 0.5)."""
+SPECIFICITY_TARGET_SENSITIVITY = 0.95
+
+
+def specificity_at_sensitivity(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    target_sensitivity: float = SPECIFICITY_TARGET_SENSITIVITY,
+) -> float:
+    y_true = np.asarray(y_true, dtype=np.int32).reshape(-1)
+    y_score = np.asarray(y_score, dtype=np.float64).reshape(-1)
+    finite = np.isfinite(y_true) & np.isfinite(y_score)
+    y_true = y_true[finite]
+    y_score = np.clip(y_score[finite], 1e-7, 1.0 - 1e-7)
+    if y_true.size == 0 or y_score.size == 0:
+        return float("nan")
+
+    positives = y_true == 1
+    n_pos = int(np.sum(positives))
+    n_neg = int(y_true.size - n_pos)
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+
+    target = float(target_sensitivity)
+    if target <= 0.0:
+        return 1.0
+    if target > 1.0:
+        return float("nan")
+
+    order = np.argsort(-y_score, kind="mergesort")
+    sorted_scores = y_score[order]
+    sorted_true = positives[order]
+    group_end = np.ones(sorted_scores.shape[0], dtype=bool)
+    if sorted_scores.shape[0] > 1:
+        group_end[:-1] = sorted_scores[:-1] != sorted_scores[1:]
+    threshold_idxs = np.flatnonzero(group_end)
+    tp = np.cumsum(sorted_true, dtype=np.float64)[threshold_idxs]
+    fp = np.cumsum(~sorted_true, dtype=np.float64)[threshold_idxs]
+    tpr = np.r_[0.0, tp / float(n_pos)]
+    fpr = np.r_[0.0, fp / float(n_neg)]
+
+    idxs = np.flatnonzero(tpr >= target)
+    if idxs.size == 0:
+        return 0.0
+    idx = int(idxs[0])
+    if idx == 0:
+        fpr_at_target = fpr[0]
+    else:
+        tpr_lo, tpr_hi = tpr[idx - 1], tpr[idx]
+        fpr_lo, fpr_hi = fpr[idx - 1], fpr[idx]
+        if abs(tpr_hi - tpr_lo) <= 1e-12:
+            fpr_at_target = min(fpr_lo, fpr_hi)
+        else:
+            fraction = (target - tpr_lo) / (tpr_hi - tpr_lo)
+            fpr_at_target = fpr_lo + fraction * (fpr_hi - fpr_lo)
+    return float(np.clip(1.0 - fpr_at_target, 0.0, 1.0))
+
+
+def compute_binary_metrics(y_true: np.ndarray, y_score: np.ndarray, threshold: float = 0.5):
+    """Compute threshold metrics and specificity at 95% sensitivity."""
     preds = (y_score >= threshold).astype(np.float32)
     tp = np.sum((preds == 1) & (y_true == 1))
     fn = np.sum((preds == 0) & (y_true == 1))
     tn = np.sum((preds == 0) & (y_true == 0))
     fp = np.sum((preds == 1) & (y_true == 0))
-    sens = tp / (tp + fn + 1e-8)
-    spec = tn / (tn + fp + 1e-8)
-    return sens, spec
+    precision = tp / (tp + fp + 1e-8)
+    recall = tp / (tp + fn + 1e-8)
+    specificity = specificity_at_sensitivity(y_true, y_score)
+    f1 = (2.0 * tp) / (2.0 * tp + fp + fn + 1e-8)
+    return {
+        "precision": float(precision),
+        "recall": float(recall),
+        "sensitivity": float(recall),
+        "specificity": float(specificity),
+        "specificity_at_sens95": float(specificity),
+        "f1": float(f1),
+    }
+
+
+def compute_sens_spec(y_true: np.ndarray, y_score: np.ndarray, threshold: float = 0.5):
+    metrics = compute_binary_metrics(y_true, y_score, threshold=threshold)
+    return metrics["sensitivity"], metrics["specificity"]
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Treinamento simples em GPU usando TFRecord + Keras com distribuição"
     )
-    parser.add_argument("--tfrec_dir", type=str, default="./data/all", help="Diretório com TFRecords")
+    parser.add_argument("--tfrec_dir", type=str, default="/home/users/bmmorales/projects/hcpa/data/all-tfrec", help="Diretório com TFRecords")
     parser.add_argument("--dataset", type=str, default="all", help="Nome lógico do dataset")
     parser.add_argument("--results", type=str, default="./results/all", help="Diretório para salvar resultados")
     parser.add_argument("--exec", type=int, default=0, help="ID de execução")
     parser.add_argument("--img_sizes", type=int, default=299, help="Tamanho das imagens (quadradas)")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch por réplica/GPU (batch global = batch_size * réplicas)")
-    parser.add_argument("--epochs", type=int, default=50, help="Número de épocas")
-    parser.add_argument("--lrate", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--batch_size", type=int, default=96, help="Batch por réplica/GPU (batch global = batch_size * réplicas)")
+    parser.add_argument("--epochs", type=int, default=200, help="Número de épocas")
+    parser.add_argument("--lrate", type=float, default=5e-4, help="Learning rate")
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="adamw",
+        choices=["adam", "adamw", "sgd_mom", "rmsprop", "adadelta"],
+        help="Otimizador a usar (padrão: adamw)",
+    )
+    parser.add_argument("--weight_decay", type=float, default=1e-5, help="Weight decay usado pelo AdamW.")
+    parser.add_argument("--clipnorm", type=float, default=1.0, help="Gradient clipping por norma; <=0 desativa.")
     parser.add_argument("--num_thresholds", type=int, default=200, help="(Mantido para compatibilidade)")
-    parser.add_argument("--verbose", type=int, default=1, help="Verbose do Keras")
+    parser.add_argument("--verbose", type=int, default=2, help="Verbose do Keras")
     parser.add_argument("--model", type=str, default="InceptionV3", help="Backbone keras.applications")
     parser.add_argument(
         "--augment",
@@ -132,7 +203,7 @@ def parse_args():
     parser.add_argument(
         "--warmup_epochs",
         type=int,
-        default=3,
+        default=5,
         help="Número de épocas de warmup para o learning rate scheduler",
     )
     parser.add_argument(
@@ -147,6 +218,37 @@ def parse_args():
         default=0.0,
         help="Label smoothing para regularização (0.0 desativa, 0.1 recomendado)",
     )
+    parser.add_argument(
+        "--early_stop_patience",
+        type=int,
+        default=0,
+        help="Paciência em épocas para early stopping por validação; 0 desativa.",
+    )
+    parser.add_argument(
+        "--early_stop_min_delta",
+        type=float,
+        default=1e-4,
+        help="Ganho mínimo exigido na métrica monitorada pelo early stopping.",
+    )
+    parser.add_argument(
+        "--early_stop_monitor",
+        type=str,
+        default="val_AUC",
+        help="Métrica usada pelo early stopping.",
+    )
+    parser.add_argument(
+        "--exact-val-every-epoch",
+        dest="exact_val_every_epoch",
+        action="store_true",
+        help="Recalcula métricas exatas da validação ao fim de cada época.",
+    )
+    parser.add_argument(
+        "--no-exact-val-every-epoch",
+        dest="exact_val_every_epoch",
+        action="store_false",
+        help="Usa métricas de validação do Keras durante treino e mantém avaliação exata no final_test.",
+    )
+    parser.set_defaults(exact_val_every_epoch=True)
     return parser.parse_args()
 
 
@@ -212,10 +314,14 @@ def choose_strategy():
     tf_config_raw = os.environ.get("TF_CONFIG")
     if tf_config_raw:
         try:
-            json.loads(tf_config_raw)
-            strategy = tf.distribute.MultiWorkerMirroredStrategy()
-            print("[Distribuição] MultiWorkerMirroredStrategy ativa via TF_CONFIG.")
-            return strategy
+            tf_config = json.loads(tf_config_raw)
+            workers = tf_config.get("cluster", {}).get("worker", []) or []
+            if len(workers) > 1:
+                strategy = tf.distribute.MultiWorkerMirroredStrategy()
+                print("[Distribuição] MultiWorkerMirroredStrategy ativa via TF_CONFIG.")
+                return strategy
+            os.environ.pop("TF_CONFIG", None)
+            print("[Distribuição] TF_CONFIG single-worker ignorado; usando estratégia local.")
         except Exception:
             print("[Distribuição] TF_CONFIG inválido, usando fallback.")
     gpus = tf.config.list_physical_devices("GPU")
@@ -230,9 +336,23 @@ def choose_strategy():
     return strategy
 
 
-def _read_gpu_memory_mb():
-    """Retorna (peak_mb, current_mb) considerando o uso corrente reportado pelo nvidia-smi."""
-    # Preferimos o valor do nvidia-smi (consumo atual visível na placa)
+def _read_gpu_current_memory_mb():
+    """Retorna a memória GPU corrente em MB, usando a maior GPU visível."""
+    try:
+        logical_gpus = tf.config.list_logical_devices("GPU")
+        currents = []
+        for idx, _ in enumerate(logical_gpus):
+            try:
+                info = tf.config.experimental.get_memory_info(f"GPU:{idx}")
+            except Exception:
+                continue
+            currents.append(info.get("current", 0))
+        if currents:
+            to_mb = 1024 * 1024
+            return max(currents) / to_mb
+    except Exception:
+        pass
+
     try:
         out = subprocess.check_output(
             [
@@ -252,47 +372,136 @@ def _read_gpu_memory_mb():
             except Exception:
                 continue
         if used_vals:
-            current = max(used_vals)
-            return current, current
+            return max(used_vals)
     except Exception:
         pass
 
-    # Fallback: API do TensorFlow (current/peak por device)
-    try:
-        logical_gpus = tf.config.list_logical_devices("GPU")
-        peaks = []
-        currents = []
-        for idx, _ in enumerate(logical_gpus):
-            try:
-                info = tf.config.experimental.get_memory_info(f"GPU:{idx}")
-            except Exception:
-                continue
-            peaks.append(info.get("peak", 0))
-            currents.append(info.get("current", 0))
-        if not peaks:
-            raise RuntimeError("get_memory_info retornou lista vazia")
-        to_mb = 1024 * 1024
-        return max(peaks) / to_mb, max(currents) / to_mb
-    except Exception:
-        return None, None
+    return None
 
 
 class GPUMemoryLogger(keras.callbacks.Callback):
-    """Adiciona métricas de memória GPU ao dicionário de logs por época."""
+    """Amostra consumo corrente de memória GPU e grava média por época."""
 
     def __init__(self, enabled: bool):
         super().__init__()
         self.enabled = enabled
+        self.train_samples = []
+        self.val_samples = []
+
+    def on_epoch_begin(self, epoch, logs=None):
+        if self.enabled:
+            self.train_samples = []
+            self.val_samples = []
+
+    def _sample(self, samples):
+        current_mb = _read_gpu_current_memory_mb()
+        if current_mb is not None:
+            samples.append(float(current_mb))
+
+    def on_train_batch_end(self, batch, logs=None):
+        if self.enabled:
+            self._sample(self.train_samples)
+
+    def on_test_batch_end(self, batch, logs=None):
+        if self.enabled:
+            self._sample(self.val_samples)
 
     def on_epoch_end(self, epoch, logs=None):
         if not self.enabled:
             return
         logs = logs or {}
-        peak_mb, current_mb = _read_gpu_memory_mb()
-        if peak_mb is not None:
-            logs["gpu_mem_peak_mb"] = peak_mb
-        if current_mb is not None:
-            logs["gpu_mem_current_mb"] = current_mb
+        if self.train_samples:
+            logs["train_gpu_mem_avg_mb"] = float(np.mean(self.train_samples))
+        if self.val_samples:
+            logs["val_gpu_mem_avg_mb"] = float(np.mean(self.val_samples))
+
+
+class ExactEvalMetricsLogger(keras.callbacks.Callback):
+    """Recalcula métricas de validação a partir de scores completos."""
+
+    def __init__(self, dataset, prefix="val", steps=None, enabled=True):
+        super().__init__()
+        self.dataset = dataset
+        self.prefix = str(prefix)
+        self.steps = None if steps is None or steps < 0 else int(steps)
+        self.enabled = bool(enabled)
+
+    def on_epoch_end(self, epoch, logs=None):
+        if not self.enabled:
+            return
+        logs = logs if logs is not None else {}
+        labels = []
+        scores = []
+        for batch_idx, batch in enumerate(self.dataset):
+            if self.steps is not None and batch_idx >= self.steps:
+                break
+            batch_images, batch_labels = batch[0], batch[1]
+            preds = self.model(batch_images, training=False)
+            labels.append(np.asarray(batch_labels.numpy()).reshape(-1))
+            scores.append(np.asarray(preds.numpy()).reshape(-1))
+        if not labels:
+            return
+
+        y_true = np.concatenate(labels).astype(np.int32)
+        y_score = np.concatenate(scores).astype(np.float64)
+        try:
+            auc_value = roc_auc_score(y_true, y_score)
+        except ValueError:
+            auc_value = float("nan")
+        metrics = compute_binary_metrics(y_true, y_score)
+        prefix = f"{self.prefix}_"
+        logs[f"{prefix}AUC"] = auc_value
+        logs[f"{prefix}auc"] = auc_value
+        logs[f"{prefix}precision"] = metrics["precision"]
+        logs[f"{prefix}sensitivity"] = metrics["sensitivity"]
+        logs[f"{prefix}recall"] = metrics["recall"]
+        logs[f"{prefix}specificity"] = metrics["specificity"]
+        logs[f"{prefix}specificity_at_sens95"] = metrics["specificity_at_sens95"]
+        logs[f"{prefix}f1"] = metrics["f1"]
+
+
+class BestWeightsTracker(keras.callbacks.Callback):
+    """Guarda em memoria os melhores pesos para evitar reload HDF5 no final."""
+
+    def __init__(self, monitor: str = "val_AUC", mode: str = "max", verbose: int = 0):
+        super().__init__()
+        self.monitor = monitor
+        self.mode = mode
+        self.verbose = verbose
+        self.best_value = -math.inf if mode == "max" else math.inf
+        self.best_epoch = None
+        self.best_weights = None
+
+    def _is_better(self, value: float) -> bool:
+        if self.best_epoch is None:
+            return True
+        if self.mode == "min":
+            return value < self.best_value
+        return value > self.best_value
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        raw_value = logs.get(self.monitor)
+        try:
+            value = float(raw_value)
+        except Exception:
+            return
+        if not np.isfinite(value) or not self._is_better(value):
+            return
+        self.best_value = value
+        self.best_epoch = int(epoch)
+        self.best_weights = [weights.copy() for weights in self.model.get_weights()]
+        if self.verbose:
+            print(
+                f"[INFO] Melhor checkpoint em memoria atualizado: "
+                f"epoch={self.best_epoch + 1}, {self.monitor}={self.best_value:.6f}"
+            )
+
+    def restore(self, model) -> bool:
+        if self.best_weights is None:
+            return False
+        model.set_weights(self.best_weights)
+        return True
 
 
 
@@ -304,31 +513,60 @@ def _dataset_cardinality(dataset):
         return None
 
 
+COMMON_CSV_FIELDS = [
+    "epoch",
+    "stage",
+    "train_loss",
+    "train_auc",
+    "train_precision",
+    "train_recall",
+    "train_f1",
+    "train_sens",
+    "train_spec",
+    "train_spec_at_sens95",
+    "train_throughput_img_s",
+    "train_elapsed_s",
+    "train_avg_batch_time_ms",
+    "train_inference_latency_ms_img",
+    "train_inference_latency_ms_batch",
+    "train_gpu_mem_avg_mb",
+    "val_loss",
+    "val_auc",
+    "val_precision",
+    "val_recall",
+    "val_f1",
+    "val_sens",
+    "val_spec",
+    "val_spec_at_sens95",
+    "val_throughput_img_s",
+    "val_elapsed_s",
+    "val_avg_batch_time_ms",
+    "val_inference_latency_ms_img",
+    "val_inference_latency_ms_batch",
+    "val_gpu_mem_avg_mb",
+    "test_loss",
+    "test_auc",
+    "test_precision",
+    "test_recall",
+    "test_f1",
+    "test_sens",
+    "test_spec",
+    "test_spec_at_sens95",
+    "test_throughput_img_s",
+    "test_elapsed_s",
+    "test_avg_batch_time_ms",
+    "test_inference_latency_ms_img",
+    "test_inference_latency_ms_batch",
+    "test_gpu_mem_avg_mb",
+    "lr",
+    "total_train_time_s",
+]
+
+
 class EpochCsvLogger(keras.callbacks.Callback):
     """Escreve métricas por época em CSV com o layout do pytorch_opt."""
 
-    _fields = [
-        "epoch",
-        "stage",
-        "train_loss",
-        "train_auc",
-        "train_sens",
-        "train_spec",
-        "train_throughput_img_s",
-        "train_elapsed_s",
-        "train_gpu_mem_alloc_mb",
-        "train_gpu_mem_reserved_mb",
-        "val_loss",
-        "val_auc",
-        "val_sens",
-        "val_spec",
-        "val_throughput_img_s",
-        "val_elapsed_s",
-        "val_gpu_mem_alloc_mb",
-        "val_gpu_mem_reserved_mb",
-        "lr",
-        "total_train_time_s",
-    ]
+    _fields = COMMON_CSV_FIELDS
 
     def __init__(self, csv_path, stage, train_steps, val_steps, global_batch_size, append=False):
         super().__init__()
@@ -401,43 +639,93 @@ class EpochCsvLogger(keras.callbacks.Callback):
         logs = logs or {}
         train_loss = logs.get("loss")
         train_auc = self._resolve_auc(logs, prefix="")
+        train_precision = self._resolve_metric(logs, "precision")
         train_sens = self._resolve_metric(logs, "sensitivity")
+        train_recall = train_sens
+        train_f1 = _compute_f1_from_precision_recall(train_precision, train_recall)
         train_spec = self._resolve_metric(logs, "specificity")
+        train_spec_at_sens95 = self._resolve_metric(logs, "specificity_at_sens95")
+        if train_spec_at_sens95 is None:
+            train_spec_at_sens95 = train_spec
         val_loss = logs.get("val_loss")
         val_auc = self._resolve_auc(logs, prefix="val_")
+        val_precision = self._resolve_metric(logs, "val_precision")
         val_sens = self._resolve_metric(logs, "val_sensitivity")
+        val_recall = val_sens
+        val_f1 = _compute_f1_from_precision_recall(val_precision, val_recall)
         val_spec = self._resolve_metric(logs, "val_specificity")
+        val_spec_at_sens95 = self._resolve_metric(logs, "val_specificity_at_sens95")
+        if val_spec_at_sens95 is None:
+            val_spec_at_sens95 = val_spec
 
         train_seen = None if self.train_steps is None else self.train_steps * self.global_batch_size
         val_seen = None if self.val_steps is None else self.val_steps * self.global_batch_size
         train_thpt = (train_seen / self._train_elapsed) if (train_seen and self._train_elapsed > 0) else None
         val_thpt = (val_seen / self._val_elapsed) if (val_seen and self._val_elapsed > 0) else None
-
-        mem_peak = logs.get("gpu_mem_peak_mb")
-        mem_current = logs.get("gpu_mem_current_mb")
-        # Usamos a alocação corrente como medida de consumo de memória.
-        mem_alloc = mem_current if mem_current is not None else mem_peak
-        mem_reserved = mem_alloc
+        train_avg_batch_time_ms = (
+            (self._train_elapsed / self.train_steps) * 1000.0
+            if self.train_steps and self._train_elapsed > 0
+            else None
+        )
+        val_avg_batch_time_ms = (
+            (self._val_elapsed / self.val_steps) * 1000.0
+            if self.val_steps and self._val_elapsed > 0
+            else None
+        )
+        val_inference_latency_ms_img = (
+            (self._val_elapsed / val_seen) * 1000.0
+            if val_seen and self._val_elapsed > 0
+            else None
+        )
+        val_inference_latency_ms_batch = val_avg_batch_time_ms
+        train_mem_avg = logs.get("train_gpu_mem_avg_mb")
+        val_mem_avg = logs.get("val_gpu_mem_avg_mb")
 
         row = {
             "epoch": int(epoch),
             "stage": self.stage,
             "train_loss": train_loss,
             "train_auc": train_auc,
+            "train_precision": train_precision,
+            "train_recall": train_recall,
+            "train_f1": train_f1,
             "train_sens": train_sens,
             "train_spec": train_spec,
+            "train_spec_at_sens95": train_spec_at_sens95,
             "train_throughput_img_s": train_thpt,
             "train_elapsed_s": self._train_elapsed if self._train_elapsed > 0 else None,
-            "train_gpu_mem_alloc_mb": mem_alloc,
-            "train_gpu_mem_reserved_mb": mem_reserved,
+            "train_avg_batch_time_ms": train_avg_batch_time_ms,
+            "train_inference_latency_ms_img": None,
+            "train_inference_latency_ms_batch": None,
+            "train_gpu_mem_avg_mb": train_mem_avg,
             "val_loss": val_loss,
             "val_auc": val_auc,
+            "val_precision": val_precision,
+            "val_recall": val_recall,
+            "val_f1": val_f1,
             "val_sens": val_sens,
             "val_spec": val_spec,
+            "val_spec_at_sens95": val_spec_at_sens95,
             "val_throughput_img_s": val_thpt,
             "val_elapsed_s": self._val_elapsed if self._val_elapsed > 0 else None,
-            "val_gpu_mem_alloc_mb": mem_alloc,
-            "val_gpu_mem_reserved_mb": mem_reserved,
+            "val_avg_batch_time_ms": val_avg_batch_time_ms,
+            "val_inference_latency_ms_img": val_inference_latency_ms_img,
+            "val_inference_latency_ms_batch": val_inference_latency_ms_batch,
+            "val_gpu_mem_avg_mb": val_mem_avg,
+            "test_loss": None,
+            "test_auc": None,
+            "test_precision": None,
+            "test_recall": None,
+            "test_f1": None,
+            "test_sens": None,
+            "test_spec": None,
+            "test_spec_at_sens95": None,
+            "test_throughput_img_s": None,
+            "test_elapsed_s": None,
+            "test_avg_batch_time_ms": None,
+            "test_inference_latency_ms_img": None,
+            "test_inference_latency_ms_batch": None,
+            "test_gpu_mem_avg_mb": None,
             "lr": self._resolve_lr(),
             "total_train_time_s": None,
         }
@@ -685,14 +973,16 @@ def main():
 
     tfrec_dir = Path(args.tfrec_dir)
     train_files = sorted(tfrec_dir.glob("train*.tfrec"))
-    valid_files = (
-        sorted(tfrec_dir.glob("test*.tfrec"))
-        + sorted(tfrec_dir.glob("val*.tfrec"))
-        + sorted(tfrec_dir.glob("valid*.tfrec"))
+    val_files = sorted(tfrec_dir.glob("val*.tfrec")) + sorted(tfrec_dir.glob("valid*.tfrec"))
+    test_files = sorted(tfrec_dir.glob("test*.tfrec"))
+    valid_files = val_files or test_files
+    test_files = test_files or valid_files
+    if not train_files or not valid_files or not test_files:
+        raise SystemExit("É necessário ao menos um TFRecord de treino e um de validação/teste.")
+    print(
+        f"Treino: {len(train_files)} arquivos | "
+        f"Validação: {len(valid_files)} arquivos | Teste: {len(test_files)} arquivos"
     )
-    if not train_files or not valid_files:
-        raise SystemExit("É necessário ao menos um TFRecord de treino e um de validação.")
-    print(f"Treino: {len(train_files)} arquivos | Validação: {len(valid_files)} arquivos")
 
     preprocess_fn = get_preprocess_fn(MODEL_NAME) if args.normalize == "preprocess" else None
     if args.normalize == "preprocess" and preprocess_fn is None:
@@ -746,17 +1036,60 @@ def main():
     label_smoothing = float(getattr(args, "label_smoothing", 0.0))
     if label_smoothing > 0:
         print(f"[Label Smoothing] Ativado com valor={label_smoothing:.3f}")
+    weight_decay = max(0.0, float(getattr(args, "weight_decay", 1e-5)))
+    clipnorm = float(getattr(args, "clipnorm", 1.0))
+    optimizer_kwargs = {}
+    if clipnorm > 0:
+        optimizer_kwargs["clipnorm"] = clipnorm
 
     with strategy.scope():
         model = build_model(MODEL_NAME, IMAGE_SIZE)
+        opt_name = str(getattr(args, "optimizer", "adam")).lower()
+        if opt_name in ("adamw", "adam_w"):
+            opt = keras.optimizers.AdamW(
+                learning_rate=lr_schedule,
+                weight_decay=weight_decay,
+                **optimizer_kwargs,
+            )
+        elif opt_name in ("sgd", "sgd_mom", "sgd-mom"):
+            opt = keras.optimizers.SGD(
+                learning_rate=lr_schedule,
+                momentum=0.9,
+                nesterov=True,
+                **optimizer_kwargs,
+            )
+        elif opt_name == "rmsprop":
+            opt = keras.optimizers.RMSprop(
+                learning_rate=lr_schedule,
+                rho=0.9,
+                **optimizer_kwargs,
+            )
+        elif opt_name == "adadelta":
+            opt = keras.optimizers.Adadelta(
+                learning_rate=lr_schedule,
+                rho=0.95,
+                **optimizer_kwargs,
+            )
+        else:
+            opt = keras.optimizers.Adam(learning_rate=lr_schedule, **optimizer_kwargs)
+        print(
+            "[Optimizer] "
+            f"name={opt_name}, weight_decay={weight_decay:.1e}, "
+            f"clipnorm={clipnorm if clipnorm > 0 else 'off'}"
+        )
         model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=lr_schedule),
+            optimizer=opt,
             loss=keras.losses.BinaryCrossentropy(label_smoothing=label_smoothing),
             metrics=[
                 keras.metrics.BinaryAccuracy(name="accuracy"),
-                keras.metrics.AUC(name="AUC"),
+                keras.metrics.AUC(num_thresholds=args.num_thresholds, name="AUC"),
+                keras.metrics.Precision(name="precision"),
                 Sensitivity(name="sensitivity"),
-                Specificity(name="specificity"),
+                keras.metrics.SpecificityAtSensitivity(
+                    SPECIFICITY_TARGET_SENSITIVITY,
+                    num_thresholds=args.num_thresholds,
+                    name="specificity",
+                ),
             ],
         )
         if VERBOSE:
@@ -771,19 +1104,94 @@ def main():
         append=False,
     )
     mem_logger = GPUMemoryLogger(enabled=args.log_gpu_mem)
+    exact_val_logger = ExactEvalMetricsLogger(
+        valid_ds,
+        prefix="val",
+        steps=val_steps_for_log,
+        enabled=args.exact_val_every_epoch,
+    )
+    if not args.exact_val_every_epoch:
+        print("[INFO] Validação exata por época desativada; final_test continua exato.")
+
+    best_weights_tracker = BestWeightsTracker(
+        monitor=args.early_stop_monitor,
+        mode="max",
+        verbose=VERBOSE,
+    )
+    print(
+        "[INFO] Rastreador do melhor modelo ativo: "
+        f"monitor={args.early_stop_monitor}, storage=memory"
+    )
+
+    callbacks = [mem_logger, exact_val_logger, best_weights_tracker]
+    if args.early_stop_patience > 0:
+        callbacks.append(
+            keras.callbacks.EarlyStopping(
+                monitor=args.early_stop_monitor,
+                mode="max",
+                patience=args.early_stop_patience,
+                min_delta=args.early_stop_min_delta,
+                restore_best_weights=True,
+                verbose=1 if VERBOSE else 0,
+            )
+        )
+        print(
+            "[INFO] Early stopping ativo: "
+            f"monitor={args.early_stop_monitor}, "
+            f"patience={args.early_stop_patience}, "
+            f"min_delta={args.early_stop_min_delta}, "
+            "restore_best_weights=True"
+        )
+    callbacks.append(csv_logger)
 
     t_start = time.time()
     history = model.fit(
         train_ds,
         validation_data=valid_ds,
         epochs=EPOCHS,
-        callbacks=[mem_logger, csv_logger],
+        callbacks=callbacks,
         verbose=VERBOSE,
     )
+    trained_epochs = len(history.epoch)
+    monitored_values = history.history.get(args.early_stop_monitor)
+    best_idx = None
+    if monitored_values:
+        best_idx = int(np.argmax(monitored_values))
+        print(
+            "[INFO] Treino finalizado: "
+            f"epochs_run={trained_epochs}/{EPOCHS}, "
+            f"best_epoch={best_idx + 1}, "
+            f"best_{args.early_stop_monitor}={monitored_values[best_idx]:.6f}"
+        )
+    else:
+        print(f"[INFO] Treino finalizado: epochs_run={trained_epochs}/{EPOCHS}")
+    if best_weights_tracker.restore(model):
+        tracker_epoch = (
+            best_weights_tracker.best_epoch + 1
+            if best_weights_tracker.best_epoch is not None
+            else None
+        )
+        tracker_value = best_weights_tracker.best_value
+        if tracker_epoch is not None and np.isfinite(tracker_value):
+            print(
+                "[INFO] Pesos restaurados do melhor checkpoint em memoria: "
+                f"epoch={tracker_epoch}, "
+                f"{args.early_stop_monitor}={tracker_value:.6f}"
+            )
+        elif best_idx is not None:
+            print(
+                "[INFO] Pesos restaurados do melhor checkpoint em memoria: "
+                f"epoch={best_idx + 1}, "
+                f"{args.early_stop_monitor}={monitored_values[best_idx]:.6f}"
+            )
+        else:
+            print("[INFO] Pesos restaurados do melhor checkpoint em memoria para o final_test.")
+    else:
+        print("[WARN] Nenhum checkpoint em memoria encontrado para restaurar; usando pesos finais.")
     elapsed = round(time.time() - t_start, 1)
 
     valid_eval = build_dataset(
-        [str(p) for p in valid_files],
+        [str(p) for p in test_files],
         batch_size=BATCH_SIZE,
         img_size=IMG,
         training=False,
@@ -794,15 +1202,36 @@ def main():
 
     y_true = []
     y_score = []
+    eval_predict_start = time.time()
+    eval_batches = 0
+    eval_inference_time_s = 0.0
+    eval_memory_samples_mb = []
     for batch_images, batch_labels in valid_eval:
+        inference_start = time.perf_counter()
         preds = model(batch_images, training=False)
-        y_score.append(preds.numpy().ravel())
+        preds_np = preds.numpy().ravel()
+        eval_inference_time_s += time.perf_counter() - inference_start
+        y_score.append(preds_np)
         y_true.append(batch_labels.numpy())
+        eval_batches += 1
+        current_mem = _read_gpu_current_memory_mb()
+        if current_mem is not None:
+            eval_memory_samples_mb.append(float(current_mem))
+    eval_predict_elapsed = time.time() - eval_predict_start
     y_true = np.concatenate(y_true)
     y_score = np.concatenate(y_score)
     auc_val = roc_auc_score(y_true, y_score)
-    sens_val, spec_val = compute_sens_spec(y_true, y_score)
+    final_metrics = compute_binary_metrics(y_true, y_score)
     fpr, tpr, thresholds = roc_curve(y_true, y_score)
+    test_inference_latency_ms_img = (
+        eval_inference_time_s / len(y_true) * 1000.0 if len(y_true) > 0 else None
+    )
+    test_inference_latency_ms_batch = (
+        eval_inference_time_s / eval_batches * 1000.0 if eval_batches > 0 else None
+    )
+    test_gpu_mem_avg_mb = (
+        float(np.mean(eval_memory_samples_mb)) if eval_memory_samples_mb else None
+    )
 
     thresholds_df = pd.DataFrame(
         {
@@ -828,24 +1257,50 @@ def main():
     plt.close()
 
     final_row = {
-        "epoch": args.epochs,
-        "stage": "final_eval",
+        "epoch": trained_epochs,
+        "stage": "final_test",
         "train_loss": None,
         "train_auc": None,
+        "train_precision": None,
+        "train_recall": None,
+        "train_f1": None,
         "train_sens": None,
         "train_spec": None,
+        "train_spec_at_sens95": None,
         "train_throughput_img_s": None,
         "train_elapsed_s": None,
-        "train_gpu_mem_alloc_mb": None,
-        "train_gpu_mem_reserved_mb": None,
+        "train_avg_batch_time_ms": None,
+        "train_inference_latency_ms_img": None,
+        "train_inference_latency_ms_batch": None,
+        "train_gpu_mem_avg_mb": None,
         "val_loss": None,
-        "val_auc": auc_val,
-        "val_sens": sens_val,
-        "val_spec": spec_val,
+        "val_auc": None,
+        "val_precision": None,
+        "val_recall": None,
+        "val_f1": None,
+        "val_sens": None,
+        "val_spec": None,
+        "val_spec_at_sens95": None,
         "val_throughput_img_s": None,
         "val_elapsed_s": None,
-        "val_gpu_mem_alloc_mb": None,
-        "val_gpu_mem_reserved_mb": None,
+        "val_avg_batch_time_ms": None,
+        "val_inference_latency_ms_img": None,
+        "val_inference_latency_ms_batch": None,
+        "val_gpu_mem_avg_mb": None,
+        "test_loss": None,
+        "test_auc": auc_val,
+        "test_precision": final_metrics["precision"],
+        "test_recall": final_metrics["recall"],
+        "test_f1": final_metrics["f1"],
+        "test_sens": final_metrics["sensitivity"],
+        "test_spec": final_metrics["specificity"],
+        "test_spec_at_sens95": final_metrics["specificity_at_sens95"],
+        "test_throughput_img_s": (len(y_true) / eval_predict_elapsed) if eval_predict_elapsed > 0 else None,
+        "test_elapsed_s": eval_predict_elapsed,
+        "test_avg_batch_time_ms": (eval_predict_elapsed / max(eval_batches, 1)) * 1000.0 if eval_batches > 0 else None,
+        "test_inference_latency_ms_img": test_inference_latency_ms_img,
+        "test_inference_latency_ms_batch": test_inference_latency_ms_batch,
+        "test_gpu_mem_avg_mb": test_gpu_mem_avg_mb,
         "lr": None,
         "total_train_time_s": elapsed,
     }
@@ -858,7 +1313,7 @@ def main():
     except Exception as exc:
         print(f"[WARN] Falha ao registrar linha final no CSV: {exc}")
 
-    print(f"Valid AUC (final): {auc_val:.4f}")
+    print(f"Test AUC (final): {auc_val:.4f}")
     print(f"Tempo total: {elapsed}s")
     print(f"{args.dataset},{args.exec},{auc_val:.6f},{elapsed}")
 

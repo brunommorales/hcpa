@@ -40,7 +40,57 @@ from .utils import (
     apply_ema,
     update_ema,
 )
-from .metrics import EpochStats
+from .metrics import EpochStats, compute_binary_metrics
+
+
+COMMON_CSV_FIELDS = [
+    "epoch",
+    "stage",
+    "train_loss",
+    "train_auc",
+    "train_precision",
+    "train_recall",
+    "train_f1",
+    "train_sens",
+    "train_spec",
+    "train_spec_at_sens95",
+    "train_throughput_img_s",
+    "train_elapsed_s",
+    "train_avg_batch_time_ms",
+    "train_inference_latency_ms_img",
+    "train_inference_latency_ms_batch",
+    "train_gpu_mem_avg_mb",
+    "val_loss",
+    "val_auc",
+    "val_precision",
+    "val_recall",
+    "val_f1",
+    "val_sens",
+    "val_spec",
+    "val_spec_at_sens95",
+    "val_throughput_img_s",
+    "val_elapsed_s",
+    "val_avg_batch_time_ms",
+    "val_inference_latency_ms_img",
+    "val_inference_latency_ms_batch",
+    "val_gpu_mem_avg_mb",
+    "test_loss",
+    "test_auc",
+    "test_precision",
+    "test_recall",
+    "test_f1",
+    "test_sens",
+    "test_spec",
+    "test_spec_at_sens95",
+    "test_throughput_img_s",
+    "test_elapsed_s",
+    "test_avg_batch_time_ms",
+    "test_inference_latency_ms_img",
+    "test_inference_latency_ms_batch",
+    "test_gpu_mem_avg_mb",
+    "lr",
+    "total_train_time_s",
+]
 
 
 @dataclass
@@ -177,6 +227,72 @@ def _build_scheduler(cfg: TrainConfig, optimizer: torch.optim.Optimizer, steps_p
     return None
 
 
+def _ddp_concat_variable_length(t: torch.Tensor) -> torch.Tensor:
+    if not dist.is_available() or not dist.is_initialized():
+        return t.detach().cpu()
+
+    n_local = torch.tensor([t.shape[0]], device=t.device, dtype=torch.long)
+    sizes = [torch.zeros_like(n_local) for _ in range(dist.get_world_size())]
+    dist.all_gather(sizes, n_local)
+    maxn = int(torch.stack(sizes).max().item())
+    if maxn == 0:
+        return torch.empty(0, dtype=t.dtype)
+
+    pad = maxn - t.shape[0]
+    if pad > 0:
+        pad_value = -1.0 if t.dtype.is_floating_point else -1
+        padding = torch.full((pad,), pad_value, device=t.device, dtype=t.dtype)
+        t = torch.cat([t, padding], dim=0)
+
+    buffers = [torch.empty_like(t) for _ in range(dist.get_world_size())]
+    dist.all_gather(buffers, t)
+    out = torch.cat(buffers, dim=0)
+    mask = out >= (0.0 if out.dtype.is_floating_point else 0)
+    return out[mask].detach().cpu()
+
+
+def _empty_metrics() -> Dict[str, float]:
+    return {
+        "loss": float("nan"),
+        "auc": float("nan"),
+        "precision": float("nan"),
+        "recall": float("nan"),
+        "sensitivity": float("nan"),
+        "specificity": float("nan"),
+        "specificity_at_sens95": float("nan"),
+        "f1": float("nan"),
+        "accuracy": float("nan"),
+    }
+
+
+def _aggregate_epoch_stats(
+    stats: EpochStats,
+    loss_sum: float,
+    sample_count: int,
+    *,
+    threshold: float,
+    device: torch.device,
+) -> tuple[Dict[str, float], tuple[np.ndarray, np.ndarray], int]:
+    probs_np, labels_np = stats.stack()
+    probs_t = torch.as_tensor(probs_np, dtype=torch.float32, device=device)
+    labels_t = torch.as_tensor(labels_np, dtype=torch.long, device=device)
+    global_probs = _ddp_concat_variable_length(probs_t).numpy()
+    global_labels = _ddp_concat_variable_length(labels_t).numpy().astype(np.int32)
+
+    loss_count = torch.tensor([float(loss_sum), float(sample_count)], device=device, dtype=torch.float64)
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_count, op=dist.ReduceOp.SUM)
+    global_loss_sum = float(loss_count[0].item())
+    global_sample_count = int(loss_count[1].item())
+
+    if global_sample_count <= 0 or global_probs.size == 0:
+        return _empty_metrics(), (global_probs, global_labels), global_sample_count
+
+    metrics = compute_binary_metrics(global_probs, global_labels, threshold=threshold)
+    metrics["loss"] = global_loss_sum / max(global_sample_count, 1)
+    return metrics, (global_probs, global_labels), global_sample_count
+
+
 def train_and_evaluate(cfg: TrainConfig) -> Dict[str, float]:
     set_seed(cfg.seed)
     rank, world_size = _init_distributed()
@@ -209,33 +325,18 @@ def train_and_evaluate(cfg: TrainConfig) -> Dict[str, float]:
     ckpt_path = cfg.results_dir / "checkpoint.pt"
     if rank == 0:
         with metrics_csv.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=[
-                "epoch",
-                "stage",
-                "train_loss",
-                "train_auc",
-                "train_sens",
-                "train_spec",
-                "train_accuracy",
-                "train_throughput_img_s",
-                "train_gpu_mem_alloc_mb",
-                "train_gpu_mem_reserved_mb",
-                "val_loss",
-                "val_auc",
-                "val_sens",
-                "val_spec",
-                "val_accuracy",
-                "val_throughput_img_s",
-                "val_gpu_mem_alloc_mb",
-                "val_gpu_mem_reserved_mb",
-                "lr",
-                "elapsed_s",
-            ])
+            writer = csv.DictWriter(handle, fieldnames=COMMON_CSV_FIELDS)
             writer.writeheader()
 
     start_time = time.perf_counter()
     last_eval_arrays = (np.array([]), np.array([]))  # probs, labels
-    last_eval_arrays = (np.array([]), np.array([]))  # probs, labels
+    last_eval_metrics = None
+    last_val_throughput = float("nan")
+    last_val_elapsed = float("nan")
+    last_val_avg_batch_time_ms = float("nan")
+    last_val_inference_latency_ms_img = float("nan")
+    last_val_inference_latency_ms_batch = float("nan")
+    last_val_mem_avg = float("nan")
     global_step = 0
 
     for epoch in range(1, cfg.epochs + 1):
@@ -244,9 +345,16 @@ def train_and_evaluate(cfg: TrainConfig) -> Dict[str, float]:
         model.train()
         train_stats = EpochStats()
         t_epoch = time.perf_counter()
+        train_batches = 0
+        train_loss_sum = 0.0
+        train_sample_count = 0
+        train_memory_samples_mb: list[float] = []
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
         optimizer.zero_grad(set_to_none=True)
 
         for step, batch in enumerate(train_loader, 1):
+            train_batches = step
             batch = move_to_device(batch, device)
             images = batch["image"]
             labels = batch["label"].view(-1)
@@ -285,15 +393,40 @@ def train_and_evaluate(cfg: TrainConfig) -> Dict[str, float]:
                     scheduler.step()
 
             probs = _prob_positive(logits.detach())
-            train_stats.update(float(loss.detach()) * cfg.gradient_accumulation, probs.cpu().numpy(), labels.cpu().numpy())
+            loss_value = float(loss.detach()) * cfg.gradient_accumulation
+            batch_size = int(labels.shape[0])
+            train_loss_sum += loss_value * batch_size
+            train_sample_count += batch_size
+            train_stats.update(loss_value, probs.cpu().numpy(), labels.cpu().numpy())
             global_step += 1
+            train_memory_samples_mb.append(_gpu_mem_current_mb())
 
             if cfg.log_every and global_step % cfg.log_every == 0 and rank == 0:
                 print(f"[opt][epoch {epoch} step {global_step}] loss={loss.item()*cfg.gradient_accumulation:.4f}")
 
         train_elapsed = time.perf_counter() - t_epoch
-        train_metrics = train_stats.aggregate(threshold=cfg.threshold)
-        train_throughput = meta.get("train_items", cfg.batch_size * steps_per_epoch) / max(train_elapsed, 1e-6)
+        if world_size > 1:
+            elapsed_tensor = torch.tensor([train_elapsed], device=device, dtype=torch.float64)
+            dist.all_reduce(elapsed_tensor, op=dist.ReduceOp.MAX)
+            train_elapsed = float(elapsed_tensor.item())
+        train_metrics, _, train_global_samples = _aggregate_epoch_stats(
+            train_stats,
+            train_loss_sum,
+            train_sample_count,
+            threshold=cfg.threshold,
+            device=device,
+        )
+        train_throughput = train_global_samples / max(train_elapsed, 1e-6)
+        train_avg_batch_time_ms = (train_elapsed / max(train_batches, 1)) * 1000.0 if train_batches > 0 else 0.0
+        train_mem_avg = _mean_valid(train_memory_samples_mb)
+        if world_size > 1:
+            mem_tensor = torch.tensor(
+                [0.0 if math.isnan(train_mem_avg) else train_mem_avg],
+                device=device,
+                dtype=torch.float64,
+            )
+            dist.all_reduce(mem_tensor, op=dist.ReduceOp.SUM)
+            train_mem_avg = float(mem_tensor.item()) / max(world_size, 1)
 
         # eval (optionally with EMA)
         model.eval()
@@ -302,22 +435,80 @@ def train_and_evaluate(cfg: TrainConfig) -> Dict[str, float]:
             backup_state = apply_ema(model.module if isinstance(model, DDP) else model, ema_state)
 
         eval_stats = EpochStats()
+        val_start = time.perf_counter()
+        val_batches = 0
+        val_loss_sum = 0.0
+        val_sample_count = 0
+        val_memory_samples_mb: list[float] = []
+        val_inference_time_s = 0.0
+        val_inference_samples = 0
         with torch.inference_mode(), autocast(enabled=cfg.amp):
             for batch in eval_loader:
+                val_batches += 1
                 batch = move_to_device(batch, device)
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                inference_start = time.perf_counter()
                 logits = model(batch["image"])
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                val_inference_time_s += time.perf_counter() - inference_start
+                val_inference_samples += int(batch["image"].shape[0])
+                labels = batch["label"].view(-1)
                 loss = _loss_fn(
                     logits,
-                    batch["label"].view(-1),
+                    labels,
                     soft_targets=None,
                     class_weights=class_weights,
                     label_smoothing=0.0,
                 )
                 probs = _prob_positive(logits)
-                eval_stats.update(float(loss), probs.cpu().numpy(), batch["label"].view(-1).cpu().numpy())
-        eval_metrics = eval_stats.aggregate(threshold=cfg.threshold)
-        last_eval_arrays = eval_stats.stack()
-        val_throughput = meta.get("eval_items", cfg.eval_batch_size * 10) / max((time.perf_counter() - t_epoch), 1e-6)
+                loss_value = float(loss)
+                batch_size = int(labels.shape[0])
+                val_loss_sum += loss_value * batch_size
+                val_sample_count += batch_size
+                eval_stats.update(loss_value, probs.cpu().numpy(), labels.cpu().numpy())
+                val_memory_samples_mb.append(_gpu_mem_current_mb())
+        val_elapsed = time.perf_counter() - val_start
+        if world_size > 1:
+            elapsed_tensor = torch.tensor([val_elapsed], device=device, dtype=torch.float64)
+            dist.all_reduce(elapsed_tensor, op=dist.ReduceOp.MAX)
+            val_elapsed = float(elapsed_tensor.item())
+        eval_metrics, last_eval_arrays, val_global_samples = _aggregate_epoch_stats(
+            eval_stats,
+            val_loss_sum,
+            val_sample_count,
+            threshold=cfg.threshold,
+            device=device,
+        )
+        val_throughput = val_global_samples / max(val_elapsed, 1e-6)
+        val_avg_batch_time_ms = (val_elapsed / max(val_batches, 1)) * 1000.0 if val_batches > 0 else 0.0
+        val_inference_latency_ms_img = (
+            val_inference_time_s / val_inference_samples * 1000.0
+            if val_inference_samples > 0
+            else float("nan")
+        )
+        val_inference_latency_ms_batch = (
+            val_inference_time_s / val_batches * 1000.0 if val_batches > 0 else float("nan")
+        )
+        val_mem_avg = _mean_valid(val_memory_samples_mb)
+        if world_size > 1:
+            mem_tensor = torch.tensor(
+                [
+                    0.0 if math.isnan(val_mem_avg) else val_mem_avg,
+                    0.0 if math.isnan(val_inference_latency_ms_img) else val_inference_latency_ms_img,
+                    0.0 if math.isnan(val_inference_latency_ms_batch) else val_inference_latency_ms_batch,
+                    1.0 if val_inference_samples > 0 else 0.0,
+                ],
+                device=device,
+                dtype=torch.float64,
+            )
+            dist.all_reduce(mem_tensor, op=dist.ReduceOp.SUM)
+            val_mem_avg = float(mem_tensor[0].item()) / max(world_size, 1)
+            latency_ranks = max(float(mem_tensor[3].item()), 1.0)
+            if mem_tensor[3].item() > 0:
+                val_inference_latency_ms_img = float(mem_tensor[1].item()) / latency_ranks
+                val_inference_latency_ms_batch = float(mem_tensor[2].item()) / latency_ranks
 
         # Quick sanity check: flag single-class validation splits that make AUC undefined
         if rank == 0 and last_eval_arrays[1].size > 0:
@@ -339,30 +530,63 @@ def train_and_evaluate(cfg: TrainConfig) -> Dict[str, float]:
             scheduler.step()
 
         if rank == 0:
+            last_eval_metrics = eval_metrics
+            last_val_throughput = val_throughput
+            last_val_elapsed = val_elapsed
+            last_val_avg_batch_time_ms = val_avg_batch_time_ms
+            last_val_inference_latency_ms_img = val_inference_latency_ms_img
+            last_val_inference_latency_ms_batch = val_inference_latency_ms_batch
+            last_val_mem_avg = val_mem_avg
             row = {
                 "epoch": epoch,
                 "stage": "train",
                 "train_loss": train_metrics["loss"],
                 "train_auc": train_metrics["auc"],
+                "train_precision": train_metrics["precision"],
+                "train_recall": train_metrics["recall"],
+                "train_f1": train_metrics["f1"],
                 "train_sens": train_metrics["sensitivity"],
                 "train_spec": train_metrics["specificity"],
-                "train_accuracy": train_metrics["accuracy"],
+                "train_spec_at_sens95": train_metrics["specificity_at_sens95"],
                 "train_throughput_img_s": train_throughput,
-                "train_gpu_mem_alloc_mb": _gpu_mem_mb()[0],
-                "train_gpu_mem_reserved_mb": _gpu_mem_mb()[1],
+                "train_elapsed_s": train_elapsed,
+                "train_avg_batch_time_ms": train_avg_batch_time_ms,
+                "train_inference_latency_ms_img": float("nan"),
+                "train_inference_latency_ms_batch": float("nan"),
+                "train_gpu_mem_avg_mb": train_mem_avg,
                 "val_loss": eval_metrics["loss"],
                 "val_auc": eval_metrics["auc"],
+                "val_precision": eval_metrics["precision"],
+                "val_recall": eval_metrics["recall"],
+                "val_f1": eval_metrics["f1"],
                 "val_sens": eval_metrics["sensitivity"],
                 "val_spec": eval_metrics["specificity"],
-                "val_accuracy": eval_metrics["accuracy"],
+                "val_spec_at_sens95": eval_metrics["specificity_at_sens95"],
                 "val_throughput_img_s": val_throughput,
-                "val_gpu_mem_alloc_mb": _gpu_mem_mb()[0],
-                "val_gpu_mem_reserved_mb": _gpu_mem_mb()[1],
+                "val_elapsed_s": val_elapsed,
+                "val_avg_batch_time_ms": val_avg_batch_time_ms,
+                "val_inference_latency_ms_img": val_inference_latency_ms_img,
+                "val_inference_latency_ms_batch": val_inference_latency_ms_batch,
+                "val_gpu_mem_avg_mb": val_mem_avg,
+                "test_loss": float("nan"),
+                "test_auc": float("nan"),
+                "test_precision": float("nan"),
+                "test_recall": float("nan"),
+                "test_f1": float("nan"),
+                "test_sens": float("nan"),
+                "test_spec": float("nan"),
+                "test_spec_at_sens95": float("nan"),
+                "test_throughput_img_s": float("nan"),
+                "test_elapsed_s": float("nan"),
+                "test_avg_batch_time_ms": float("nan"),
+                "test_inference_latency_ms_img": float("nan"),
+                "test_inference_latency_ms_batch": float("nan"),
+                "test_gpu_mem_avg_mb": float("nan"),
                 "lr": lr_value,
-                "elapsed_s": time.perf_counter() - start_time,
+                "total_train_time_s": float("nan"),
             }
             with metrics_csv.open("a", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(handle, fieldnames=row.keys())
+                writer = csv.DictWriter(handle, fieldnames=COMMON_CSV_FIELDS)
                 writer.writerow(row)
 
             val_auc = eval_metrics["auc"]
@@ -400,6 +624,58 @@ def train_and_evaluate(cfg: TrainConfig) -> Dict[str, float]:
     }
     if rank == 0:
         _save_roc_plots(cfg.results_dir, last_eval_arrays, prefix="val")
+        if last_eval_metrics is not None:
+            final_row = {
+                "epoch": cfg.epochs,
+                "stage": "final_test",
+                "train_loss": float("nan"),
+                "train_auc": float("nan"),
+                "train_precision": float("nan"),
+                "train_recall": float("nan"),
+                "train_f1": float("nan"),
+                "train_sens": float("nan"),
+                "train_spec": float("nan"),
+                "train_spec_at_sens95": float("nan"),
+                "train_throughput_img_s": float("nan"),
+                "train_elapsed_s": float("nan"),
+                "train_avg_batch_time_ms": float("nan"),
+                "train_inference_latency_ms_img": float("nan"),
+                "train_inference_latency_ms_batch": float("nan"),
+                "train_gpu_mem_avg_mb": float("nan"),
+                "val_loss": float("nan"),
+                "val_auc": float("nan"),
+                "val_precision": float("nan"),
+                "val_recall": float("nan"),
+                "val_f1": float("nan"),
+                "val_sens": float("nan"),
+                "val_spec": float("nan"),
+                "val_spec_at_sens95": float("nan"),
+                "val_throughput_img_s": float("nan"),
+                "val_elapsed_s": float("nan"),
+                "val_avg_batch_time_ms": float("nan"),
+                "val_inference_latency_ms_img": float("nan"),
+                "val_inference_latency_ms_batch": float("nan"),
+                "val_gpu_mem_avg_mb": float("nan"),
+                "test_loss": last_eval_metrics["loss"],
+                "test_auc": last_eval_metrics["auc"],
+                "test_precision": last_eval_metrics["precision"],
+                "test_recall": last_eval_metrics["recall"],
+                "test_f1": last_eval_metrics["f1"],
+                "test_sens": last_eval_metrics["sensitivity"],
+                "test_spec": last_eval_metrics["specificity"],
+                "test_spec_at_sens95": last_eval_metrics["specificity_at_sens95"],
+                "test_throughput_img_s": last_val_throughput,
+                "test_elapsed_s": last_val_elapsed,
+                "test_avg_batch_time_ms": last_val_avg_batch_time_ms,
+                "test_inference_latency_ms_img": last_val_inference_latency_ms_img,
+                "test_inference_latency_ms_batch": last_val_inference_latency_ms_batch,
+                "test_gpu_mem_avg_mb": last_val_mem_avg,
+                "lr": float("nan"),
+                "total_train_time_s": time.perf_counter() - start_time,
+            }
+            with metrics_csv.open("a", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=COMMON_CSV_FIELDS)
+                writer.writerow(final_row)
         (cfg.results_dir / "final_metrics.json").write_text(json.dumps(final, indent=2), encoding="utf-8")
     if world_size > 1:
         dist.barrier()
@@ -460,12 +736,17 @@ def benchmark(cfg: TrainConfig, *, warmup_steps: int = 20, measure_steps: int = 
     return {"latency_s": mean_t, "throughput_img_s": throughput}
 
 
-def _gpu_mem_mb() -> tuple[float, float]:
+def _gpu_mem_current_mb() -> float:
     if not torch.cuda.is_available():
-        return float("nan"), float("nan")
+        return float("nan")
     alloc = torch.cuda.memory_allocated() / (1024**2)
     reserved = torch.cuda.memory_reserved() / (1024**2)
-    return float(alloc), float(reserved)
+    return float(max(alloc, reserved))
+
+
+def _mean_valid(values: list[float]) -> float:
+    valid = [float(value) for value in values if not math.isnan(float(value))]
+    return float(np.mean(valid)) if valid else float("nan")
 
 
 def _save_roc_plots(results_dir: Path, arrays: tuple[np.ndarray, np.ndarray], prefix: str) -> None:

@@ -5,7 +5,6 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 CONTAINER="${ROOT}/monai_opt.sif"
 TFREC_DIR_HOST="${ROOT}/data/all-tfrec"
-BASE_RESULTS_HOST="${ROOT}/results/h200_opt"
 
 # Configs
 BATCH_SIZE=96
@@ -16,10 +15,32 @@ MODEL="efficientnet_b3"
 NUM_RUNS=10
 USE_DALI_FLAG="--use_dali"   # remova se a imagem não tiver DALI
 
+sanitize_tag() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//' | cut -c1-80
+}
+
+JOB_ID_TAG="$(sanitize_tag "${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-manual}}")"
+NODE_NAME_RAW="${SLURM_NODELIST:-$(hostname)}"
+NODEGROUP_RAW="${NODE_NAME_RAW%%,*}"
+NODEGROUP_RAW="${NODEGROUP_RAW%%[*}"
+NODEGROUP_RAW="$(printf '%s' "${NODEGROUP_RAW}" | sed -E 's/[0-9]+$//')"
+NODEGROUP_TAG="$(sanitize_tag "${NODEGROUP_RAW:-nodes}")"
+GPU_NAME_RAW="${GPU_NAME_RAW:-$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1 2>/dev/null || true)}"
+GPU_TAG="$(sanitize_tag "${GPU_NAME_RAW:-gpu}")"
+if [[ -z "${GPU_TAG}" || "${GPU_TAG}" == "unknown" ]]; then
+  GPU_TAG="gpu"
+fi
+GPU_COUNT="${SLURM_GPUS_PER_TASK:-${CUDA_VISIBLE_DEVICES:+$(awk -F, '{print NF}' <<<"${CUDA_VISIBLE_DEVICES}")}}"
+GPU_COUNT="${GPU_COUNT:-1}"
+GPU_DESC="${GPU_COUNT}x${GPU_TAG}"
+BATCH_TAG="bs$(sanitize_tag "${BATCH_SIZE}")"
+RESULTS_SUBDIR="${RESULTS_SUBDIR:-results/result${JOB_ID_TAG}_${NODEGROUP_TAG}_${GPU_DESC}_${BATCH_TAG}}"
+BASE_RESULTS_HOST="${ROOT}/${RESULTS_SUBDIR}"
+
 for i in $(seq 0 $((NUM_RUNS-1)))
 do
   RUN_DIR_HOST="${BASE_RESULTS_HOST}/run_${i}"
-  RUN_DIR_CONT="/workspace/results/h200_opt/run_${i}"
+  RUN_DIR_CONT="/workspace/${RESULTS_SUBDIR}/run_${i}"
   TFREC_DIR_CONT="/workspace/data/all-tfrec"
 
   echo "======================================"

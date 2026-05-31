@@ -44,10 +44,8 @@ class RunRecord:
     avg_thr_per_gpu: Optional[float]
     avg_thr_global: Optional[float]
     final_auc: Optional[float]
-    peak_train_mem_alloc_mb: Optional[float]
-    peak_train_mem_reserved_mb: Optional[float]
-    peak_val_mem_alloc_mb: Optional[float]
-    peak_val_mem_reserved_mb: Optional[float]
+    train_mem_avg_mb: Optional[float]
+    val_mem_avg_mb: Optional[float]
 
 
 def safe_float(x: object) -> Optional[float]:
@@ -117,10 +115,8 @@ def parse_run(run_dir: Path, gpus: int, partition: str, cluster: Optional[str], 
     if not csv_path:
         return None
     thr_values: List[float] = []  # per-GPU throughput values from CSV
-    train_mem_alloc_values: List[float] = []
-    train_mem_reserved_values: List[float] = []
-    val_mem_alloc_values: List[float] = []
-    val_mem_reserved_values: List[float] = []
+    train_mem_avg_values: List[float] = []
+    val_mem_avg_values: List[float] = []
     final_auc: Optional[float] = None
     final_elapsed: Optional[float] = None
 
@@ -134,18 +130,12 @@ def parse_run(run_dir: Path, gpus: int, partition: str, cluster: Optional[str], 
                     v = safe_float(row.get("train_throughput_img_s"))
                     if v is not None:
                         thr_values.append(v)
-                    mem_alloc = safe_float(row.get("train_gpu_mem_alloc_mb"))
-                    if mem_alloc is not None:
-                        train_mem_alloc_values.append(mem_alloc)
-                    mem_reserved = safe_float(row.get("train_gpu_mem_reserved_mb"))
-                    if mem_reserved is not None:
-                        train_mem_reserved_values.append(mem_reserved)
-                val_mem_alloc = safe_float(row.get("val_gpu_mem_alloc_mb"))
-                if val_mem_alloc is not None:
-                    val_mem_alloc_values.append(val_mem_alloc)
-                val_mem_reserved = safe_float(row.get("val_gpu_mem_reserved_mb"))
-                if val_mem_reserved is not None:
-                    val_mem_reserved_values.append(val_mem_reserved)
+                    mem_avg = safe_float(row.get("train_gpu_mem_avg_mb"))
+                    if mem_avg is not None:
+                        train_mem_avg_values.append(mem_avg)
+                val_mem_avg = safe_float(row.get("val_gpu_mem_avg_mb"))
+                if val_mem_avg is not None:
+                    val_mem_avg_values.append(val_mem_avg)
                 # final eval row carries total elapsed
                 if stage == "final_eval":
                     final_elapsed = safe_float(row.get("val_elapsed_s"))
@@ -155,10 +145,8 @@ def parse_run(run_dir: Path, gpus: int, partition: str, cluster: Optional[str], 
 
     avg_thr_per_gpu = statistics.mean(thr_values) if thr_values else None
     avg_thr_global = (avg_thr_per_gpu * gpus) if avg_thr_per_gpu is not None else None
-    peak_train_mem_alloc = max(train_mem_alloc_values) if train_mem_alloc_values else None
-    peak_train_mem_reserved = max(train_mem_reserved_values) if train_mem_reserved_values else None
-    peak_val_mem_alloc = max(val_mem_alloc_values) if val_mem_alloc_values else None
-    peak_val_mem_reserved = max(val_mem_reserved_values) if val_mem_reserved_values else None
+    train_mem_avg = statistics.mean(train_mem_avg_values) if train_mem_avg_values else None
+    val_mem_avg = statistics.mean(val_mem_avg_values) if val_mem_avg_values else None
 
     return RunRecord(
         dir=run_dir,
@@ -171,10 +159,8 @@ def parse_run(run_dir: Path, gpus: int, partition: str, cluster: Optional[str], 
         avg_thr_per_gpu=avg_thr_per_gpu,
         avg_thr_global=avg_thr_global,
         final_auc=final_auc,
-        peak_train_mem_alloc_mb=peak_train_mem_alloc,
-        peak_train_mem_reserved_mb=peak_train_mem_reserved,
-        peak_val_mem_alloc_mb=peak_val_mem_alloc,
-        peak_val_mem_reserved_mb=peak_val_mem_reserved,
+        train_mem_avg_mb=train_mem_avg,
+        val_mem_avg_mb=val_mem_avg,
     )
 
 
@@ -242,30 +228,22 @@ def summarize_groups(groups: Dict[int, List[RunRecord]]) -> Dict[int, Dict[str, 
     for g, runs in sorted(groups.items()):
         times = [r.elapsed_s for r in runs]
         thr = [r.avg_thr_global for r in runs]
-        train_mem_alloc = [r.peak_train_mem_alloc_mb for r in runs]
-        train_mem_reserved = [r.peak_train_mem_reserved_mb for r in runs]
-        val_mem_alloc = [r.peak_val_mem_alloc_mb for r in runs]
-        val_mem_reserved = [r.peak_val_mem_reserved_mb for r in runs]
+        train_mem_avg = [r.train_mem_avg_mb for r in runs]
+        val_mem_avg = [r.val_mem_avg_mb for r in runs]
         t_mean, t_std = describe(times)
         th_mean, th_std = describe(thr)
-        tr_mem_alloc_mean, tr_mem_alloc_std = describe(train_mem_alloc)
-        tr_mem_res_mean, tr_mem_res_std = describe(train_mem_reserved)
-        val_mem_alloc_mean, val_mem_alloc_std = describe(val_mem_alloc)
-        val_mem_res_mean, val_mem_res_std = describe(val_mem_reserved)
+        train_mem_avg_mean, train_mem_avg_std = describe(train_mem_avg)
+        val_mem_avg_mean, val_mem_avg_std = describe(val_mem_avg)
         summary[g] = {
             "runs": len(runs),
             "elapsed_mean": t_mean,
             "elapsed_stdev": t_std,
             "throughput_mean": th_mean,
             "throughput_stdev": th_std,
-            "train_mem_alloc_mean": tr_mem_alloc_mean,
-            "train_mem_alloc_stdev": tr_mem_alloc_std,
-            "train_mem_reserved_mean": tr_mem_res_mean,
-            "train_mem_reserved_stdev": tr_mem_res_std,
-            "val_mem_alloc_mean": val_mem_alloc_mean,
-            "val_mem_alloc_stdev": val_mem_alloc_std,
-            "val_mem_reserved_mean": val_mem_res_mean,
-            "val_mem_reserved_stdev": val_mem_res_std,
+            "train_mem_avg_mean": train_mem_avg_mean,
+            "train_mem_avg_stdev": train_mem_avg_std,
+            "val_mem_avg_mean": val_mem_avg_mean,
+            "val_mem_avg_stdev": val_mem_avg_std,
         }
     return summary
 
@@ -342,22 +320,17 @@ def build_text_summary(groups: Dict[int, Dict[str, float]], comps: Iterable[Dict
                 f"efficiency={c['scalability_efficiency']:.3f}"
             )
     lines.append("")
-    lines.append("=== GPU Memory (peak MB) ===")
+    lines.append("=== GPU Memory (average MB) ===")
     lines.append("")
-    mem_hdr = (
-        f"{'GPUs':>4} | {'Train alloc':>18} | {'Train reserved':>18} | "
-        f"{'Val alloc':>18} | {'Val reserved':>18}"
-    )
+    mem_hdr = f"{'GPUs':>4} | {'Train avg':>18} | {'Val avg':>18}"
     lines.append(mem_hdr)
     lines.append("-" * len(mem_hdr))
     for g in sorted(groups):
         s = groups[g]
         lines.append(
             f"{g:>4} | "
-            f"{format_stat(s['train_mem_alloc_mean'], s['train_mem_alloc_stdev'], '{:.1f}'):>18} | "
-            f"{format_stat(s['train_mem_reserved_mean'], s['train_mem_reserved_stdev'], '{:.1f}'):>18} | "
-            f"{format_stat(s['val_mem_alloc_mean'], s['val_mem_alloc_stdev'], '{:.1f}'):>18} | "
-            f"{format_stat(s['val_mem_reserved_mean'], s['val_mem_reserved_stdev'], '{:.1f}'):>18}"
+            f"{format_stat(s['train_mem_avg_mean'], s['train_mem_avg_stdev'], '{:.1f}'):>18} | "
+            f"{format_stat(s['val_mem_avg_mean'], s['val_mem_avg_stdev'], '{:.1f}'):>18}"
         )
     lines.append("")
     return "\n".join(lines)
@@ -399,10 +372,8 @@ def main() -> None:
                 "avg_throughput_per_gpu": r.avg_thr_per_gpu,
                 "avg_throughput_global": r.avg_thr_global,
                 "final_auc": r.final_auc,
-                "peak_train_mem_alloc_mb": r.peak_train_mem_alloc_mb,
-                "peak_train_mem_reserved_mb": r.peak_train_mem_reserved_mb,
-                "peak_val_mem_alloc_mb": r.peak_val_mem_alloc_mb,
-                "peak_val_mem_reserved_mb": r.peak_val_mem_reserved_mb,
+                "train_mem_avg_mb": r.train_mem_avg_mb,
+                "val_mem_avg_mb": r.val_mem_avg_mb,
             }
             for r in records
         ],

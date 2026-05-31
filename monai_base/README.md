@@ -11,7 +11,7 @@ Clonamos a versão otimizada e a simplificamos: nada de DALI, nada de timm, sem 
 ## Treino recomendado
 ```bash
 python3 train.py \
-  --tfrec_dir ./data/all-tfrec \
+  --tfrec_dir /home/users/bmmorales/projects/hcpa/data/all-tfrec \
   --results results/monai_puro \
   --batch_size 96 --epochs 200 \
   --model inception_v3

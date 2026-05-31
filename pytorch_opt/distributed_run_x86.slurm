@@ -4,12 +4,12 @@
 #SBATCH --ntasks-per-node=1          # 1 processo por nó (ajuste se quiser +GPUs por nó)
 #SBATCH --gpus-per-task=1
 #SBATCH --cpus-per-task=8
-#SBATCH --array=1-10%1
-#SBATCH --time=24:00:00
+#SBATCH --array=0-9%1
+#SBATCH --time=14:00:00
 #SBATCH --partition=tupi
-#SBATCH --nodelist=tupi3
-#SBATCH --output=logs/%x_%j_%N.out
-#SBATCH --error=logs/%x_%j_%N.err
+#SBATCH --nodelist=tupi5
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
 
 set -euxo pipefail
 
@@ -55,17 +55,37 @@ EOS
 # ========================== CONFIG ==========================
 # Imagem única (já buildada nos dois nós)
 IMAGE="distributed_x86:latest"
+MODULE_NAME="pytorch_opt"
 
-# Projeto no HOST: usa o diretório onde você rodar o sbatch
-HOST_PROJ_DIR="${SLURM_SUBMIT_DIR}"
+SSD_BASE_DIR="${SSD_BASE_DIR:-/ssd/bmmorales}"
+PERSISTENT_ROOT_DIR="${PERSISTENT_ROOT_DIR:-${HOME:-/home/users/bmmorales}/projects/hcpa}"
+REQUIRE_SSD="${REQUIRE_SSD:-1}"
+FINAL_SYNC="${FINAL_SYNC:-0}"
+SYNC_LOGS_TO_HOME="${SYNC_LOGS_TO_HOME:-0}"
+RUNTIME_HELPER="${PERSISTENT_ROOT_DIR}/tools/hcpa_ssd_runtime.sh"
+if [[ ! -f "${RUNTIME_HELPER}" ]]; then
+  echo "[CHECK][FAIL] helper de runtime ausente: ${RUNTIME_HELPER}"
+  exit 91
+fi
+source "${RUNTIME_HELPER}"
+hcpa_runtime_init_paths "${MODULE_NAME}"
+DATASET_NAME="${DATASET_NAME:-all-tfrec}"
+TFREC_SOURCE_DIR="${TFREC_SOURCE_DIR:-${HOME_ROOT_DIR}/data/all-tfrec}"
+TFREC_STAGE_NAME="${TFREC_STAGE_NAME:-${DATASET_NAME}}"
 
 # Usa tmp local para build e cache do Docker (evita estourar /usr ou NFS)
 DOCKER_TMPDIR="${DOCKER_TMPDIR:-/tmp/docker_${SLURM_JOB_ID:-$$}}"
 export DOCKER_TMPDIR DOCKER_BUILDKIT=1
 mkdir -p "${DOCKER_TMPDIR}"
 
-# TFRecords no HOST (ajuste se necessário; precisa existir nos dois nós)
-HOST_TFREC_DIR="${HOST_TFREC_DIR:-${HOST_PROJ_DIR}/data/all-tfrec}"
+# TFRecords no HOST: espelho compartilhado no SSD, salvo override explícito.
+if [[ -n "${HOST_TFREC_DIR:-}" ]]; then
+  if [[ -d "${HOST_TFREC_DIR}" ]]; then
+    HOST_TFREC_DIR="$(hcpa_runtime_resolve_dir_path "${HOST_TFREC_DIR}")"
+  fi
+else
+  HOST_TFREC_DIR="$(hcpa_runtime_stage_shared_tfrec_to_ssd "${TFREC_SOURCE_DIR}" "${TFREC_STAGE_NAME}")"
+fi
 
 # Diretório de trabalho dentro do container
 CONT_WORKDIR="/workspace"
@@ -75,13 +95,24 @@ INTERNAL_IFACE="${INTERNAL_IFACE:-}"
 export INTERNAL_IFACE
 HOST_UID="${HOST_UID:-$(id -u)}"
 HOST_GID="${HOST_GID:-$(id -g)}"
-ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:-1}"
+ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 ARRAY_TASK_MAX="${SLURM_ARRAY_TASK_MAX:-${ARRAY_TASK_ID}}"
 ARRAY_JOB_ID="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-manual}}"
-if ! [[ "${ARRAY_TASK_ID}" =~ ^[0-9]+$ ]]; then ARRAY_TASK_ID=1; fi
+if ! [[ "${ARRAY_TASK_ID}" =~ ^[0-9]+$ ]]; then ARRAY_TASK_ID=0; fi
 if ! [[ "${ARRAY_TASK_MAX}" =~ ^[0-9]+$ ]]; then ARRAY_TASK_MAX="${ARRAY_TASK_ID}"; fi
-RUN_ID=$((ARRAY_TASK_ID-1))
 JOB_ID_TAG="${ARRAY_JOB_ID}"
+SEED="${SEED:-42}"
+TARGET_EPOCHS="${TARGET_EPOCHS:-200}"
+RUN_START="${RUN_START:-${ARRAY_TASK_ID}}"
+RUN_END="${RUN_END:-${ARRAY_TASK_ID}}"
+if ! [[ "${RUN_START}" =~ ^[0-9]+$ && "${RUN_END}" =~ ^[0-9]+$ ]]; then
+  echo "[CHECK][FAIL] RUN_START e RUN_END devem ser inteiros."
+  exit 92
+fi
+if (( RUN_START < 0 || RUN_END > 9 || RUN_START > RUN_END )); then
+  echo "[CHECK][FAIL] Faixa de runs inválida: ${RUN_START}-${RUN_END}. Esperado 0..9."
+  exit 92
+fi
 parse_tasks_per_node() {
   local spec="${SLURM_TASKS_PER_NODE:-}"
   spec="${spec// /}"
@@ -153,6 +184,7 @@ if [[ -z "${PARTITION_TAG_RAW}" && -n "${SLURM_JOB_ID:-}" ]]; then
   PARTITION_TAG_RAW="$(scontrol show job "${SLURM_JOB_ID}" | sed -n 's/.*Partition=\([^ ]*\).*/\1/p' | head -n1)"
 fi
 PARTITION_TAG="$(sanitize_tag "${PARTITION_TAG_RAW:-unknown}")"
+DATASET_TAG="$(sanitize_tag "${DATASET_NAME}")"
 
 # Metadados adicionais (manifesto)
 CLUSTER_TAG_RAW="${SLURM_CLUSTER_NAME:-}"
@@ -169,7 +201,7 @@ TRAIN_STATIC_ARGS=(
   --model inception_v3          # timm nome canonical (PyTorch puro)
   --normalize preprocess
   --batch_size 96
-  --epochs 200
+  --epochs "${TARGET_EPOCHS}"
   --lrate 5e-4
   --freeze_epochs 0
   --fine_tune_lr_factor 0.1
@@ -229,14 +261,38 @@ if [[ -z "${RESULTS_SUBDIR:-}" ]]; then
   RESULTS_SUBDIR="results/result${JOB_ID_TAG}_${NODEGROUP_TAG}_${GPU_DESC}_${BATCH_TAG}"
 fi
 HOST_RESULTS_DIR="${HOST_RESULTS_DIR:-${HOST_PROJ_DIR}/${RESULTS_SUBDIR}}"
+if [[ "${HOST_RESULTS_DIR}" != "${HOST_PROJ_DIR}/"* ]]; then
+  echo "[CHECK][FAIL] HOST_RESULTS_DIR deve ficar dentro de ${HOST_PROJ_DIR}"
+  exit 93
+fi
+HOME_RESULTS_DIR="${HOME_RESULTS_DIR:-${HOME_PROJ_DIR}/${RESULTS_SUBDIR}}"
+if [[ "${HOME_RESULTS_DIR}" != "${HOME_PROJ_DIR}/"* ]]; then
+  echo "[CHECK][FAIL] HOME_RESULTS_DIR deve ficar dentro de ${HOME_PROJ_DIR}"
+  exit 93
+fi
 RUNS_DIR_HOST="${HOST_RESULTS_DIR}"
 RUN_DIR_BASE="${HOST_RESULTS_DIR}"
+HOST_LOGS_DIR="${HOST_LOGS_DIR:-${HOST_PROJ_DIR}/logs}"
+HOME_LOGS_DIR="${HOME_LOGS_DIR:-${HOME_PROJ_DIR}/logs}"
 
 TRAIN_STATIC_ARGS_STR="$(printf '%s ' "${TRAIN_STATIC_ARGS[@]}")"
 TRAIN_STATIC_ARGS_STR="${TRAIN_STATIC_ARGS_STR% }"
 
-export IMAGE HOST_PROJ_DIR HOST_TFREC_DIR CONT_WORKDIR INTERNAL_IFACE HOST_UID HOST_GID HOST_RESULTS_DIR RUNS_DIR_HOST RUN_DIR_BASE RESULTS_SUBDIR TOTAL_GPUS
+export IMAGE HOST_PROJ_DIR HOST_TFREC_DIR CONT_WORKDIR INTERNAL_IFACE HOST_UID HOST_GID HOST_RESULTS_DIR RUNS_DIR_HOST RUN_DIR_BASE RESULTS_SUBDIR TOTAL_GPUS HOST_ROOT_DIR HOME_ROOT_DIR DATASET_NAME
 export TRAIN_STATIC_ARGS_STR TRAIN_BATCH_SIZE
+PROFILER_HELPER="$(hcpa_runtime_resolve_support_file "tools/hcpa_profiler_launcher.sh" "${PROFILER_HELPER:-}")"
+CLEAN_TEMP_HELPER="$(hcpa_runtime_resolve_support_file "clean_temp_loggers.py" "${CLEAN_TEMP_HELPER:-}")"
+if [[ ! -f "${PROFILER_HELPER}" ]]; then
+  echo "[CHECK][FAIL] helper de profiling ausente: ${PROFILER_HELPER}"
+  exit 91
+fi
+if [[ ! -f "${CLEAN_TEMP_HELPER}" ]]; then
+  echo "[CHECK][FAIL] helper de limpeza ausente: ${CLEAN_TEMP_HELPER}"
+  exit 91
+fi
+source "${PROFILER_HELPER}"
+hcpa_profile_init_env
+trap 'exit_code=$?; trap - EXIT; hcpa_runtime_cleanup_and_sync "${exit_code}"; exit "$?"' EXIT
 # ===========================================================
 
 echo "[CHECK] Iniciando pré-checagem local."
@@ -300,7 +356,7 @@ fi
 
 echo "[CHECK] Pré-checagem local concluída com sucesso."
 
-mkdir -p logs
+mkdir -p "${HOST_LOGS_DIR}"
 
 NNODES="${SLURM_JOB_NUM_NODES:-2}"
 readarray -t SLURM_HOSTS < <(scontrol show hostnames "$SLURM_NODELIST")
@@ -345,6 +401,10 @@ export MASTER_PORT MASTER_ADDR OMP_NUM_THREADS NCCL_DEBUG TORCH_DISTRIBUTED_DEBU
     echo "job_name=${SLURM_JOB_NAME:-}"
     echo "cluster=${CLUSTER_TAG}"
     echo "partition=${PARTITION_TAG}"
+    echo "persistent_project_root=${HOME_PROJ_DIR}"
+    echo "execution_project_root=${HOST_PROJ_DIR}"
+    echo "persistent_results_dir=${HOME_RESULTS_DIR}"
+    echo "execution_results_dir=${HOST_RESULTS_DIR}"
   echo "nodelist=${SLURM_NODELIST:-}"
   echo "nodes_resolved=${SLURM_HOSTS[*]}"
   echo "nodegroup=${NODEGROUP_TAG}"
@@ -354,7 +414,8 @@ export MASTER_PORT MASTER_ADDR OMP_NUM_THREADS NCCL_DEBUG TORCH_DISTRIBUTED_DEBU
     echo "master_iface=${MASTER_IFACE}"
     echo "node_net_info=${NODE_NET_INFO}"
     echo "global_batch_size=${TRAIN_BATCH_SIZE}"
-    echo "run_id=${RUN_ID}"
+    echo "run_start=${RUN_START}"
+    echo "run_end=${RUN_END}"
   } > "${HOST_RESULTS_DIR}/env_manifest.txt"
 
 # -------- Sanity checks em TODOS os nós --------
@@ -391,7 +452,7 @@ if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
   [[ -d "${BUILD_DIR}" ]] || { echo "Diretório de build ausente em ${HOSTNAME}: ${BUILD_DIR}"; exit 128; }
   (
     cd "${BUILD_DIR}"
-    docker build -t "${IMAGE}" .
+    docker build --build-arg UID="${HOST_UID}" --build-arg GID="${HOST_GID}" -t "${IMAGE}" .
   )
 fi
 
@@ -399,12 +460,21 @@ fi
 [[ -d "${HOST_TFREC_DIR}" ]] || { echo "HOST_TFREC_DIR ausente em ${HOSTNAME}: ${HOST_TFREC_DIR}"; exit 2; }
 EOS
 
-# -------- Repetições sequenciais (padrão: 10) --------
 RUN_LABEL="${ARRAY_TASK_ID}/${ARRAY_TASK_MAX}"
 
-echo "[RUN ${RUN_LABEL} | run_id ${RUN_ID}] iniciando..."
+for RUN_ID in $(seq "${RUN_START}" "${RUN_END}"); do
+  RUN_SEED=$((SEED + RUN_ID))
+  RUN_RESULTS_DIR="${HOST_RESULTS_DIR}/run_${RUN_ID}"
+  mkdir -p "${RUN_RESULTS_DIR}" "${RUN_RESULTS_DIR}/torchelastic_logs" "${RUN_RESULTS_DIR}/profiling" "${RUN_RESULTS_DIR}/profiling/torch_traces"
+  {
+    echo "run_id=${RUN_ID}"
+    echo "seed=${RUN_SEED}"
+    echo "execution_run_results=${RUN_RESULTS_DIR}"
+  } > "${RUN_RESULTS_DIR}/run_manifest.txt"
+
+  echo "[RUN ${RUN_LABEL} | run_id ${RUN_ID}] iniciando..."
   export RUN_ID
-  # Varia porta por repetição para evitar conflito residual
+  export RUN_SEED
   export MASTER_PORT=$((29500 + RUN_ID))
 
   # -------- Lança 1 container por nó --------
@@ -498,7 +568,13 @@ else
   echo "[$(hostname)] NCCL interface não definida; rede padrão será usada."
 fi
 
+DOCKER_USERNS_ARGS=()
+if docker --version 2>/dev/null | grep -qi podman; then
+  DOCKER_USERNS_ARGS=(--userns=keep-id)
+fi
+
 docker run --rm --name "${CONTAINER_NAME}" \
+  "${DOCKER_USERNS_ARGS[@]}" \
   "${DOCKER_GPU_ARGS[@]}" \
   --ipc=host \
   --ulimit memlock=-1 --ulimit stack=67108864 \
@@ -506,6 +582,7 @@ docker run --rm --name "${CONTAINER_NAME}" \
   -e DOCKER_TMPDIR="${DOCKER_TMPDIR}" \
   --user "${HOST_UID}:${HOST_GID}" \
   -v "${HOST_PROJ_DIR}:${CONT_WORKDIR}" \
+  -v "${HOST_ROOT_DIR}/tools:${CONT_WORKDIR}/tools:ro" \
   -v "${HOST_TFREC_DIR}:/workspace/data" \
   -w "${CONT_WORKDIR}" \
   -e HOME="/workspace" \
@@ -530,11 +607,30 @@ docker run --rm --name "${CONTAINER_NAME}" \
   -e MASTER_ADDR="${MASTER_ADDR}" \
   -e MASTER_PORT="${MASTER_PORT}" \
   -e NODE_RANK="${NODE_RANK}" \
+  -e PROFILE_TOOL="${PROFILE_TOOL}" \
+  -e ENABLE_TORCH_TRACE="${ENABLE_TORCH_TRACE}" \
+  -e ENABLE_NVTX="${ENABLE_NVTX}" \
+  -e PROFILE_RANK0_ONLY="${PROFILE_RANK0_ONLY}" \
+  -e PROFILE_STAGES="${PROFILE_STAGES}" \
+  -e TORCH_PROFILE_WAIT="${TORCH_PROFILE_WAIT}" \
+  -e TORCH_PROFILE_WARMUP="${TORCH_PROFILE_WARMUP}" \
+  -e TORCH_PROFILE_ACTIVE="${TORCH_PROFILE_ACTIVE}" \
+  -e TORCH_PROFILE_REPEAT="${TORCH_PROFILE_REPEAT}" \
+  -e TORCH_PROFILE_MAX_STEPS="${TORCH_PROFILE_MAX_STEPS}" \
+  -e TORCH_PROFILE_RECORD_SHAPES="${TORCH_PROFILE_RECORD_SHAPES}" \
+  -e TORCH_PROFILE_PROFILE_MEMORY="${TORCH_PROFILE_PROFILE_MEMORY}" \
+  -e TORCH_PROFILE_WITH_STACK="${TORCH_PROFILE_WITH_STACK}" \
+  -e NSYS_EXPORT_SQLITE="${NSYS_EXPORT_SQLITE}" \
+  -e NCU_EXPORT_CSV="${NCU_EXPORT_CSV}" \
+  -e NCU_SET="${NCU_SET}" \
+  -e NCU_TARGET_PROCESSES="${NCU_TARGET_PROCESSES}" \
   "${IMAGE}" \
   bash -lc "
     echo \"[$(hostname)] rank=${NODE_RANK}/${WORLD_SIZE} subindo\";
       local_tmp=\"/tmp/hcpa_${SLURM_JOB_ID}_r${RUN_ID}_${SLURM_NODEID}\";
       mpl_dir=\"\${local_tmp}/mplconfig\";
+      source /workspace/tools/hcpa_profiler_launcher.sh;
+      hcpa_profile_init_env;
       export TMPDIR=\"\${local_tmp}\";
       export TMP=\"\${TMPDIR}\";
       export TEMP=\"\${TMPDIR}\";
@@ -548,6 +644,8 @@ docker run --rm --name "${CONTAINER_NAME}" \
       export TRITON_CACHE_DIR=\"\${cache_root}/triton/${SLURM_NODEID}\";
       mkdir -p \"./${RESULTS_SUBDIR}/run_${RUN_ID}\" \
                \"./${RESULTS_SUBDIR}/run_${RUN_ID}/torchelastic_logs\" \
+               \"./${RESULTS_SUBDIR}/run_${RUN_ID}/profiling\" \
+               \"./${RESULTS_SUBDIR}/run_${RUN_ID}/profiling/torch_traces\" \
                \"\${local_tmp}\" \
                \"\${mpl_dir}\" \
                \"\${cache_root}\" \
@@ -555,6 +653,11 @@ docker run --rm --name "${CONTAINER_NAME}" \
                \"\${TORCH_HOME}\" \
                \"\${TORCHINDUCTOR_CACHE_DIR}\" \
                \"\${TRITON_CACHE_DIR}\";
+      export HCPA_TORCH_PROFILER_DIR=\"./${RESULTS_SUBDIR}/run_${RUN_ID}/profiling/torch_traces\";
+      export HCPA_PROFILE_ARTIFACT_ROOT=\"./${RESULTS_SUBDIR}/run_${RUN_ID}/profiling\";
+      export HCPA_PROFILE_ARTIFACT_STEM=\"pytorch_opt_node\${NODE_RANK}\";
+      export HCPA_PROFILE_ARTIFACT_PREFIX=\"\${HCPA_PROFILE_ARTIFACT_ROOT}/\${HCPA_PROFILE_ARTIFACT_STEM}\";
+      hcpa_profile_write_manifest;
       # Garante timm no contêiner mesmo se a imagem estiver desatualizada
       python - <<'PY'
 import importlib, subprocess, sys
@@ -565,20 +668,31 @@ except ImportError:
 PY
       python -c 'import torch; print(\"CUDA devices:\", torch.cuda.device_count())'
       read -r -a TRAIN_STATIC_ARGS <<< \"\${TRAIN_STATIC_ARGS_STR}\"
-      torchrun \
-        --nnodes=${WORLD_SIZE} --nproc_per_node=1 --node_rank=${NODE_RANK} \
-        --rdzv_backend=c10d --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
-        --log-dir=\"./${RESULTS_SUBDIR}/run_${RUN_ID}/torchelastic_logs\" \
-        dr_hcpa_v2_2024.py \
-          --tfrec_dir /workspace/data \
-          --results \"./${RESULTS_SUBDIR}/run_${RUN_ID}\" \
-          --exec ${RUN_ID} \
-          \"\${TRAIN_STATIC_ARGS[@]}\"
+      LAUNCH_CMD=(
+        torchrun
+        --nnodes=${WORLD_SIZE}
+        --nproc_per_node=1
+        --node_rank=${NODE_RANK}
+        --rdzv_backend=c10d
+        --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT}
+        --log-dir=\"./${RESULTS_SUBDIR}/run_${RUN_ID}/torchelastic_logs\"
+        dr_hcpa_v2_2024.py
+        --tfrec_dir /workspace/data
+        --dataset ${DATASET_NAME}
+        --results \"./${RESULTS_SUBDIR}/run_${RUN_ID}\"
+        --exec ${RUN_ID}
+        --seed ${RUN_SEED}
+        \"\${TRAIN_STATIC_ARGS[@]}\"
+      );
+      hcpa_profile_wrap_command \"\${LAUNCH_CMD[@]}\";
+      \"\${PROFILED_CMD[@]}\";
+      hcpa_profile_postprocess;
   "
 EOS
-echo "[RUN ${RUN_LABEL} | run_id ${RUN_ID}] concluido."
+  echo "[RUN ${RUN_LABEL} | run_id ${RUN_ID}] concluido."
 
-# Limpa logs/caches volumosos, preservando CSVs/PDFs
-python3 "${HOST_PROJ_DIR}/../clean_temp_loggers.py" --root "${RUN_DIR_BASE}" --scope results-only --max-print 0 || true
+  # Limpa logs/caches volumosos, preservando CSVs/PDFs
+  python3 "${CLEAN_TEMP_HELPER}" --root "${RUN_RESULTS_DIR}" --scope results-only --max-print 0 || true
+done
 
 echo "Job complete."

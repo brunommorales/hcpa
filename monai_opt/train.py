@@ -10,7 +10,7 @@ from hcpa_monai_optimized.config import TrainConfig
 def parse_args() -> TrainConfig:
     p = argparse.ArgumentParser(description="Treino otimizado (PyTorch/MONAI)")
     p.add_argument("--results", type=Path, default=Path("./results/opt_monai"))
-    p.add_argument("--tfrec_dir", type=Path, default=Path("./data/all-tfrec"))
+    p.add_argument("--tfrec_dir", type=Path, default=Path("/home/users/bmmorales/projects/hcpa/data/all-tfrec"))
     p.add_argument("--image_size", type=int, default=299)
     p.add_argument("--num_classes", type=int, default=2)
     p.add_argument("--batch_size", type=int, default=96)
@@ -19,6 +19,7 @@ def parse_args() -> TrainConfig:
     p.add_argument("--min_lr", type=float, default=3e-5)
     p.add_argument("--warmup_epochs", type=int, default=10)
     p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "adam", "sgd_mom", "rmsprop", "adadelta"])
     p.add_argument("--model", dest="model_name", type=str, default="inception_v3")
     p.add_argument("--normalize", type=str, default="inception", choices=["inception", "imagenet", "none"])
     p.add_argument("--fundus_crop_ratio", type=float, default=0.9)

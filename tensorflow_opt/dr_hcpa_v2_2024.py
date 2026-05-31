@@ -32,6 +32,8 @@ os.environ.setdefault("MPLCONFIGDIR", _mpl_fallback)
 tempfile.tempdir = _tmp_hint
 
 import pandas as pd, numpy as np, math, json
+import random
+import subprocess
 import tensorflow as tf
 import tensorflow.keras.backend as K
 import matplotlib.pyplot as plt
@@ -58,8 +60,61 @@ except ImportError:
             value = value.numpy()
         return value
 from sklearn.metrics import roc_curve
+from sklearn.metrics import roc_auc_score
 from sklearn.metrics import auc
 import csv
+
+from lib.runtime_profiling import RuntimeProfiler
+
+
+COMMON_CSV_FIELDS = [
+    "epoch",
+    "stage",
+    "train_loss",
+    "train_auc",
+    "train_precision",
+    "train_recall",
+    "train_f1",
+    "train_sens",
+    "train_spec",
+    "train_spec_at_sens95",
+    "train_throughput_img_s",
+    "train_elapsed_s",
+    "train_avg_batch_time_ms",
+    "train_inference_latency_ms_img",
+    "train_inference_latency_ms_batch",
+    "train_gpu_mem_avg_mb",
+    "val_loss",
+    "val_auc",
+    "val_precision",
+    "val_recall",
+    "val_f1",
+    "val_sens",
+    "val_spec",
+    "val_spec_at_sens95",
+    "val_throughput_img_s",
+    "val_elapsed_s",
+    "val_avg_batch_time_ms",
+    "val_inference_latency_ms_img",
+    "val_inference_latency_ms_batch",
+    "val_gpu_mem_avg_mb",
+    "test_loss",
+    "test_auc",
+    "test_precision",
+    "test_recall",
+    "test_f1",
+    "test_sens",
+    "test_spec",
+    "test_spec_at_sens95",
+    "test_throughput_img_s",
+    "test_elapsed_s",
+    "test_avg_batch_time_ms",
+    "test_inference_latency_ms_img",
+    "test_inference_latency_ms_batch",
+    "test_gpu_mem_avg_mb",
+    "lr",
+    "total_train_time_s",
+]
 
 
 CACHE_BASE_DIR = None
@@ -126,15 +181,17 @@ def is_primary_worker():
 
 def parse_args():
     parser = argparse.ArgumentParser(description='This script is used for training the hcpa model using dataset from tfrecord files. See more: python3 dr_hcpa_v2_2024.py -h')
-    parser.add_argument('--tfrec_dir', type=str, default='./data/all', help='Directory containing TFRecord files')
+    parser.add_argument('--tfrec_dir', type=str, default='/home/users/bmmorales/projects/hcpa/data/all-tfrec', help='Directory containing TFRecord files')
     parser.add_argument('--dataset', type=str, default='all', help='Name of the dataset')
     parser.add_argument('--results', type=str, default='./results/all', help='Directory to save results')
     parser.add_argument('--exec', type=int, default=0, help='Execution number')
     parser.add_argument('--img_sizes', type=int, default=299, help='Image sizes')
     parser.add_argument('--batch_size', type=int, default=96, help='Batch por réplica/GPU (batch global = batch_size * réplicas)')
     parser.add_argument('--epochs', type=int, default=200, help='Number of epochs')
+    parser.add_argument('--seed', type=int, default=42, help='Seed base para reprodutibilidade')
     parser.add_argument('--num_classes', type=int, default=2, help='Number of classes')
     parser.add_argument('--lrate', type=float, default=0.003, help='Learning rate')
+    parser.add_argument('--optimizer', type=str, default='adamw', choices=['adamw', 'adam', 'sgd_mom', 'rmsprop', 'adadelta'], help='Otimizador a usar')
     parser.add_argument('--num_thresholds', type=int, default=200, help='Number of thresholds')
     parser.add_argument('--wait_epochs', type=int, default=30, help='Number of epochs to wait')
     parser.add_argument('--show_files', type=bool, default=False, help='Show files')
@@ -183,11 +240,19 @@ def parse_args():
     parser.add_argument('--recompute_backbone', action='store_true', help='Habilita tf.recompute_grad no backbone para economizar memória (pode reduzir throughput)')
     parser.add_argument('--jit_compile', action='store_true', help='Habilita jit_compile no Keras/TensorFlow se suportado (pode acelerar, mas aumenta compilação)')
     parser.add_argument('--auc_target', type=float, default=0.95, help='Valor de AUC de validação para registrar tempo de chegada (não interrompe o treino)')
+    parser.add_argument('--exact_eval_interval', type=int, default=1, help='Roda a avaliação clínica exata (sens/spec@95, thresholds) a cada N epochs (1=toda epoch). val_loss/val_AUC padrão do Keras continuam toda epoch.')
     parser.add_argument('--save_val_preds', type=str, default='', help='Se informado, salva logits e labels de validação em NPZ neste caminho')
     parser.add_argument('--calibrate', action='store_true', help='Executa calibração (temperature scaling) e busca limiar para sensibilidade-alvo')
     parser.add_argument('--sens_target', type=float, default=0.9, help='Sensibilidade-alvo para ajuste de limiar (0-1)')
 
     return parser.parse_args()
+
+
+def set_random_seeds(seed: int) -> None:
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
 
 _PREPROCESS_MAP = {
     'InceptionV3': applications.inception_v3.preprocess_input,
@@ -388,6 +453,7 @@ if DALI_AVAILABLE:
             output_dtypes=(tf.float32, tf.float32),
             device_id=shard_id,
             prefetch_queue_depth=2,
+            fail_on_device_mismatch=False,
         )
         dataset = dataset.repeat()
         dataset = dataset.map(
@@ -492,9 +558,10 @@ class GpuMemoryTracker(Callback):
         except Exception:
             self.device_names = []
         self._get_memory_info = getattr(tf.config.experimental, "get_memory_info", None)
-        self._reset_memory_stats = getattr(tf.config.experimental, "reset_memory_stats", None)
-        self.enabled = bool(self.device_names) and callable(self._get_memory_info)
-        self.max_peak_mb = 0.0
+        self.enabled = bool(self.device_names)
+        self.train_samples = []
+        self.val_samples = []
+        self.avg_memory_mb = 0.0
 
     def _read_nvidia_smi_usage(self):
         try:
@@ -518,29 +585,9 @@ class GpuMemoryTracker(Callback):
             return None
         return None
 
-    def _reset_stats(self):
-        if not self.enabled or not callable(self._reset_memory_stats):
-            return
-        for name in self.device_names:
-            try:
-                self._reset_memory_stats(name)
-            except Exception:
-                continue
-
-    def on_train_begin(self, logs=None):
-        self._reset_stats()
-
-    def on_epoch_begin(self, epoch, logs=None):
-        self._reset_stats()
-
-    def on_epoch_end(self, epoch, logs=None):
-        if not self.enabled or logs is None:
-            return
-        current_mb = self._read_nvidia_smi_usage()
-        peak_mb = current_mb
-        if current_mb is None:
-            max_peak = 0.0
-            max_current = 0.0
+    def _read_current_memory_mb(self):
+        max_current = 0.0
+        if self.enabled and callable(self._get_memory_info):
             for name in self.device_names:
                 try:
                     info = self._get_memory_info(name)
@@ -548,30 +595,113 @@ class GpuMemoryTracker(Callback):
                     continue
                 if not isinstance(info, dict):
                     continue
-                peak = info.get("peak") or 0
                 current = info.get("current") or 0
-                if peak > max_peak:
-                    max_peak = peak
                 if current > max_current:
                     max_current = current
-            if max_peak <= 0 and max_current <= 0:
-                return
-            peak_mb = max_peak / (1024 ** 2)
-            current_mb = max_current / (1024 ** 2)
+            if max_current > 0:
+                return max_current / (1024 ** 2)
+        return self._read_nvidia_smi_usage()
 
-        logs["gpu_mem_peak_mb"] = peak_mb
-        logs["gpu_mem_current_mb"] = current_mb
-        logs["gpu_mem_devices"] = len(self.device_names)
-        self.max_peak_mb = max(self.max_peak_mb, peak_mb)
+    def on_epoch_begin(self, epoch, logs=None):
+        self.train_samples = []
+        self.val_samples = []
+
+    def _sample(self, samples):
+        current_mb = self._read_current_memory_mb()
+        if current_mb is not None:
+            samples.append(float(current_mb))
+
+    def on_train_batch_end(self, batch, logs=None):
+        if self.enabled:
+            self._sample(self.train_samples)
+
+    def on_test_batch_end(self, batch, logs=None):
+        if self.enabled:
+            self._sample(self.val_samples)
+
+    def on_epoch_end(self, epoch, logs=None):
+        if not self.enabled or logs is None:
+            return
+        if self.train_samples:
+            logs["train_gpu_mem_avg_mb"] = float(np.mean(self.train_samples))
+        if self.val_samples:
+            logs["val_gpu_mem_avg_mb"] = float(np.mean(self.val_samples))
+        samples = self.train_samples + self.val_samples
+        if samples:
+            self.avg_memory_mb = float(np.mean(samples))
 
     def _implements_train_batch_hooks(self):
-        return False
+        return True
 
     def _implements_test_batch_hooks(self):
-        return False
+        return True
 
     def _implements_predict_batch_hooks(self):
         return False
+
+
+class ExactEvalMetricsLogger(Callback):
+    """Recalcula métricas de validação a partir de scores completos."""
+
+    def __init__(self, dataset, prefix="val", steps=None, enabled=True, primary_worker=True, interval=1):
+        super().__init__()
+        self.dataset = dataset
+        self.prefix = str(prefix)
+        self.steps = None if steps is None or steps < 0 else int(steps)
+        self.enabled = bool(enabled)
+        self.primary_worker = bool(primary_worker)
+        self.interval = max(1, int(interval))
+
+    def _implements_predict_batch_hooks(self):
+        return False
+
+    def _is_due(self, epoch):
+        if self.interval <= 1:
+            return True
+        # roda a cada N epochs (1-based) e SEMPRE na ultima epoch do treino
+        total = None
+        try:
+            if self.params:
+                total = int(self.params.get("epochs"))
+        except Exception:
+            total = None
+        is_last = total is not None and (epoch + 1) >= total
+        return ((epoch + 1) % self.interval == 0) or is_last
+
+    def on_epoch_end(self, epoch, logs=None):
+        if not self.enabled or not self.primary_worker:
+            return
+        if not self._is_due(epoch):
+            return
+        logs = logs if logs is not None else {}
+        labels = []
+        scores = []
+        for batch_idx, batch in enumerate(self.dataset):
+            if self.steps is not None and batch_idx >= self.steps:
+                break
+            batch_images, batch_labels = batch[0], batch[1]
+            preds = self.model(batch_images, training=False)
+            labels.append(np.asarray(batch_labels.numpy()).reshape(-1))
+            scores.append(np.asarray(preds.numpy()).reshape(-1))
+        if not labels:
+            return
+
+        y_true = np.concatenate(labels).astype(np.int32)
+        y_score = np.concatenate(scores).astype(np.float64)
+        try:
+            auc_value = roc_auc_score(y_true, y_score)
+        except ValueError:
+            auc_value = float("nan")
+        metrics = compute_binary_metrics(y_true, y_score)
+        prefix = f"{self.prefix}_"
+        logs[f"{prefix}AUC"] = auc_value
+        logs[f"{prefix}auc"] = auc_value
+        logs[f"{prefix}precision"] = metrics["precision"]
+        logs[f"{prefix}sensitivity"] = metrics["sensitivity"]
+        logs[f"{prefix}recall"] = metrics["recall"]
+        logs[f"{prefix}specificity"] = metrics["specificity"]
+        logs[f"{prefix}specificity_at_sens95"] = metrics["specificity_at_sens95"]
+        logs[f"{prefix}f1"] = metrics["f1"]
 
 
 class TrainingSpeedLogger(Callback):
@@ -636,7 +766,7 @@ class TrainingSpeedLogger(Callback):
 class TuningFileCallback(Callback):
     """Aplica ajustes online vindos do autotuner lendo um arquivo JSON por época."""
 
-    def __init__(self, tuning_file, optimizer, mixup_var=None, checkpoints_dir=None, best_path=None, last_path=None, verbose=False):
+    def __init__(self, tuning_file, optimizer, mixup_var=None, checkpoints_dir=None, best_path=None, last_path=None, verbose=False, build_optimizer_fn=None, weight_decay=None, clipnorm=None):
         super().__init__()
         self.tuning_file = Path(tuning_file) if tuning_file else None
         self.optimizer = optimizer
@@ -647,10 +777,27 @@ class TuningFileCallback(Callback):
         self.checkpoints_dir = Path(checkpoints_dir) if checkpoints_dir else None
         self.best_path = Path(best_path) if best_path else (self.checkpoints_dir / "best.ckpt" if self.checkpoints_dir else None)
         self.last_path = Path(last_path) if last_path else (self.checkpoints_dir / "last.ckpt" if self.checkpoints_dir else None)
+        self._build_optimizer_fn = build_optimizer_fn
+        self._weight_decay = weight_decay
+        self._clipnorm = clipnorm
+
+    def _get_base_metrics(self):
+        metrics = getattr(self.model, "_hcpa_user_metrics", None)
+        if metrics:
+            return metrics
+        try:
+            import tensorflow as tf
+            return [
+                m for m in getattr(self.model, "metrics", [])
+                if not (
+                    isinstance(m, tf.keras.metrics.Mean)
+                    and getattr(m, "name", "").startswith("loss")
+                )
+            ]
+        except Exception:
+            return getattr(self.model, "metrics", [])
 
     # Keras 2.17 chama esses métodos para decidir se o callback implementa hooks por batch.
-    # Habilitamos train_batch_hooks para podermos abortar a época em on_batch_end
-    # quando o autotuner detecta loss: inf mid-epoch e escreve um payload de rollback.
     def _implements_train_batch_hooks(self):
         return True  # habilitado para suportar abort mid-epoch via on_batch_end
 
@@ -771,6 +918,45 @@ class TuningFileCallback(Callback):
             except Exception:
                 pass
 
+        opt_new = cfg.get("optimizer", None)
+        if opt_new and self._build_optimizer_fn:
+            # recriar optimizer e recompilar o modelo
+            try:
+                current_lr = None
+                for attr in ("lr", "learning_rate"):
+                    if hasattr(self.optimizer, attr):
+                        try:
+                            current_lr = float(getattr(self.optimizer, attr))
+                        except Exception:
+                            current_lr = None
+                        break
+                target_lr = lr_new if lr_new is not None else current_lr
+                new_opt = self._build_optimizer_fn(
+                    opt_new, target_lr, self._weight_decay, self._clipnorm
+                )
+                base_metrics = self._get_base_metrics()
+                self.model.compile(
+                    optimizer=new_opt, loss=self.model.loss, metrics=base_metrics
+                )
+                self.model._hcpa_user_metrics = list(base_metrics)
+                # Forçar Keras a recriar train_function/test_function após compile().
+                # Sem isso, model.train_function fica None e o próximo model.fit() crasheia
+                # com "TypeError: 'NoneType' object is not callable".
+                self.model.train_function = None
+                self.model.test_function = None
+                if hasattr(self.model, 'predict_function'):
+                    self.model.predict_function = None
+                if hasattr(self.model, '_train_counter'):
+                    pass  # manter counter
+                self.model.make_train_function()
+                self.model.make_test_function()
+                self.optimizer = new_opt
+                if self.verbose:
+                    print(f"[tuning] epoch {epoch} trocou optimizer -> {opt_new}")
+            except Exception as exc:
+                if self.verbose:
+                    print(f"[tuning] falha ao trocar optimizer: {exc}")
+
         if self.verbose:
             print(f"[tuning] epoch {epoch} aplicou payload: lr={lr_new} mixup={mix_new} clip={clip_new}")
 
@@ -785,7 +971,16 @@ class TuningFileCallback(Callback):
                         new_opt.lr = float(lr_new)
                     elif hasattr(new_opt, "learning_rate"):
                         new_opt.learning_rate = float(lr_new)
-                self.model.compile(optimizer=new_opt, loss=self.model.loss, metrics=self.model.metrics)
+                base_metrics = self._get_base_metrics()
+                self.model.compile(optimizer=new_opt, loss=self.model.loss, metrics=base_metrics)
+                self.model._hcpa_user_metrics = list(base_metrics)
+                # Recriar train_function/test_function após compile() para evitar NoneType crash
+                self.model.train_function = None
+                self.model.test_function = None
+                if hasattr(self.model, 'predict_function'):
+                    self.model.predict_function = None
+                self.model.make_train_function()
+                self.model.make_test_function()
             except Exception as exc:
                 if self.verbose:
                     print(f"[tuning] falhou ao resetar optimizer pós-rollback: {exc}")
@@ -888,30 +1083,20 @@ class SaveBestLastCallback(Callback):
 class EpochCsvLogger(Callback):
     """Escreve métricas por época em CSV com o mesmo layout usado no pytorch_opt."""
 
-    _fields = [
-        "epoch",
-        "stage",
-        "train_loss",
-        "train_auc",
-        "train_sens",
-        "train_spec",
-        "train_throughput_img_s",
-        "train_elapsed_s",
-        "train_gpu_mem_alloc_mb",
-        "train_gpu_mem_reserved_mb",
-        "val_loss",
-        "val_auc",
-        "val_sens",
-        "val_spec",
-        "val_throughput_img_s",
-        "val_elapsed_s",
-        "val_gpu_mem_alloc_mb",
-        "val_gpu_mem_reserved_mb",
-        "lr",
-        "total_train_time_s",
-    ]
+    _fields = COMMON_CSV_FIELDS
 
-    def __init__(self, csv_path, stage, train_steps, val_steps, global_batch_size, append=False):
+    def __init__(
+        self,
+        csv_path,
+        stage,
+        train_steps,
+        val_steps,
+        global_batch_size,
+        append=False,
+        total_epochs=None,
+        print_epoch_summary=False,
+        primary_worker=True,
+    ):
         super().__init__()
         self.csv_path = Path(csv_path)
         self.stage = stage
@@ -919,6 +1104,9 @@ class EpochCsvLogger(Callback):
         self.val_steps = max(1, int(val_steps))
         self.global_batch_size = max(1, int(global_batch_size))
         self.append = bool(append)
+        self.total_epochs = int(total_epochs) if total_epochs is not None else None
+        self.print_epoch_summary = bool(print_epoch_summary)
+        self.primary_worker = bool(primary_worker)
         self._file = None
         self._writer = None
         self._train_elapsed = 0.0
@@ -979,52 +1167,129 @@ class EpochCsvLogger(Callback):
                 return v
         return None
 
+    def _fmt_metric(self, value, precision=4):
+        if value is None:
+            return "n/a"
+        try:
+            value = float(value)
+        except Exception:
+            return "n/a"
+        if math.isnan(value):
+            return "n/a"
+        return f"{value:.{precision}f}"
+
+    def _fmt_lr(self, value):
+        if value is None:
+            return "n/a"
+        try:
+            value = float(value)
+        except Exception:
+            return "n/a"
+        if math.isnan(value):
+            return "n/a"
+        return f"{value:.2e}"
+
     def on_epoch_end(self, epoch, logs=None):
         logs = logs or {}
         train_loss = logs.get("loss")
         train_auc = self._resolve_auc(logs, prefix="")
+        train_precision = self._resolve_metric(logs, "precision")
         train_sens = self._resolve_metric(logs, "sensitivity")
+        train_recall = train_sens
+        train_f1 = _compute_f1_from_precision_recall(train_precision, train_recall)
         train_spec = self._resolve_metric(logs, "specificity")
+        train_spec_at_sens95 = self._resolve_metric(logs, "specificity_at_sens95")
+        if train_spec_at_sens95 is None:
+            train_spec_at_sens95 = train_spec
         val_loss = logs.get("val_loss")
         val_auc = self._resolve_auc(logs, prefix="val_")
+        val_precision = self._resolve_metric(logs, "val_precision")
         val_sens = self._resolve_metric(logs, "val_sensitivity")
+        val_recall = val_sens
+        val_f1 = _compute_f1_from_precision_recall(val_precision, val_recall)
         val_spec = self._resolve_metric(logs, "val_specificity")
+        val_spec_at_sens95 = self._resolve_metric(logs, "val_specificity_at_sens95")
+        if val_spec_at_sens95 is None:
+            val_spec_at_sens95 = val_spec
 
         train_seen = self.train_steps * self.global_batch_size
         val_seen = self.val_steps * self.global_batch_size
         train_thpt = train_seen / self._train_elapsed if self._train_elapsed > 0 else None
         val_thpt = val_seen / self._val_elapsed if self._val_elapsed > 0 else None
-
-        mem_peak = logs.get("gpu_mem_peak_mb")
-        mem_current = logs.get("gpu_mem_current_mb")
-        mem_alloc = mem_current if mem_current is not None else mem_peak
-        mem_reserved = mem_alloc
+        train_avg_batch_time_ms = (self._train_elapsed / self.train_steps) * 1000.0 if self._train_elapsed > 0 else None
+        val_avg_batch_time_ms = (self._val_elapsed / self.val_steps) * 1000.0 if self._val_elapsed > 0 else None
+        val_inference_latency_ms_img = (
+            (self._val_elapsed / val_seen) * 1000.0
+            if val_seen and self._val_elapsed > 0
+            else None
+        )
+        val_inference_latency_ms_batch = val_avg_batch_time_ms
+        train_mem_avg = logs.get("train_gpu_mem_avg_mb")
+        val_mem_avg = logs.get("val_gpu_mem_avg_mb")
 
         row = {
             "epoch": int(epoch),
             "stage": self.stage,
             "train_loss": train_loss,
             "train_auc": train_auc,
+            "train_precision": train_precision,
+            "train_recall": train_recall,
+            "train_f1": train_f1,
             "train_sens": train_sens,
             "train_spec": train_spec,
+            "train_spec_at_sens95": train_spec_at_sens95,
             "train_throughput_img_s": train_thpt,
             "train_elapsed_s": self._train_elapsed if self._train_elapsed > 0 else None,
-            "train_gpu_mem_alloc_mb": mem_alloc,
-            "train_gpu_mem_reserved_mb": mem_reserved,
+            "train_avg_batch_time_ms": train_avg_batch_time_ms,
+            "train_inference_latency_ms_img": None,
+            "train_inference_latency_ms_batch": None,
+            "train_gpu_mem_avg_mb": train_mem_avg,
             "val_loss": val_loss,
             "val_auc": val_auc,
+            "val_precision": val_precision,
+            "val_recall": val_recall,
+            "val_f1": val_f1,
             "val_sens": val_sens,
             "val_spec": val_spec,
+            "val_spec_at_sens95": val_spec_at_sens95,
             "val_throughput_img_s": val_thpt,
             "val_elapsed_s": self._val_elapsed if self._val_elapsed > 0 else None,
-            "val_gpu_mem_alloc_mb": mem_alloc,
-            "val_gpu_mem_reserved_mb": mem_reserved,
+            "val_avg_batch_time_ms": val_avg_batch_time_ms,
+            "val_inference_latency_ms_img": val_inference_latency_ms_img,
+            "val_inference_latency_ms_batch": val_inference_latency_ms_batch,
+            "val_gpu_mem_avg_mb": val_mem_avg,
+            "test_loss": None,
+            "test_auc": None,
+            "test_precision": None,
+            "test_recall": None,
+            "test_f1": None,
+            "test_sens": None,
+            "test_spec": None,
+            "test_spec_at_sens95": None,
+            "test_throughput_img_s": None,
+            "test_elapsed_s": None,
+            "test_avg_batch_time_ms": None,
+            "test_inference_latency_ms_img": None,
+            "test_inference_latency_ms_batch": None,
+            "test_gpu_mem_avg_mb": None,
             "lr": self._resolve_lr(),
             "total_train_time_s": None,
         }
         if self._writer is not None:
             self._writer.writerow(row)
             self._file.flush()
+        if self.print_epoch_summary and self.primary_worker:
+            print(
+                f"[{self.stage} E{int(epoch)}/{self.total_epochs or (int(epoch) + 1)}] "
+                f"train_loss={self._fmt_metric(train_loss)} train_auc={self._fmt_metric(train_auc)} "
+                f"train_precision={self._fmt_metric(train_precision)} train_sens={self._fmt_metric(train_sens)} "
+                f"train_spec={self._fmt_metric(train_spec)} train_f1={self._fmt_metric(train_f1)} | "
+                f"val_loss={self._fmt_metric(val_loss)} val_auc={self._fmt_metric(val_auc)} "
+                f"val_precision={self._fmt_metric(val_precision)} val_sens={self._fmt_metric(val_sens)} "
+                f"val_spec={self._fmt_metric(val_spec)} val_f1={self._fmt_metric(val_f1)} | "
+                f"thr={self._fmt_metric(train_thpt, 1)} img/s lr={self._fmt_lr(row['lr'])}",
+                flush=True,
+            )
 
     def on_train_end(self, logs=None):
         if self._file is not None:
@@ -1156,9 +1421,13 @@ def detect_hardware():
 
     tf_config = _parse_tf_config(os.environ.get("TF_CONFIG"))
     if tf_config:
-        strategy = tf.distribute.MultiWorkerMirroredStrategy()
-        print(f"[MWMS] workers={len(tf_config.get('cluster', {}).get('worker', []))} replicas={strategy.num_replicas_in_sync}")
-        return strategy
+        workers = tf_config.get("cluster", {}).get("worker", []) or []
+        if len(workers) > 1:
+            strategy = tf.distribute.MultiWorkerMirroredStrategy()
+            print(f"[MWMS] workers={len(workers)} replicas={strategy.num_replicas_in_sync}")
+            return strategy
+        os.environ.pop("TF_CONFIG", None)
+        print("[Hardware] TF_CONFIG single-worker ignorado; usando estratégia local")
 
     gpus = tf.config.list_logical_devices("GPU")
     if len(gpus) > 1:
@@ -1251,17 +1520,57 @@ def unfreeze_batchnorm_layers(base_model):
             layer.trainable = True
 
 
-def build_optimizer(learning_rate, weight_decay, clipnorm):
+def build_optimizer(learning_rate, weight_decay, clipnorm, optimizer_name="adamw"):
+    name = str(optimizer_name).lower()
     clip_value = clipnorm if clipnorm and clipnorm > 0 else None
+    if name in ("adamw", "adam_w"):
+        return tf.keras.optimizers.AdamW(
+            learning_rate=learning_rate,
+            beta_1=0.9,
+            beta_2=0.999,
+            epsilon=1e-8,
+            weight_decay=weight_decay,
+            clipnorm=clip_value,
+        )
+    if name == "adam":
+        return tf.keras.optimizers.Adam(
+            learning_rate=learning_rate,
+            beta_1=0.9,
+            beta_2=0.999,
+            epsilon=1e-8,
+            clipnorm=clip_value,
+        )
+    if name in ("sgd", "sgd_mom", "sgd-mom"):
+        return tf.keras.optimizers.SGD(
+            learning_rate=learning_rate,
+            momentum=0.9,
+            nesterov=True,
+            weight_decay=weight_decay,
+            clipnorm=clip_value,
+        )
+    if name == "rmsprop":
+        return tf.keras.optimizers.RMSprop(
+            learning_rate=learning_rate,
+            rho=0.9,
+            momentum=0.9,
+            clipnorm=clip_value,
+        )
+    if name == "adadelta":
+        return tf.keras.optimizers.Adadelta(
+            learning_rate=learning_rate,
+            rho=0.95,
+            epsilon=1e-6,
+            clipnorm=clip_value,
+        )
+    # fallback
     return tf.keras.optimizers.AdamW(
         learning_rate=learning_rate,
         beta_1=0.9,
         beta_2=0.999,
         epsilon=1e-8,
         weight_decay=weight_decay,
-        clipnorm=clip_value
+        clipnorm=clip_value,
     )
-
 
 def build_loss_fn(label_smoothing=0.0, focal_gamma=0.0, pos_weight=1.0):
     label_smoothing = float(label_smoothing)
@@ -1521,17 +1830,19 @@ def load_dataset(filenames, labeled=True, ordered=False, return_only_label=False
         num_parallel_reads=tf.data.experimental.AUTOTUNE
     )
 
-    if CACHE_BASE_DIR:
-        cache_dir = Path(CACHE_BASE_DIR)
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_path = cache_dir / f"{dataset_name}.cache"
-        dataset = dataset.cache(str(cache_path))
-
     dataset = dataset.with_options(options)
     dataset = dataset.map(
         lambda example: read_labeled_tfrecord(example, __return_only_label=return_only_label),
         num_parallel_calls=tf.data.experimental.AUTOTUNE
     )
+
+    # Cache in-memory APOS o decode: elimina JPEG decode para epochs 2+.
+    # ~11GB de tensores float32 ficam na RAM (GH200 tem 480GB).
+    # Epoch 1: le TFRecords do NVMe local (staging), decodifica JPEG, cacheia em RAM.
+    # Epoch 2+: le tensores pre-decodificados direto da RAM, sem I/O nem decode.
+    if CACHE_BASE_DIR:
+        dataset = dataset.cache()  # sem path = cache in-memory, sem escrita em disco
+
     # returns a dataset of (image, labels) pairs if labeled=True or (image, id) pairs if labeled=False
     return dataset
 
@@ -1545,7 +1856,8 @@ def get_training_dataset(
     preprocess_fn=None,
     mixup_alpha_ref=None,
     cutmix_alpha_ref=None,
-    fundus_crop_ratio=1.0
+    fundus_crop_ratio=1.0,
+    seed=42,
 ):
     dataset = load_dataset(
         filenames,
@@ -1568,7 +1880,7 @@ def get_training_dataset(
             lambda image, label: (normalize_image(image, normalize_mode, preprocess_fn), label),
             num_parallel_calls=tf.data.experimental.AUTOTUNE
         )
-    dataset = dataset.shuffle(2048, reshuffle_each_iteration=True)
+    dataset = dataset.shuffle(2048, seed=int(seed), reshuffle_each_iteration=True)
     dataset = dataset.repeat()
     dataset = dataset.batch(GLOBAL_BATCH_SIZE)
     if mixup_alpha_ref is not None or cutmix_alpha_ref is not None:
@@ -1651,16 +1963,16 @@ def apply_tta_view(images, view_idx):
     return images
 
 
-def predict_with_tta(model, dataset, tta_views):
-    if tta_views <= 1:
-        labels = np.concatenate([y.numpy() for _, y in dataset], axis=0)
-        probs = model.predict(dataset, verbose=0).ravel()
-        return labels, probs
-
+def predict_with_tta(model, dataset, tta_views, memory_tracker=None):
+    tta_views = max(1, int(tta_views))
     probs_chunks = []
     labels_chunks = []
+    inference_time_s = 0.0
+    batch_count = 0
+    memory_samples = []
     for batch_images, batch_labels in dataset:
         batch_acc = None
+        t0 = time.perf_counter()
         for view_idx in range(tta_views):
             view_images = apply_tta_view(batch_images, view_idx)
             preds = model(view_images, training=False)
@@ -1671,10 +1983,200 @@ def predict_with_tta(model, dataset, tta_views):
                 batch_acc += preds
         avg_preds = batch_acc / float(tta_views)
         probs_chunks.append(avg_preds.numpy())
+        inference_time_s += time.perf_counter() - t0
+        batch_count += 1
+        if memory_tracker is not None and hasattr(memory_tracker, "_read_current_memory_mb"):
+            current_mb = memory_tracker._read_current_memory_mb()
+            if current_mb is not None:
+                memory_samples.append(float(current_mb))
         labels_chunks.append(batch_labels.numpy())
     labels = np.concatenate(labels_chunks, axis=0)
     probs = np.concatenate([chunk.ravel() for chunk in probs_chunks], axis=0)
-    return labels, probs
+    memory_avg_mb = float(np.mean(memory_samples)) if memory_samples else None
+    return labels, probs, inference_time_s, batch_count, memory_avg_mb
+
+
+def _compute_f1_from_precision_recall(precision, recall):
+    if precision is None or recall is None:
+        return None
+    try:
+        precision = float(precision)
+        recall = float(recall)
+    except Exception:
+        return None
+    denom = precision + recall
+    if denom <= 0:
+        return 0.0
+    return (2.0 * precision * recall) / (denom + 1e-8)
+
+
+SPECIFICITY_TARGET_SENSITIVITY = 0.95
+
+
+def specificity_at_sensitivity(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    target_sensitivity: float = SPECIFICITY_TARGET_SENSITIVITY,
+) -> float:
+    y_true = np.asarray(y_true, dtype=np.int32).reshape(-1)
+    y_score = np.asarray(y_score, dtype=np.float64).reshape(-1)
+    finite = np.isfinite(y_true) & np.isfinite(y_score)
+    y_true = y_true[finite]
+    y_score = np.clip(y_score[finite], 1e-7, 1.0 - 1e-7)
+    if y_true.size == 0 or y_score.size == 0:
+        return float("nan")
+
+    positives = y_true == 1
+    n_pos = int(np.sum(positives))
+    n_neg = int(y_true.size - n_pos)
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+
+    target = float(target_sensitivity)
+    if target <= 0.0:
+        return 1.0
+    if target > 1.0:
+        return float("nan")
+
+    order = np.argsort(-y_score, kind="mergesort")
+    sorted_scores = y_score[order]
+    sorted_true = positives[order]
+    group_end = np.ones(sorted_scores.shape[0], dtype=bool)
+    if sorted_scores.shape[0] > 1:
+        group_end[:-1] = sorted_scores[:-1] != sorted_scores[1:]
+    threshold_idxs = np.flatnonzero(group_end)
+    tp = np.cumsum(sorted_true, dtype=np.float64)[threshold_idxs]
+    fp = np.cumsum(~sorted_true, dtype=np.float64)[threshold_idxs]
+    tpr = np.r_[0.0, tp / float(n_pos)]
+    fpr = np.r_[0.0, fp / float(n_neg)]
+
+    idxs = np.flatnonzero(tpr >= target)
+    if idxs.size == 0:
+        return 0.0
+    idx = int(idxs[0])
+    if idx == 0:
+        fpr_at_target = fpr[0]
+    else:
+        tpr_lo, tpr_hi = tpr[idx - 1], tpr[idx]
+        fpr_lo, fpr_hi = fpr[idx - 1], fpr[idx]
+        if abs(tpr_hi - tpr_lo) <= 1e-12:
+            fpr_at_target = min(fpr_lo, fpr_hi)
+        else:
+            fraction = (target - tpr_lo) / (tpr_hi - tpr_lo)
+            fpr_at_target = fpr_lo + fraction * (fpr_hi - fpr_lo)
+    return float(np.clip(1.0 - fpr_at_target, 0.0, 1.0))
+
+
+def compute_binary_metrics(y_true: np.ndarray, y_score: np.ndarray, threshold: float = 0.5):
+    preds = (y_score >= threshold).astype(np.float32)
+    tp = np.sum((preds == 1) & (y_true == 1))
+    fn = np.sum((preds == 0) & (y_true == 1))
+    tn = np.sum((preds == 0) & (y_true == 0))
+    fp = np.sum((preds == 1) & (y_true == 0))
+    precision = tp / (tp + fp + 1e-8)
+    recall = tp / (tp + fn + 1e-8)
+    specificity = specificity_at_sensitivity(y_true, y_score)
+    f1 = (2.0 * tp) / (2.0 * tp + fp + fn + 1e-8)
+    return {
+        "precision": float(precision),
+        "recall": float(recall),
+        "sensitivity": float(recall),
+        "specificity": float(specificity),
+        "specificity_at_sens95": float(specificity),
+        "f1": float(f1),
+    }
+
+
+def build_terminal_final_summary(final_metrics, total_train_time_s, throughput_img_s=None, avg_gpu_memory_mb=None):
+    def _fmt(value, precision):
+        if value is None:
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        if math.isnan(value):
+            return None
+        return f"{value:.{precision}f}"
+
+    auc_str = _fmt(final_metrics.get("auc"), 4)
+    precision_str = _fmt(final_metrics.get("precision"), 4)
+    recall_str = _fmt(final_metrics.get("recall"), 4)
+    sensitivity_str = _fmt(final_metrics.get("sensitivity"), 4)
+    specificity_str = _fmt(final_metrics.get("specificity"), 4)
+    f1_str = _fmt(final_metrics.get("f1"), 4)
+    throughput_str = _fmt(throughput_img_s, 1)
+    total_time_str = _fmt(total_train_time_s, 1)
+    avg_mem_str = _fmt(avg_gpu_memory_mb, 1)
+
+    lines = [
+        "=" * 70,
+        "FINAL SUMMARY",
+        "=" * 70,
+        f"AUC: {auc_str or 'n/a'}",
+        f"Precision: {precision_str or 'n/a'}",
+        f"Recall: {recall_str or 'n/a'}",
+        f"Sensitivity: {sensitivity_str or 'n/a'}",
+        f"Specificity: {specificity_str or 'n/a'}",
+        f"F1: {f1_str or 'n/a'}",
+        f"Throughput: {throughput_str} img/s" if throughput_str is not None else "Throughput: n/a",
+        f"Total train time: {total_time_str}s" if total_time_str is not None else "Total train time: n/a",
+        f"Avg GPU memory: {avg_mem_str} MB" if avg_mem_str is not None else "Avg GPU memory: n/a",
+    ]
+    return "\n".join(lines)
+
+
+def build_terminal_epoch_summary(epoch, total_epochs, train_metrics, val_metrics, throughput_img_s=None, lr=None):
+    def _fmt(value, precision):
+        if value is None:
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        if math.isnan(value):
+            return None
+        return f"{value:.{precision}f}"
+
+    def _fmt_lr(value):
+        if value is None:
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        if math.isnan(value):
+            return None
+        return f"{value:.2e}"
+
+    lines = [
+        "=" * 70,
+        f"Epoch {epoch + 1}/{total_epochs}",
+        "=" * 70,
+        (
+            f"Train Loss: {_fmt(train_metrics.get('loss'), 4) or 'n/a'} | "
+            f"AUC: {_fmt(train_metrics.get('auc'), 4) or 'n/a'} | "
+            f"Precision: {_fmt(train_metrics.get('precision'), 4) or 'n/a'} | "
+            f"Recall: {_fmt(train_metrics.get('recall'), 4) or 'n/a'} | "
+            f"Spec: {_fmt(train_metrics.get('specificity'), 4) or 'n/a'} | "
+            f"F1: {_fmt(train_metrics.get('f1'), 4) or 'n/a'}"
+        ),
+        (
+            f"Val   Loss: {_fmt(val_metrics.get('loss'), 4) or 'n/a'} | "
+            f"AUC: {_fmt(val_metrics.get('auc'), 4) or 'n/a'} | "
+            f"Precision: {_fmt(val_metrics.get('precision'), 4) or 'n/a'} | "
+            f"Recall: {_fmt(val_metrics.get('recall'), 4) or 'n/a'} | "
+            f"Spec: {_fmt(val_metrics.get('specificity'), 4) or 'n/a'} | "
+            f"F1: {_fmt(val_metrics.get('f1'), 4) or 'n/a'}"
+        ),
+        (
+            f"Throughput: {_fmt(throughput_img_s, 1)} img/s"
+            if _fmt(throughput_img_s, 1) is not None
+            else "Throughput: n/a"
+        ),
+        f"LR: {_fmt_lr(lr)}" if _fmt_lr(lr) is not None else "LR: n/a",
+    ]
+    return "\n".join(lines)
 
 class Sensitivity(tf.keras.metrics.Metric):
     """Sensibilidade (recall) com threshold fixo em 0.5."""
@@ -1716,46 +2218,6 @@ class Sensitivity(tf.keras.metrics.Metric):
         self.fn.assign(0.0)
 
 
-class Specificity(tf.keras.metrics.Metric):
-    """Especificidade (true negative rate) com threshold 0.5."""
-
-    def __init__(self, name="specificity", **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.tn = self.add_weight(
-            name="tn",
-            initializer="zeros",
-            aggregation=tf.VariableAggregation.SUM,
-            synchronization=tf.VariableSynchronization.ON_WRITE,
-        )
-        self.fp = self.add_weight(
-            name="fp",
-            initializer="zeros",
-            aggregation=tf.VariableAggregation.SUM,
-            synchronization=tf.VariableSynchronization.ON_WRITE,
-        )
-
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.cast(tf.round(y_pred), tf.float32)
-        tn = tf.reduce_sum((1.0 - y_true) * (1.0 - y_pred))
-        fp = tf.reduce_sum((1.0 - y_true) * y_pred)
-        if sample_weight is not None:
-            sample_weight = tf.cast(sample_weight, tf.float32)
-            tn = tf.multiply(tn, tf.reduce_mean(sample_weight))
-            fp = tf.multiply(fp, tf.reduce_mean(sample_weight))
-        self.tn.assign_add(tn)
-        self.fp.assign_add(fp)
-
-    def result(self):
-        denom = self.tn + self.fp + tf.keras.backend.epsilon()
-        return self.tn / denom
-
-    def reset_states(self):
-        self.tn.assign(0.0)
-        self.fp.assign(0.0)
-
-
-
 def generate_thresholds(num_thresholds, kepsilon=1e-7):
     thresholds = [
         (i + 1) * 1.0 / (num_thresholds -1) for i in range(num_thresholds -2)
@@ -1791,17 +2253,25 @@ def build_model(thresholds, dim=299, recompute_backbone=False):
     return model
 
 
-def compile_model(model, learning_rate, weight_decay, clipnorm, strategy=None, label_smoothing=0.0, jit_compile=False, focal_gamma=0.0, pos_weight=1.0):
+def compile_model(model, learning_rate, weight_decay, clipnorm, optimizer_name="adamw",
+                  strategy=None, label_smoothing=0.0, jit_compile=False,
+                  focal_gamma=0.0, pos_weight=1.0, num_thresholds=200):
     def _compile():
-        opt = build_optimizer(learning_rate=learning_rate, weight_decay=weight_decay, clipnorm=clipnorm)
+        opt = build_optimizer(learning_rate=learning_rate, weight_decay=weight_decay, clipnorm=clipnorm, optimizer_name=optimizer_name)
         loss = build_loss_fn(label_smoothing=label_smoothing, focal_gamma=focal_gamma, pos_weight=pos_weight)
 
         metrics = [
             tf.keras.metrics.BinaryAccuracy(name='accuracy'),
-            tf.keras.metrics.AUC(name='AUC'),
+            tf.keras.metrics.AUC(num_thresholds=num_thresholds, name='AUC'),
+            tf.keras.metrics.Precision(name='precision'),
             Sensitivity(name='sensitivity'),
-            Specificity(name='specificity')
+            tf.keras.metrics.SpecificityAtSensitivity(
+                SPECIFICITY_TARGET_SENSITIVITY,
+                num_thresholds=num_thresholds,
+                name='specificity',
+            )
         ]
+        model._hcpa_user_metrics = list(metrics)
 
         compile_kwargs = dict(optimizer=opt, loss=loss, metrics=metrics)
         if jit_compile:
@@ -1847,6 +2317,7 @@ if __name__ == "__main__":
         pass
 
     args = parse_args()
+    set_random_seeds(args.seed)
     TUNING_FILE = os.environ.get("HCPA_TUNING_FILE", "").strip()
     cores = max(0, int(getattr(args, "cores", 0)))
     if cores > 0:
@@ -1905,12 +2376,10 @@ if __name__ == "__main__":
     model_name = args.model
     normalize_mode = args.normalize
     TTA_VIEWS = max(1, int(args.tta_views))
-    use_dali = False
-    if getattr(args, "use_dali", False):
-        print("[INFO] suporte DALI desativado nesta versão otimizada; usando tf.data padrão.")
-    dali_threads = 0
-    dali_layout = "NHWC"
-    dali_seed = 0
+    use_dali = False  # DALI desabilitado no ARM/GH200 (device mismatch); staging local + tf.data atinge ~4000 img/s
+    dali_threads = int(getattr(args, "dali_threads", 4)) if use_dali else 0
+    dali_layout = getattr(args, "dali_layout", "NHWC")
+    dali_seed = int(args.seed)
     recompute_backbone = False
     if getattr(args, "recompute_backbone", False):
         print("[INFO] recompute_grad desativado nesta versão otimizada.")
@@ -1924,7 +2393,7 @@ if __name__ == "__main__":
         print(f"[WARN] preprocess_input não disponível para '{model_name}'. Usando 'raw255'.")
         normalize_mode = 'raw255'
     if use_dali:
-        print("[INFO] Caminho DALI ignorado; use tf.data (normalize_mode será respeitado).")
+        print(f"[INFO] DALI ativado: threads={dali_threads} layout={dali_layout}")
 
     HEAD_WEIGHT_DECAY = 1e-4
     FINE_TUNE_WEIGHT_DECAY = 1e-5
@@ -1977,6 +2446,7 @@ if __name__ == "__main__":
         results_dir = target_dir
 
     rank_id = get_worker_rank()
+    runtime_profiler = RuntimeProfiler(results_dir, rank=rank_id, project_name="tensorflow_opt")
     tmp_root = results_dir / "tmp"
     rank_tmp = tmp_root / f"worker_{rank_id}"
     rank_tmp.mkdir(parents=True, exist_ok=True)
@@ -2083,11 +2553,13 @@ if __name__ == "__main__":
             lrate,
             HEAD_WEIGHT_DECAY,
             grad_clip_norm,
+            optimizer_name=args.optimizer,
             strategy=None,
             label_smoothing=label_smoothing,
             jit_compile=jit_compile_flag,
             focal_gamma=focal_gamma,
-            pos_weight=pos_weight
+            pos_weight=pos_weight,
+            num_thresholds=num_thresholds,
         )
         model.summary()
 
@@ -2154,7 +2626,8 @@ if __name__ == "__main__":
             preprocess_fn=preprocess_fn,
             mixup_alpha_ref=mixup_alpha_var if mixup_alpha_var is not None else None,
             cutmix_alpha_ref=cutmix_alpha_const if cutmix_alpha_const is not None else None,
-            fundus_crop_ratio=fundus_crop_ratio
+            fundus_crop_ratio=fundus_crop_ratio,
+            seed=args.seed,
         )
         valid_dataset = get_valid_dataset(
             VALID_FILENAMES,
@@ -2165,6 +2638,13 @@ if __name__ == "__main__":
 
     scalar_metrics_cb = EnsureScalarMetrics(strategy)
     gpu_memory_cb = GpuMemoryTracker()
+    exact_val_logger = ExactEvalMetricsLogger(
+        valid_dataset,
+        prefix="val",
+        steps=valid_steps,
+        primary_worker=primary_worker,
+        interval=int(getattr(args, "exact_eval_interval", 1)),
+    )
     speed_logger = TrainingSpeedLogger(
         steps_per_epoch=train_steps,
         global_batch_size=GLOBAL_BATCH_SIZE,
@@ -2172,6 +2652,7 @@ if __name__ == "__main__":
         results_dir=results_dir,
         primary_worker=primary_worker
     )
+    fit_profiler_cb = runtime_profiler.fit_callback()
     save_ckpt_cb = SaveBestLastCallback(checkpoints_dir) if primary_worker else None
 
     csv_logger_path = results + '/' + model_name + '-%i.csv' % exec
@@ -2182,6 +2663,9 @@ if __name__ == "__main__":
         val_steps=valid_steps,
         global_batch_size=GLOBAL_BATCH_SIZE,
         append=False,
+        total_epochs=EPOCHS,
+        print_epoch_summary=primary_worker,
+        primary_worker=primary_worker,
     )
 
     tStart = time.time()
@@ -2197,9 +2681,27 @@ if __name__ == "__main__":
                     return fallback_epoch
         return fallback_epoch
 
+    opt_builder_stage1 = lambda name, lr, wd=HEAD_WEIGHT_DECAY, clip=grad_clip_norm: build_optimizer(
+        learning_rate=lr if lr is not None else lrate,
+        weight_decay=wd,
+        clipnorm=clip,
+        optimizer_name=name,
+    )
+
     if freeze_epochs > 0:
-        tuning_cb_stage1 = TuningFileCallback(TUNING_FILE, optimizer=model.optimizer, mixup_var=mixup_alpha_var, checkpoints_dir=checkpoints_dir, verbose=bool(args.verbose)) if TUNING_FILE else None
-        callbacks_stage1 = [scalar_metrics_cb, gpu_memory_cb, csv_logger_stage1, ema_callback, speed_logger]
+        tuning_cb_stage1 = TuningFileCallback(
+            TUNING_FILE,
+            optimizer=model.optimizer,
+            mixup_var=mixup_alpha_var,
+            checkpoints_dir=checkpoints_dir,
+            verbose=bool(args.verbose),
+            build_optimizer_fn=opt_builder_stage1,
+            weight_decay=HEAD_WEIGHT_DECAY,
+            clipnorm=grad_clip_norm,
+        ) if TUNING_FILE else None
+        callbacks_stage1 = [scalar_metrics_cb, gpu_memory_cb, exact_val_logger, csv_logger_stage1, ema_callback, speed_logger]
+        if fit_profiler_cb is not None:
+            callbacks_stage1.append(fit_profiler_cb)
         if save_ckpt_cb is not None:
             callbacks_stage1.append(save_ckpt_cb)
         if tuning_cb_stage1 is not None:
@@ -2291,11 +2793,13 @@ if __name__ == "__main__":
             fine_tune_lr,
             FINE_TUNE_WEIGHT_DECAY,
             grad_clip_norm,
+            optimizer_name=args.optimizer,
             strategy=getattr(model, 'distribute_strategy', None),
             label_smoothing=label_smoothing,
             jit_compile=jit_compile_flag,
             focal_gamma=focal_gamma,
-            pos_weight=pos_weight
+            pos_weight=pos_weight,
+            num_thresholds=num_thresholds,
         )
         ema_callback.rebuild_shadow_variables()
         if VERBOSE and base_model is not None:
@@ -2310,6 +2814,9 @@ if __name__ == "__main__":
             val_steps=valid_steps,
             global_batch_size=GLOBAL_BATCH_SIZE,
             append=True,
+            total_epochs=EPOCHS,
+            print_epoch_summary=primary_worker,
+            primary_worker=primary_worker,
         )
         if scheduler_mode == 'cosine':
             scheduler_cb = make_cosine_scheduler(
@@ -2331,8 +2838,25 @@ if __name__ == "__main__":
                 verbose=1 if VERBOSE else 0
             )
 
-        tuning_cb_stage2 = TuningFileCallback(TUNING_FILE, optimizer=model.optimizer, mixup_var=mixup_alpha_var, checkpoints_dir=checkpoints_dir, verbose=bool(args.verbose)) if TUNING_FILE else None
-        stage2_callbacks_base = [scalar_metrics_cb, gpu_memory_cb, csv_logger_stage2, scheduler_cb, ema_callback, speed_logger]
+        opt_builder_stage2 = lambda name, lr, wd=FINE_TUNE_WEIGHT_DECAY, clip=grad_clip_norm: build_optimizer(
+            learning_rate=lr if lr is not None else fine_tune_lr,
+            weight_decay=wd,
+            clipnorm=clip,
+            optimizer_name=name,
+        )
+        tuning_cb_stage2 = TuningFileCallback(
+            TUNING_FILE,
+            optimizer=model.optimizer,
+            mixup_var=mixup_alpha_var,
+            checkpoints_dir=checkpoints_dir,
+            verbose=bool(args.verbose),
+            build_optimizer_fn=opt_builder_stage2,
+            weight_decay=FINE_TUNE_WEIGHT_DECAY,
+            clipnorm=grad_clip_norm,
+        ) if TUNING_FILE else None
+        stage2_callbacks_base = [scalar_metrics_cb, gpu_memory_cb, exact_val_logger, csv_logger_stage2, scheduler_cb, ema_callback, speed_logger]
+        if fit_profiler_cb is not None:
+            stage2_callbacks_base.append(fit_profiler_cb)
         if save_ckpt_cb is not None:
             stage2_callbacks_base.append(save_ckpt_cb)
         if tuning_cb_stage2 is not None:
@@ -2353,7 +2877,8 @@ if __name__ == "__main__":
                     strategy=getattr(model, 'distribute_strategy', None),
                     label_smoothing=label_smoothing,
                     focal_gamma=focal_gamma,
-                    pos_weight=pos_weight
+                    pos_weight=pos_weight,
+                    num_thresholds=num_thresholds,
                 )
                 ema_callback.rebuild_shadow_variables()
                 if tuning_cb_stage2 is not None:
@@ -2399,14 +2924,44 @@ if __name__ == "__main__":
     print('Time (sec) elapsed: ', tElapsed)
     print('...')
 
+    best_ckpt_path = checkpoints_dir / "best.ckpt"
+    best_ckpt_index = Path(str(best_ckpt_path) + ".index")
+    loaded_best_ckpt = False
+    if best_ckpt_path.exists() or best_ckpt_index.exists():
+        try:
+            model.load_weights(str(best_ckpt_path))
+            loaded_best_ckpt = True
+            best_meta_path = checkpoints_dir / "best_meta.json"
+            if best_meta_path.exists():
+                try:
+                    best_meta = json.loads(best_meta_path.read_text())
+                    print(
+                        "[BEST] Restaurado best.ckpt: "
+                        f"epoch={best_meta.get('epoch')} val_auc={best_meta.get('val_auc')}"
+                    )
+                except Exception:
+                    print(f"[BEST] Restaurado best.ckpt: {best_ckpt_path}")
+            else:
+                print(f"[BEST] Restaurado best.ckpt: {best_ckpt_path}")
+        except Exception as exc:
+            print(f"[WARN] Falha ao carregar best.ckpt; usando fallback EMA/final: {exc}")
+
     valid_eval_dataset = get_valid_dataset(
         VALID_FILENAMES,
         normalize_mode=normalize_mode,
         preprocess_fn=preprocess_fn,
         fundus_crop_ratio=fundus_crop_ratio
     )
-    applied_ema = ema_callback.apply_ema_weights()
-    labels, probabilities = predict_with_tta(model, valid_eval_dataset, TTA_VIEWS)
+    applied_ema = False if loaded_best_ckpt else ema_callback.apply_ema_weights()
+    eval_predict_start = time.time()
+    with runtime_profiler.profile_scope("eval/predict_with_tta", stage="eval"):
+        labels, probabilities, inference_time_s, inference_batches, eval_mem_avg = predict_with_tta(
+            model,
+            valid_eval_dataset,
+            TTA_VIEWS,
+            memory_tracker=gpu_memory_cb,
+        )
+    eval_predict_elapsed = time.time() - eval_predict_start
     probabilities = probabilities.ravel()
 
     fpr_keras, tpr_keras, thresholds_keras = roc_curve(labels, probabilities)
@@ -2444,54 +2999,82 @@ if __name__ == "__main__":
         preprocess_fn=preprocess_fn,
         fundus_crop_ratio=fundus_crop_ratio
     )
-    train_final_stats = model.evaluate(train_eval_dataset, verbose=VERBOSE)
-    valid_final_stats = model.evaluate(valid_eval_dataset_for_eval, verbose=VERBOSE)
+    with runtime_profiler.profile_scope("eval/train_evaluate", stage="eval"):
+        train_final_stats = model.evaluate(train_eval_dataset, verbose=VERBOSE, return_dict=True)
+    with runtime_profiler.profile_scope("eval/valid_evaluate", stage="eval"):
+        valid_final_stats = model.evaluate(valid_eval_dataset_for_eval, verbose=VERBOSE, return_dict=True)
 
-    print(f"Train final stats: {train_final_stats}")
-    print(f"Valid final stats: {valid_final_stats}")
-    # Padroniza o AUC reportado para o cálculo exato (roc_auc_score) usado também nos outros pipelines
-    print(f"{dataset},{exec},{valid_final_stats[1]},{auc_keras},{tElapsed}")
-
-    mem_peak = gpu_memory_cb.max_peak_mb if getattr(gpu_memory_cb, "max_peak_mb", 0) > 0 else None
-    val_loss_final = valid_final_stats[0] if isinstance(valid_final_stats, (list, tuple)) and len(valid_final_stats) > 0 else None
+    avg_gpu_memory_mb = eval_mem_avg
+    tracker_avg = getattr(gpu_memory_cb, "avg_memory_mb", 0.0)
+    if avg_gpu_memory_mb is None and tracker_avg > 0:
+        avg_gpu_memory_mb = tracker_avg
+    val_throughput_final = (len(labels) / eval_predict_elapsed) if eval_predict_elapsed > 0 else None
+    inference_latency_ms_img = (
+        inference_time_s / len(labels) * 1000.0 if len(labels) > 0 else None
+    )
+    inference_latency_ms_batch = (
+        inference_time_s / inference_batches * 1000.0 if inference_batches > 0 else None
+    )
+    final_metrics = compute_binary_metrics(labels, probabilities)
+    val_loss_final = valid_final_stats.get("loss") if isinstance(valid_final_stats, dict) else None
     # Sempre persistir o AUC calculado com roc_auc_score (mais fiel)
     val_auc_final = auc_keras
-    val_sens_final = None
-    val_spec_final = None
-    try:
-        val_sens_final = valid_final_stats[3]
-    except Exception:
-        pass
-    try:
-        val_spec_final = valid_final_stats[4]
-    except Exception:
-        pass
-    train_sens_final = None
-    train_spec_final = None
-    try:
-        train_sens_final = train_final_stats[3]
-        train_spec_final = train_final_stats[4]
-    except Exception:
-        pass
+    val_precision_final = final_metrics["precision"]
+    val_recall_final = final_metrics["recall"]
+    val_f1_final = final_metrics["f1"]
+    val_sens_final = final_metrics["sensitivity"]
+    val_spec_final = final_metrics["specificity"]
+    val_spec_at_sens95_final = final_metrics["specificity_at_sens95"]
+    train_precision_final = train_final_stats.get("precision") if isinstance(train_final_stats, dict) else None
+    train_sens_final = train_final_stats.get("sensitivity") if isinstance(train_final_stats, dict) else None
+    train_recall_final = train_sens_final
+    train_f1_final = _compute_f1_from_precision_recall(train_precision_final, train_recall_final)
+    train_spec_final = train_final_stats.get("specificity") if isinstance(train_final_stats, dict) else None
     final_row = {
         "epoch": current_epoch,
-        "stage": "final_eval",
+        "stage": "final_test",
         "train_loss": None,
         "train_auc": None,
+        "train_precision": train_precision_final,
+        "train_recall": train_recall_final,
+        "train_f1": train_f1_final,
         "train_sens": train_sens_final,
         "train_spec": train_spec_final,
+        "train_spec_at_sens95": train_spec_final,
         "train_throughput_img_s": None,
         "train_elapsed_s": None,
-        "train_gpu_mem_alloc_mb": mem_peak,
-        "train_gpu_mem_reserved_mb": mem_peak,
-        "val_loss": val_loss_final,
-        "val_auc": val_auc_final,
-        "val_sens": val_sens_final,
-        "val_spec": val_spec_final,
+        "train_avg_batch_time_ms": None,
+        "train_inference_latency_ms_img": None,
+        "train_inference_latency_ms_batch": None,
+        "train_gpu_mem_avg_mb": None,
+        "val_loss": None,
+        "val_auc": None,
+        "val_precision": None,
+        "val_recall": None,
+        "val_f1": None,
+        "val_sens": None,
+        "val_spec": None,
+        "val_spec_at_sens95": None,
         "val_throughput_img_s": None,
         "val_elapsed_s": None,
-        "val_gpu_mem_alloc_mb": mem_peak,
-        "val_gpu_mem_reserved_mb": mem_peak,
+        "val_avg_batch_time_ms": None,
+        "val_inference_latency_ms_img": None,
+        "val_inference_latency_ms_batch": None,
+        "val_gpu_mem_avg_mb": None,
+        "test_loss": val_loss_final,
+        "test_auc": val_auc_final,
+        "test_precision": val_precision_final,
+        "test_recall": val_recall_final,
+        "test_f1": val_f1_final,
+        "test_sens": val_sens_final,
+        "test_spec": val_spec_final,
+        "test_spec_at_sens95": val_spec_at_sens95_final,
+        "test_throughput_img_s": val_throughput_final,
+        "test_elapsed_s": eval_predict_elapsed,
+        "test_avg_batch_time_ms": None,
+        "test_inference_latency_ms_img": inference_latency_ms_img,
+        "test_inference_latency_ms_batch": inference_latency_ms_batch,
+        "test_gpu_mem_avg_mb": avg_gpu_memory_mb,
         "lr": None,
         "total_train_time_s": tElapsed,
     }
@@ -2503,3 +3086,8 @@ if __name__ == "__main__":
             writer.writerow(final_row)
     except Exception as exc:
         print(f"[WARN] Falha ao gravar linha final no CSV: {exc}")
+
+    final_summary_metrics = {"auc": val_auc_final, **final_metrics}
+    print(build_terminal_final_summary(final_summary_metrics, tElapsed, val_throughput_final, avg_gpu_memory_mb))
+
+    runtime_profiler.close()

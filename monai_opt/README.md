@@ -11,7 +11,7 @@ Versão otimizada para throughput/latência, com pipeline agressivo de dados e t
 ## Treino recomendado
 ```bash
 python3 train.py \
-  --tfrec_dir ./data/all-tfrec \
+  --tfrec_dir /home/users/bmmorales/projects/hcpa/data/all-tfrec \
   --results results/opt_monai \
   --batch_size 96 \
   --epochs 200 \
