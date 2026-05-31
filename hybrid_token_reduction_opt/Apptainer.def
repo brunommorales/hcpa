@@ -1,0 +1,30 @@
+# Apptainer definition para hybrid_token_reduction_opt (PyTorch, ARM/Grace-Hopper).
+Bootstrap: docker
+From: nvcr.io/nvidia/pytorch:24.11-py3
+
+%labels
+    Maintainer bmmorales
+    App hybrid_token_reduction_opt
+
+%files
+    requirements-ngc.txt /opt/requirements-ngc.txt
+
+%post
+    set -eux
+    if [ -f /etc/pip/constraint.txt ]; then
+        C="-c /etc/pip/constraint.txt"
+    else
+        C=""
+    fi
+    python -m pip install --upgrade pip
+    python -m pip install -r /opt/requirements-ngc.txt ${C}
+    rm -rf /root/.cache/pip
+    mkdir -p /workspace
+    chmod 777 /workspace
+
+%environment
+    export KERAS_BACKEND=torch
+    export PYTHONPATH=/workspace
+
+%runscript
+    exec /bin/bash "$@"
