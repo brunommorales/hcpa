@@ -1,0 +1,135 @@
+#!/bin/bash
+#OAR -n tensorflow_opt_arm
+#OAR -l nodes=1,walltime=6:00:00
+#OAR -p cluster='hydra'
+#OAR -t exotic
+#OAR -O logs/g5k_tensorflow_opt_%jobid%.stdout
+#OAR -E logs/g5k_tensorflow_opt_%jobid%.stderr
+
+###############################################################################
+# Script OAR - tensorflow_opt (TensorFlow otimizado) - ARM (Hydra)
+# Cluster: Hydra (Lyon) - NVIDIA Grace Hopper - ARM aarch64
+# GPU: Nvidia H200 (96 GiB)
+#
+# OTIMIZAÇÕES (IGUAL SLURM):
+# - InceptionV3 com fine-tuning antecipado
+# - Mixup/CutMix/Label Smoothing
+# - Focal Loss + pos_weight
+# - TTA, JIT compile, gradient checkpointing
+###############################################################################
+
+set -euxo pipefail
+
+IMAGE="tf_distributed_arm:latest"
+PROJ_DIR="$HOME/projects/hcpa/tensorflow_opt"
+TFREC_DIR="${PROJ_DIR}/data/all-tfrec"
+CONT_WORKDIR="/workspace"
+LOG_DIR="${PROJ_DIR}/logs"
+RESULTS_DIR="${PROJ_DIR}/results"
+
+mkdir -p "${LOG_DIR}" "${RESULTS_DIR}"
+
+sanitize_tag() {
+    local s="${1:-}"
+    s="$(printf '%s' "${s}" | tr '[:upper:]' '[:lower:]')"
+    if [[ -z "${s}" || "${s}" == "(null)" || "${s}" == "null" ]]; then
+        printf '%s' 'unknown'
+        return
+    fi
+    s="$(printf '%s' "${s}" | sed -E 's/[^a-z0-9._-]+/-/g')"
+    s="$(printf '%s' "${s}" | sed -E 's/-+/-/g')"
+    printf '%s' "${s}"
+}
+
+# ========================== TRAIN ARGS (IGUAL SLURM) ==========================
+TRAIN_ARGS=(
+  --batch_size 96
+  --model InceptionV3
+  --normalize preprocess
+  --epochs 200
+  --freeze_epochs 1
+  --fine_tune_at -200
+  --fine_tune_lr 2e-4
+  --lrate 0.003
+  --mixup_alpha 0.3
+  --cutmix_alpha 0.6
+  --label_smoothing 0.1
+  --focal_gamma 2.0
+  --pos_weight 2.0
+  --fundus_crop_ratio 0.9
+  --warmup_epochs 5
+  --min_lr 1e-6
+  --tta_views 2
+  --recompute_backbone
+  --jit_compile
+  --auc_target 0.95
+  --cache_dir none
+  --data_dir ${CONT_WORKDIR}/data/all-tfrec
+)
+
+echo "=========================================="
+echo "HCPA - tensorflow_opt (TensorFlow ARM)"
+echo "=========================================="
+echo "Job ID: ${OAR_JOB_ID}"
+echo "Architecture: ARM (aarch64)"
+echo "Cluster: Hydra"
+echo "Node: $(hostname)"
+echo "Start: $(date)"
+echo "=========================================="
+echo "Training Arguments:"
+printf '  %s\n' "${TRAIN_ARGS[@]}"
+echo "=========================================="
+
+cd "${PROJ_DIR}"
+
+if ! docker images | grep -q "${IMAGE%:*}"; then
+    echo "Building Docker image for ARM..."
+    docker build -t ${IMAGE} .
+fi
+
+nvidia-smi || echo "WARNING: nvidia-smi failed"
+
+GPU_NAME_RAW="${GPU_NAME_RAW:-$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1 2>/dev/null || true)}"
+GPU_TAG="${GPU_TAG:-$(sanitize_tag "${GPU_NAME_RAW:-gpu}")}"
+if [[ -z "${GPU_TAG}" || "${GPU_TAG}" == "unknown" ]]; then
+    GPU_TAG="gpu"
+fi
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    IFS=',' read -ra _cvd <<<"${CUDA_VISIBLE_DEVICES}"
+    GPU_COUNT=${#_cvd[@]}
+else
+    GPU_COUNT=$(nvidia-smi -L | grep -c '^GPU' || true)
+fi
+if ! [[ "${GPU_COUNT:-}" =~ ^[0-9]+$ ]] || (( GPU_COUNT < 1 )); then
+    GPU_COUNT=1
+fi
+RUN_ID="${RUN_ID:-0}"
+if [[ -z "${RESULTS_SUBDIR:-}" ]]; then
+    if (( GPU_COUNT > 1 )); then
+        RESULTS_SUBDIR="${GPU_COUNT}x_${GPU_TAG}"
+    else
+        RESULTS_SUBDIR="${GPU_TAG}"
+    fi
+fi
+HOST_RESULTS_DIR="${RESULTS_DIR}/${RESULTS_SUBDIR}/run_${RUN_ID}"
+mkdir -p "${HOST_RESULTS_DIR}"
+
+echo "Starting TensorFlow Original training with optimizations..."
+
+docker run --gpus all --rm \
+    -v "${PROJ_DIR}:${CONT_WORKDIR}" \
+    -v "${TFREC_DIR}:${CONT_WORKDIR}/data/all-tfrec" \
+    -v "${HOST_RESULTS_DIR}:${CONT_WORKDIR}/results" \
+    --network host \
+    --ipc=host \
+    --shm-size=16g \
+    -e TF_CPP_MIN_LOG_LEVEL=1 \
+    -e TF_GPU_THREAD_MODE=gpu_private \
+    -e TF_FORCE_GPU_ALLOW_GROWTH=true \
+    ${IMAGE} \
+    python3 ${CONT_WORKDIR}/dr_hcpa_v2_2024.py "${TRAIN_ARGS[@]}"
+
+echo "=========================================="
+echo "Completed: $(date)"
+echo "Results in: ${HOST_RESULTS_DIR}"
+echo "=========================================="

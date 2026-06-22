@@ -1,0 +1,148 @@
+#!/bin/bash
+#OAR -n pytorch_opt_x86
+#OAR -l nodes=1,walltime=6:00:00
+#OAR -p cluster='sirius' or cluster='gemini'
+#OAR -t exotic
+#OAR -O logs/g5k_pytorch_opt_%jobid%.stdout
+#OAR -E logs/g5k_pytorch_opt_%jobid%.stderr
+
+###############################################################################
+# Script OAR - pytorch_opt (PyTorch) - x86_64
+# Clusters: Sirius (A100) ou Gemini (V100)
+#
+# OTIMIZAÇÕES (IGUAL SLURM):
+# - inception_v3 (timm)
+# - Fine-tuning com lr_factor
+# - Mixup/Label Smoothing
+# - Warmup epochs
+###############################################################################
+
+set -euxo pipefail
+
+IMAGE="pytorch_opt_x86:latest"
+PROJ_DIR="$HOME/projects/hcpa/pytorch_opt"
+TFREC_DIR="${PROJ_DIR}/data/all-tfrec"
+CONT_WORKDIR="/workspace"
+LOG_DIR="${PROJ_DIR}/logs"
+RESULTS_DIR="${PROJ_DIR}/results"
+CACHE_ROOT="/tmp/hcpa_${OAR_JOB_ID}_cache"
+TMP_ROOT="/tmp/hcpa_${OAR_JOB_ID}"
+
+mkdir -p "${LOG_DIR}" "${RESULTS_DIR}" "${CACHE_ROOT}" "${TMP_ROOT}/mplconfig"
+
+sanitize_tag() {
+    local s="${1:-}"
+    s="$(printf '%s' "${s}" | tr '[:upper:]' '[:lower:]')"
+    if [[ -z "${s}" || "${s}" == "(null)" || "${s}" == "null" ]]; then
+        printf '%s' 'unknown'
+        return
+    fi
+    s="$(printf '%s' "${s}" | sed -E 's/[^a-z0-9._-]+/-/g')"
+    s="$(printf '%s' "${s}" | sed -E 's/-+/-/g')"
+    printf '%s' "${s}"
+}
+
+# ========================== TRAIN ARGS (IGUAL SLURM) ==========================
+TRAIN_ARGS=(
+  --model inception_v3
+  --normalize preprocess
+  --batch_size 96
+  --epochs 200
+  --lrate 3e-3
+  --freeze_epochs 1
+  --fine_tune_lr_factor 0.1
+  --fine_tune_lr 2e-4
+  --warmup_epochs 2
+  --min_lr 1e-6
+  --mixup_alpha 0.3
+  --cutmix_alpha 0.0
+  --label_smoothing 0.01
+  --focal_gamma 0.0
+  --pos_weight 1.0
+  --fundus_crop_ratio 0.9
+  --tta_views 1
+  --data_dir ${CONT_WORKDIR}/data/all-tfrec
+)
+
+echo "=========================================="
+echo "HCPA - pytorch_opt (PyTorch x86)"
+echo "=========================================="
+echo "Job ID: ${OAR_JOB_ID}"
+echo "Architecture: x86_64"
+echo "Node: $(hostname)"
+echo "Start: $(date)"
+echo "=========================================="
+echo "Training Arguments:"
+printf '  %s\n' "${TRAIN_ARGS[@]}"
+echo "=========================================="
+
+cd "${PROJ_DIR}"
+
+HOST_UID=$(id -u)
+HOST_GID=$(id -g)
+
+if ! docker images | grep -q "${IMAGE%:*}"; then
+    echo "Building Docker image for x86..."
+    docker build \
+        --build-arg UID=${HOST_UID} \
+        --build-arg GID=${HOST_GID} \
+        -t ${IMAGE} .
+fi
+
+nvidia-smi || echo "WARNING: nvidia-smi failed"
+
+GPU_NAME_RAW="${GPU_NAME_RAW:-$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1 2>/dev/null || true)}"
+GPU_TAG="${GPU_TAG:-$(sanitize_tag "${GPU_NAME_RAW:-gpu}")}"
+if [[ -z "${GPU_TAG}" || "${GPU_TAG}" == "unknown" ]]; then
+    GPU_TAG="gpu"
+fi
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    IFS=',' read -ra _cvd <<<"${CUDA_VISIBLE_DEVICES}"
+    GPU_COUNT=${#_cvd[@]}
+else
+    GPU_COUNT=$(nvidia-smi -L | grep -c '^GPU' || true)
+fi
+if ! [[ "${GPU_COUNT:-}" =~ ^[0-9]+$ ]] || (( GPU_COUNT < 1 )); then
+    GPU_COUNT=1
+fi
+RUN_ID="${RUN_ID:-0}"
+if [[ -z "${RESULTS_SUBDIR:-}" ]]; then
+    if (( GPU_COUNT > 1 )); then
+        RESULTS_SUBDIR="${GPU_COUNT}x_${GPU_TAG}"
+    else
+        RESULTS_SUBDIR="${GPU_TAG}"
+    fi
+fi
+HOST_RESULTS_DIR="${RESULTS_DIR}/${RESULTS_SUBDIR}/run_${RUN_ID}"
+mkdir -p "${HOST_RESULTS_DIR}"
+
+echo "Starting PyTorch training with optimizations..."
+
+docker run --gpus all --rm \
+    -v "${PROJ_DIR}:${CONT_WORKDIR}" \
+    -v "${TFREC_DIR}:${CONT_WORKDIR}/data/all-tfrec" \
+    -v "${HOST_RESULTS_DIR}:${CONT_WORKDIR}/results" \
+    --network host \
+    --ipc=host \
+    --shm-size=16g \
+    -e NCCL_DEBUG=WARN \
+    -e TORCH_DISTRIBUTED_DEBUG=OFF \
+    -e XDG_CACHE_HOME="${CACHE_ROOT}" \
+    -e HF_HOME="${CACHE_ROOT}/hf" \
+    -e TRANSFORMERS_CACHE="${CACHE_ROOT}/hf" \
+    -e TORCH_HOME="${CACHE_ROOT}/torch" \
+    -e TORCHINDUCTOR_CACHE_DIR="${CACHE_ROOT}/torchinductor" \
+    -e TRITON_CACHE_DIR="${CACHE_ROOT}/triton" \
+    -e TMPDIR="${TMP_ROOT}" \
+    -e MPLCONFIGDIR="${TMP_ROOT}/mplconfig" \
+    -u ${HOST_UID}:${HOST_GID} \
+    -e KERAS_BACKEND=torch \
+    -e PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512 \
+    -e CUDA_LAUNCH_BLOCKING=0 \
+    ${IMAGE} \
+    python3 ${CONT_WORKDIR}/dr_hcpa_v2_2024.py "${TRAIN_ARGS[@]}"
+
+echo "=========================================="
+echo "Completed: $(date)"
+echo "Results in: ${HOST_RESULTS_DIR}"
+echo "=========================================="
