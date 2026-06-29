@@ -38,6 +38,7 @@ ENABLE_COSINE="${ENABLE_COSINE:-1}"
 ENABLE_PERFORMANCE_PROFILER="${ENABLE_PERFORMANCE_PROFILER:-0}"
 AUTO_POS_WEIGHT="${AUTO_POS_WEIGHT:-1}"
 FREEZE_BACKBONE="${FREEZE_BACKBONE:-0}"
+FREEZE_EPOCHS="${FREEZE_EPOCHS:-0}"
 
 TRAIN_STATIC_ARGS=(
   --batch_size       "${BATCH_SIZE}"
@@ -55,6 +56,7 @@ TRAIN_STATIC_ARGS=(
   --focal_gamma      "${FOCAL_GAMMA}"
   --clip_grad_norm   "${CLIP_GRAD_NORM}"
   --head_dropout     "${HEAD_DROPOUT}"
+  --freeze_epochs    "${FREEZE_EPOCHS}"
 )
 
 [[ "${ENABLE_AMP}"                  == "1" ]] && TRAIN_STATIC_ARGS+=(--enable_amp)                  || TRAIN_STATIC_ARGS+=(--disable_amp)

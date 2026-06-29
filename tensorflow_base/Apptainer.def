@@ -9,23 +9,25 @@ From: nvcr.io/nvidia/tensorflow:25.02-tf2-py3
     App tensorflow_base
 
 %files
-    requirements /tmp/requirements.txt
+    requirements /opt/requirements.txt
 
 %post
     set -eux
     python -m pip install --upgrade pip
     if [ -f /etc/pip/constraint.txt ]; then
-        python -m pip install -r /tmp/requirements.txt -c /etc/pip/constraint.txt
+        python -m pip install -r /opt/requirements.txt -c /etc/pip/constraint.txt
         python -m pip install --extra-index-url https://developer.download.nvidia.com/compute/redist \
             -c /etc/pip/constraint.txt \
             nvidia-dali-cuda120 \
             nvidia-dali-tf-plugin-cuda120
     else
-        python -m pip install -r /tmp/requirements.txt
+        python -m pip install -r /opt/requirements.txt
         python -m pip install --extra-index-url https://developer.download.nvidia.com/compute/redist \
             nvidia-dali-cuda120 \
             nvidia-dali-tf-plugin-cuda120
     fi
+    # gpu_energy.py precisa do modulo pynvml; instala so se faltar (conflict-proof)
+    python -c "import pynvml" 2>/dev/null || python -m pip install nvidia-ml-py
     rm -rf /root/.cache/pip
     mkdir -p /workspace
     chmod 777 /workspace

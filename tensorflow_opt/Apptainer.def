@@ -26,6 +26,8 @@ From: nvcr.io/nvidia/tensorflow:25.02-tf2-py3
             nvidia-dali-cuda120 \
             nvidia-dali-tf-plugin-cuda120
     fi
+    # gpu_energy.py precisa do modulo pynvml; instala so se faltar (conflict-proof)
+    python -c "import pynvml" 2>/dev/null || python -m pip install nvidia-ml-py
     rm -rf /root/.cache/pip
     mkdir -p /workspace
     chmod 777 /workspace

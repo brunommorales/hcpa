@@ -5,8 +5,9 @@
 #SBATCH --gpus-per-task=1
 #SBATCH --cpus-per-task=8
 #SBATCH --array=0-9%1
-#SBATCH --time=24:00:00
+#SBATCH --time=06:00:00
 #SBATCH --partition=tupi
+#SBATCH --nodelist=tupi5
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 

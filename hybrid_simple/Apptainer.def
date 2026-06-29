@@ -22,6 +22,8 @@ From: nvcr.io/nvidia/pytorch:24.11-py3
     fi
     python -m pip install --upgrade pip
     python -m pip install -r /opt/requirements-ngc.txt ${C}
+    # gpu_energy.py precisa do modulo pynvml; instala so se faltar (conflict-proof)
+    python -c "import pynvml" 2>/dev/null || python -m pip install nvidia-ml-py
     rm -rf /root/.cache/pip
     mkdir -p /workspace
     chmod 777 /workspace

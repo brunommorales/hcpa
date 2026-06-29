@@ -20,8 +20,10 @@ import torch.amp
 from contextlib import contextmanager, nullcontext
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+SELF_DIR = Path(__file__).resolve().parent  # gpu_energy.py vive ao lado do script (robusto ao mount do container)
+for _p in (str(SELF_DIR), str(PROJECT_ROOT)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from hybrid_token_reduction_opt.model import create_hybrid_token_reduction_model
 from hybrid_token_reduction_opt.config import get_args
@@ -255,6 +257,19 @@ def load_model_state_dict(model: nn.Module, state_dict: dict) -> None:
     unwrap_model_for_state_dict(model).load_state_dict(state_dict)
 
 
+from gpu_energy import GpuTelemetry
+
+_GPU_TELE = None
+
+
+def _gpu_tele() -> GpuTelemetry:
+    """Singleton lazy: criado após o device CUDA estar definido (resolve a GPU correta)."""
+    global _GPU_TELE
+    if _GPU_TELE is None:
+        _GPU_TELE = GpuTelemetry()
+    return _GPU_TELE
+
+
 def run_epoch(
     model: nn.Module,
     loader,
@@ -290,6 +305,8 @@ def run_epoch(
     num_batches = 0
     total_samples = 0
     memory_samples_mb = []
+    power_samples_w = []
+    _tele = _gpu_tele()
     inference_time_s = 0.0
     inference_batches = 0
     inference_samples = 0
@@ -303,6 +320,7 @@ def run_epoch(
     use_channels_last = bool(getattr(args, "use_channels_last", False))
     check_finite = bool(getattr(args, "enable_finite_checks", False))
     epoch_start_time = time.perf_counter()
+    _energy_start_j = _tele.energy_j()
 
     loader_iter = iter(loader)
     batch_idx = 0
@@ -516,7 +534,13 @@ def run_epoch(
                 torch.cuda.synchronize(device)
                 allocated_mb = torch.cuda.memory_allocated(device) / (1024 ** 2)
                 reserved_mb = torch.cuda.memory_reserved(device) / (1024 ** 2)
-                memory_samples_mb.append(max(allocated_mb, reserved_mb))
+                _used_mb = _tele.memory_used_mb()
+                memory_samples_mb.append(
+                    _used_mb if _used_mb is not None else max(allocated_mb, reserved_mb)
+                )
+                _pw = _tele.power_w()
+                if _pw is not None:
+                    power_samples_w.append(_pw)
 
         if runtime_profiler:
             runtime_profiler.step(stage_name)
@@ -589,6 +613,16 @@ def run_epoch(
         epoch_profile["avg_batch_time_ms"] = (
             epoch_profile["epoch_time"] / max(num_batches, 1)
         ) * 1000.0 if num_batches > 0 else 0.0
+        _energy_end_j = _tele.energy_j()
+        epoch_profile["energy_j"] = (
+            max(0.0, _energy_end_j - _energy_start_j)
+            if (_energy_start_j is not None and _energy_end_j is not None)
+            else float("nan")
+        )
+        epoch_profile["memory_peak_mb"] = max(memory_samples_mb) if memory_samples_mb else float("nan")
+        epoch_profile["avg_power_w"] = (
+            sum(power_samples_w) / len(power_samples_w) if power_samples_w else float("nan")
+        )
         return epoch_profile
 
     if not all_targets or not all_probs:

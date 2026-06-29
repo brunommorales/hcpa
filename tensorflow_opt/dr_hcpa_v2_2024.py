@@ -67,6 +67,25 @@ import csv
 from lib.runtime_profiling import RuntimeProfiler
 
 
+import sys as _sys
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_SELF_DIR = Path(__file__).resolve().parent  # gpu_energy.py vive ao lado do script (robusto ao mount do container)
+for _p in (str(_SELF_DIR), str(_PROJECT_ROOT)):
+    if _p not in _sys.path:
+        _sys.path.insert(0, _p)
+from gpu_energy import GpuTelemetry, EnergyScope
+
+_GPU_TELE = None
+
+
+def _gpu_tele() -> GpuTelemetry:
+    """Singleton lazy de telemetria NVML (energia/potência/memória real)."""
+    global _GPU_TELE
+    if _GPU_TELE is None:
+        _GPU_TELE = GpuTelemetry()
+    return _GPU_TELE
+
+
 COMMON_CSV_FIELDS = [
     "epoch",
     "stage",
@@ -84,6 +103,9 @@ COMMON_CSV_FIELDS = [
     "train_inference_latency_ms_img",
     "train_inference_latency_ms_batch",
     "train_gpu_mem_avg_mb",
+    "train_gpu_mem_peak_mb",
+    "train_energy_j",
+    "train_avg_power_w",
     "val_loss",
     "val_auc",
     "val_precision",
@@ -98,6 +120,9 @@ COMMON_CSV_FIELDS = [
     "val_inference_latency_ms_img",
     "val_inference_latency_ms_batch",
     "val_gpu_mem_avg_mb",
+    "val_gpu_mem_peak_mb",
+    "val_energy_j",
+    "val_avg_power_w",
     "test_loss",
     "test_auc",
     "test_precision",
@@ -112,6 +137,9 @@ COMMON_CSV_FIELDS = [
     "test_inference_latency_ms_img",
     "test_inference_latency_ms_batch",
     "test_gpu_mem_avg_mb",
+    "test_gpu_mem_peak_mb",
+    "test_energy_j",
+    "test_avg_power_w",
     "lr",
     "total_train_time_s",
 ]
@@ -558,9 +586,12 @@ class GpuMemoryTracker(Callback):
         except Exception:
             self.device_names = []
         self._get_memory_info = getattr(tf.config.experimental, "get_memory_info", None)
-        self.enabled = bool(self.device_names)
+        self._tele = _gpu_tele()
+        self.enabled = bool(self.device_names) or self._tele.available
         self.train_samples = []
         self.val_samples = []
+        self.power_samples = []
+        self._energy_start_j = None
         self.avg_memory_mb = 0.0
 
     def _read_nvidia_smi_usage(self):
@@ -586,6 +617,9 @@ class GpuMemoryTracker(Callback):
         return None
 
     def _read_current_memory_mb(self):
+        _used = self._tele.memory_used_mb()  # uso REAL da GPU (NVML); preferido
+        if _used is not None:
+            return _used
         max_current = 0.0
         if self.enabled and callable(self._get_memory_info):
             for name in self.device_names:
@@ -605,11 +639,16 @@ class GpuMemoryTracker(Callback):
     def on_epoch_begin(self, epoch, logs=None):
         self.train_samples = []
         self.val_samples = []
+        self.power_samples = []
+        self._energy_start_j = self._tele.energy_j()
 
     def _sample(self, samples):
         current_mb = self._read_current_memory_mb()
         if current_mb is not None:
             samples.append(float(current_mb))
+        _pw = self._tele.power_w()
+        if _pw is not None:
+            self.power_samples.append(_pw)
 
     def on_train_batch_end(self, batch, logs=None):
         if self.enabled:
@@ -629,6 +668,12 @@ class GpuMemoryTracker(Callback):
         samples = self.train_samples + self.val_samples
         if samples:
             self.avg_memory_mb = float(np.mean(samples))
+            logs["train_gpu_mem_peak_mb"] = float(np.max(samples))
+        if self.power_samples:
+            logs["train_avg_power_w"] = float(np.mean(self.power_samples))
+        _e_end = self._tele.energy_j()
+        if self._energy_start_j is not None and _e_end is not None:
+            logs["train_energy_j"] = max(0.0, _e_end - self._energy_start_j)
 
     def _implements_train_batch_hooks(self):
         return True
@@ -1226,6 +1271,9 @@ class EpochCsvLogger(Callback):
         val_inference_latency_ms_batch = val_avg_batch_time_ms
         train_mem_avg = logs.get("train_gpu_mem_avg_mb")
         val_mem_avg = logs.get("val_gpu_mem_avg_mb")
+        train_mem_peak = logs.get("train_gpu_mem_peak_mb")
+        train_energy_j = logs.get("train_energy_j")
+        train_avg_power_w = logs.get("train_avg_power_w")
 
         row = {
             "epoch": int(epoch),
@@ -1244,6 +1292,9 @@ class EpochCsvLogger(Callback):
             "train_inference_latency_ms_img": None,
             "train_inference_latency_ms_batch": None,
             "train_gpu_mem_avg_mb": train_mem_avg,
+            "train_gpu_mem_peak_mb": train_mem_peak,
+            "train_energy_j": train_energy_j,
+            "train_avg_power_w": train_avg_power_w,
             "val_loss": val_loss,
             "val_auc": val_auc,
             "val_precision": val_precision,
@@ -1258,6 +1309,9 @@ class EpochCsvLogger(Callback):
             "val_inference_latency_ms_img": val_inference_latency_ms_img,
             "val_inference_latency_ms_batch": val_inference_latency_ms_batch,
             "val_gpu_mem_avg_mb": val_mem_avg,
+            "val_gpu_mem_peak_mb": None,
+            "val_energy_j": None,
+            "val_avg_power_w": None,
             "test_loss": None,
             "test_auc": None,
             "test_precision": None,
@@ -1272,6 +1326,9 @@ class EpochCsvLogger(Callback):
             "test_inference_latency_ms_img": None,
             "test_inference_latency_ms_batch": None,
             "test_gpu_mem_avg_mb": None,
+            "test_gpu_mem_peak_mb": None,
+            "test_energy_j": None,
+            "test_avg_power_w": None,
             "lr": self._resolve_lr(),
             "total_train_time_s": None,
         }
@@ -2954,6 +3011,8 @@ if __name__ == "__main__":
     )
     applied_ema = False if loaded_best_ckpt else ema_callback.apply_ema_weights()
     eval_predict_start = time.time()
+    _test_scope = EnergyScope(_gpu_tele())
+    _test_scope.start()
     with runtime_profiler.profile_scope("eval/predict_with_tta", stage="eval"):
         labels, probabilities, inference_time_s, inference_batches, eval_mem_avg = predict_with_tta(
             model,
@@ -2961,6 +3020,7 @@ if __name__ == "__main__":
             TTA_VIEWS,
             memory_tracker=gpu_memory_cb,
         )
+    _test_scope.stop()
     eval_predict_elapsed = time.time() - eval_predict_start
     probabilities = probabilities.ravel()
 
@@ -3047,6 +3107,9 @@ if __name__ == "__main__":
         "train_inference_latency_ms_img": None,
         "train_inference_latency_ms_batch": None,
         "train_gpu_mem_avg_mb": None,
+        "train_gpu_mem_peak_mb": None,
+        "train_energy_j": None,
+        "train_avg_power_w": None,
         "val_loss": None,
         "val_auc": None,
         "val_precision": None,
@@ -3061,6 +3124,9 @@ if __name__ == "__main__":
         "val_inference_latency_ms_img": None,
         "val_inference_latency_ms_batch": None,
         "val_gpu_mem_avg_mb": None,
+        "val_gpu_mem_peak_mb": None,
+        "val_energy_j": None,
+        "val_avg_power_w": None,
         "test_loss": val_loss_final,
         "test_auc": val_auc_final,
         "test_precision": val_precision_final,
@@ -3074,7 +3140,12 @@ if __name__ == "__main__":
         "test_avg_batch_time_ms": None,
         "test_inference_latency_ms_img": inference_latency_ms_img,
         "test_inference_latency_ms_batch": inference_latency_ms_batch,
-        "test_gpu_mem_avg_mb": avg_gpu_memory_mb,
+        "test_gpu_mem_avg_mb": (
+            _test_scope.avg_mem_mb if _test_scope.avg_mem_mb is not None else avg_gpu_memory_mb
+        ),
+        "test_gpu_mem_peak_mb": _test_scope.peak_mem_mb,
+        "test_energy_j": _test_scope.energy_j,
+        "test_avg_power_w": _test_scope.avg_power_w,
         "lr": None,
         "total_train_time_s": tElapsed,
     }

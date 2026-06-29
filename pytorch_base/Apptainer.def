@@ -10,7 +10,7 @@ From: nvcr.io/nvidia/pytorch:24.11-py3
     App pytorch_base
 
 %files
-    requirements-ngc.txt /tmp/requirements-ngc.txt
+    requirements-ngc.txt /opt/requirements-ngc.txt
 
 %post
     set -eux
@@ -20,9 +20,11 @@ From: nvcr.io/nvidia/pytorch:24.11-py3
         C=""
     fi
     python -m pip install --upgrade pip
-    python -m pip install -r /tmp/requirements-ngc.txt ${C}
+    python -m pip install -r /opt/requirements-ngc.txt ${C}
     # Enable DALI if/when needed:
     # python -m pip install --extra-index-url https://developer.download.nvidia.com/compute/redist nvidia-dali-cuda120
+    # gpu_energy.py precisa do modulo pynvml; instala so se faltar (conflict-proof)
+    python -c "import pynvml" 2>/dev/null || python -m pip install nvidia-ml-py
     rm -rf /root/.cache/pip
     mkdir -p /workspace
     chmod 777 /workspace

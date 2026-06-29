@@ -8,6 +8,7 @@ diabetic retinopathy classification in the existing hcpa pipeline.
 from __future__ import annotations
 
 import os
+import random
 import sys
 import time
 from contextlib import nullcontext
@@ -17,11 +18,14 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+SELF_DIR = Path(__file__).resolve().parent  # gpu_energy.py vive ao lado do script (robusto ao mount do container)
+for _p in (str(SELF_DIR), str(PROJECT_ROOT)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from retfound_green.config import get_args
 from retfound_green.model import (
@@ -64,10 +68,16 @@ RETFOUND_GREEN_NORMALIZATION_MODEL = "inception_v3"
 
 
 def set_seed(seed: int) -> None:
+    random.seed(seed)
     np.random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    # ensure_cuda_ready() sets benchmark=True; override for reproducibility
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 def init_distributed() -> tuple[int, int, int, torch.device]:
@@ -155,6 +165,19 @@ def estimate_pos_weight(loader, device: torch.device) -> float:
     return max(1.0, neg_count / pos_count)
 
 
+from gpu_energy import GpuTelemetry
+
+_GPU_TELE = None
+
+
+def _gpu_tele() -> GpuTelemetry:
+    """Singleton lazy: criado após o device CUDA estar definido (resolve a GPU correta)."""
+    global _GPU_TELE
+    if _GPU_TELE is None:
+        _GPU_TELE = GpuTelemetry()
+    return _GPU_TELE
+
+
 def run_epoch(
     model: nn.Module,
     loader,
@@ -187,6 +210,8 @@ def run_epoch(
     all_probs = []
     num_batches = 0
     memory_samples_mb = []
+    power_samples_w = []
+    _tele = _gpu_tele()
     inference_time_s = 0.0
     inference_batches = 0
     inference_samples = 0
@@ -194,6 +219,7 @@ def run_epoch(
     amp_enabled = args.enable_amp and device.type == "cuda"
     total_samples = 0
     epoch_start_time = time.perf_counter()
+    _energy_start_j = _tele.energy_j()
 
     loader_iter = iter(loader)
     batch_idx = 0
@@ -289,7 +315,13 @@ def run_epoch(
                 torch.cuda.synchronize(device)
                 allocated_mb = torch.cuda.memory_allocated(device) / (1024 ** 2)
                 reserved_mb = torch.cuda.memory_reserved(device) / (1024 ** 2)
-                memory_samples_mb.append(max(allocated_mb, reserved_mb))
+                _used_mb = _tele.memory_used_mb()
+                memory_samples_mb.append(
+                    _used_mb if _used_mb is not None else max(allocated_mb, reserved_mb)
+                )
+                _pw = _tele.power_w()
+                if _pw is not None:
+                    power_samples_w.append(_pw)
 
         if runtime_profiler:
             runtime_profiler.step(stage_name)
@@ -372,6 +404,17 @@ def run_epoch(
         ) * 1000.0 if num_batches > 0 else 0.0
     epoch_profile["num_samples"] = global_samples
     epoch_profile["throughput"] = global_samples / (epoch_profile["epoch_time"] + 1e-7)
+    # Energia (J) pelo contador NVML e memória REAL (pico) — rank-local (1 GPU/processo).
+    _energy_end_j = _tele.energy_j()
+    epoch_profile["energy_j"] = (
+        max(0.0, _energy_end_j - _energy_start_j)
+        if (_energy_start_j is not None and _energy_end_j is not None)
+        else float("nan")
+    )
+    epoch_profile["memory_peak_mb"] = max(memory_samples_mb) if memory_samples_mb else float("nan")
+    epoch_profile["avg_power_w"] = (
+        sum(power_samples_w) / len(power_samples_w) if power_samples_w else float("nan")
+    )
     results = {
         "loss": avg_loss,
         "auc": metrics["auc"],
@@ -452,14 +495,18 @@ def main() -> None:
     if rank == 0:
         print(f"Effective positive-class weight: {effective_pos_weight:.4f}")
 
+    # LP-FT: se freeze_epochs > 0, iniciar com backbone congelado independente de freeze_backbone
+    initial_freeze = args.freeze_backbone or (args.freeze_epochs > 0)
     model = create_retfound_green_model(
         img_size=args.img_size,
         backbone_model=args.backbone_model,
         checkpoint_path=str(checkpoint_path),
         head_dropout=args.head_dropout,
-        freeze_backbone=args.freeze_backbone,
+        freeze_backbone=initial_freeze,
         device=device,
     )
+    if args.freeze_epochs > 0:
+        args.freeze_backbone = True
 
     if rank == 0:
         print(
@@ -481,12 +528,15 @@ def main() -> None:
             output_device=local_rank,
         )
 
-    optimizer = create_optimizer(
-        model,
-        optimizer_name=args.optimizer,
-        lr=args.lrate,
-        weight_decay=args.weight_decay,
-    )
+    # LR discriminativo: head (aleatória) usa LR cheio; backbone (pré-treinado) usa LR/10
+    _base = model.module if isinstance(model, nn.parallel.DistributedDataParallel) else model
+    _head_params = list(_base.head_dropout.parameters()) + list(_base.classifier.parameters())
+    _backbone_params = list(_base.backbone.parameters())
+    _param_groups = [
+        {"params": _head_params, "lr": args.lrate},
+        {"params": _backbone_params, "lr": args.lrate * 0.1},
+    ]
+    optimizer = optim.AdamW(_param_groups, weight_decay=args.weight_decay, eps=1e-7)
     scheduler = None
     if args.enable_cosine:
         scheduler = LinearWarmupCosineAnnealingScheduler(
@@ -508,6 +558,18 @@ def main() -> None:
     overall_start_time = time.perf_counter()
 
     for epoch in range(args.epochs):
+        # LP-FT: unfreeze backbone after freeze_epochs warm-up epochs
+        if args.freeze_epochs > 0 and epoch == args.freeze_epochs:
+            base_model = model.module if hasattr(model, "module") else model
+            base_model.set_backbone_trainable(True)
+            args.freeze_backbone = False
+            if rank == 0:
+                print(f"[LP-FT] Epoch {epoch + 1}: backbone descongelado para fine-tuning completo")
+
+        # Warmup fix: step antes do treino para que a época 0 rode com LR de warmup, não LR cheio
+        if scheduler is not None:
+            scheduler.step()
+
         if rank == 0:
             print(f"\n{'=' * 70}")
             print(f"Epoch {epoch + 1}/{args.epochs}")
@@ -548,9 +610,6 @@ def main() -> None:
             stage_name="val",
             return_predictions=True,
         )
-
-        if scheduler is not None:
-            scheduler.step()
 
         if rank == 0:
             val_opt_threshold, val_opt_f1 = find_optimal_threshold(

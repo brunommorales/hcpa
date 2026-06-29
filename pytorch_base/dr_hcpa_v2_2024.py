@@ -36,6 +36,24 @@ import torchvision.transforms.v2 as T
 
 from lib.runtime_profiling import RuntimeProfiler
 
+import sys
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_SELF_DIR = Path(__file__).resolve().parent  # gpu_energy.py vive ao lado do script (robusto ao mount do container)
+for _p in (str(_SELF_DIR), str(_PROJECT_ROOT)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+from gpu_energy import GpuTelemetry, EnergyScope
+
+_GPU_TELE = None
+
+
+def _gpu_tele() -> GpuTelemetry:
+    """Singleton lazy de telemetria NVML (energia/potência/memória real)."""
+    global _GPU_TELE
+    if _GPU_TELE is None:
+        _GPU_TELE = GpuTelemetry()
+    return _GPU_TELE
+
 
 COMMON_CSV_FIELDS = [
     "epoch",
@@ -54,6 +72,9 @@ COMMON_CSV_FIELDS = [
     "train_inference_latency_ms_img",
     "train_inference_latency_ms_batch",
     "train_gpu_mem_avg_mb",
+    "train_gpu_mem_peak_mb",
+    "train_energy_j",
+    "train_avg_power_w",
     "val_loss",
     "val_auc",
     "val_precision",
@@ -68,6 +89,9 @@ COMMON_CSV_FIELDS = [
     "val_inference_latency_ms_img",
     "val_inference_latency_ms_batch",
     "val_gpu_mem_avg_mb",
+    "val_gpu_mem_peak_mb",
+    "val_energy_j",
+    "val_avg_power_w",
     "test_loss",
     "test_auc",
     "test_precision",
@@ -82,6 +106,9 @@ COMMON_CSV_FIELDS = [
     "test_inference_latency_ms_img",
     "test_inference_latency_ms_batch",
     "test_gpu_mem_avg_mb",
+    "test_gpu_mem_peak_mb",
+    "test_energy_j",
+    "test_avg_power_w",
     "lr",
     "total_train_time_s",
 ]
@@ -1003,7 +1030,10 @@ def main():
                     torch.cuda.synchronize(device)
                     allocated_mb = torch.cuda.memory_allocated(device) / (1024 ** 2)
                     reserved_mb = torch.cuda.memory_reserved(device) / (1024 ** 2)
-                    memory_samples_mb.append(max(allocated_mb, reserved_mb))
+                    _used_mb = _gpu_tele().memory_used_mb()
+                    memory_samples_mb.append(
+                        _used_mb if _used_mb is not None else max(allocated_mb, reserved_mb)
+                    )
 
             runtime_profiler.step(stage_name)
 
@@ -1100,6 +1130,8 @@ def main():
 
         if isinstance(train_sampler, DistributedSampler):
             train_sampler.set_epoch(epoch)
+        _train_scope = EnergyScope(_gpu_tele())
+        _train_scope.start()
         (
             train_loss,
             train_auc,
@@ -1113,6 +1145,9 @@ def main():
         ) = run_epoch(
             train_loader, train=True, epoch_idx=epoch
         )
+        _train_scope.stop()
+        _val_scope = EnergyScope(_gpu_tele())
+        _val_scope.start()
         (
             val_loss,
             val_auc,
@@ -1126,7 +1161,8 @@ def main():
         ) = run_epoch(
             valid_loader, train=False, epoch_idx=epoch
         )
-        
+        _val_scope.stop()
+
         if scheduler is not None:
             scheduler.step()
 
@@ -1153,7 +1189,12 @@ def main():
                     "train_avg_batch_time_ms": train_avg_batch_time_ms,
                     "train_inference_latency_ms_img": train_inference_latency_ms_img,
                     "train_inference_latency_ms_batch": train_inference_latency_ms_batch,
-                    "train_gpu_mem_avg_mb": train_mem_avg,
+                    "train_gpu_mem_avg_mb": (
+                        _train_scope.avg_mem_mb if _train_scope.avg_mem_mb is not None else train_mem_avg
+                    ),
+                    "train_gpu_mem_peak_mb": _train_scope.peak_mem_mb,
+                    "train_energy_j": _train_scope.energy_j,
+                    "train_avg_power_w": _train_scope.avg_power_w,
                     "val_loss": val_loss,
                     "val_auc": val_auc,
                     "val_precision": val_epoch_metrics["precision"],
@@ -1167,7 +1208,12 @@ def main():
                     "val_avg_batch_time_ms": val_avg_batch_time_ms,
                     "val_inference_latency_ms_img": val_inference_latency_ms_img,
                     "val_inference_latency_ms_batch": val_inference_latency_ms_batch,
-                    "val_gpu_mem_avg_mb": val_mem_avg,
+                    "val_gpu_mem_avg_mb": (
+                        _val_scope.avg_mem_mb if _val_scope.avg_mem_mb is not None else val_mem_avg
+                    ),
+                    "val_gpu_mem_peak_mb": _val_scope.peak_mem_mb,
+                    "val_energy_j": _val_scope.energy_j,
+                    "val_avg_power_w": _val_scope.avg_power_w,
                     "test_loss": np.nan,
                     "test_auc": np.nan,
                     "test_precision": np.nan,
@@ -1182,6 +1228,9 @@ def main():
                     "test_inference_latency_ms_img": np.nan,
                     "test_inference_latency_ms_batch": np.nan,
                     "test_gpu_mem_avg_mb": np.nan,
+                    "test_gpu_mem_peak_mb": np.nan,
+                    "test_energy_j": np.nan,
+                    "test_avg_power_w": np.nan,
                     "lr": opt.param_groups[0]["lr"],
                     "total_train_time_s": None,
                 }
@@ -1219,6 +1268,8 @@ def main():
         eval_memory_samples_mb = []
         eval_inference_time_s = 0.0
         eval_inference_samples = 0
+        _test_scope = EnergyScope(_gpu_tele())
+        _test_scope.start()
         with torch.no_grad():
             eval_iter = iter(eval_loader)
             while True:
@@ -1249,8 +1300,12 @@ def main():
                     if use_cuda and device.type == "cuda":
                         allocated_mb = torch.cuda.memory_allocated(device) / (1024 ** 2)
                         reserved_mb = torch.cuda.memory_reserved(device) / (1024 ** 2)
-                        eval_memory_samples_mb.append(max(allocated_mb, reserved_mb))
+                        _used_mb = _gpu_tele().memory_used_mb()
+                        eval_memory_samples_mb.append(
+                            _used_mb if _used_mb is not None else max(allocated_mb, reserved_mb)
+                        )
                 runtime_profiler.step("eval")
+        _test_scope.stop()
         y_true = np.concatenate(y_true)
         y_score = np.concatenate(y_score)
         auc_val = roc_auc_score(y_true, y_score)
@@ -1317,6 +1372,9 @@ def main():
                 "train_inference_latency_ms_img": np.nan,
                 "train_inference_latency_ms_batch": np.nan,
                 "train_gpu_mem_avg_mb": np.nan,
+                "train_gpu_mem_peak_mb": np.nan,
+                "train_energy_j": np.nan,
+                "train_avg_power_w": np.nan,
                 "val_loss": float("nan"),
                 "val_auc": np.nan,
                 "val_precision": np.nan,
@@ -1331,6 +1389,9 @@ def main():
                 "val_inference_latency_ms_img": np.nan,
                 "val_inference_latency_ms_batch": np.nan,
                 "val_gpu_mem_avg_mb": np.nan,
+                "val_gpu_mem_peak_mb": np.nan,
+                "val_energy_j": np.nan,
+                "val_avg_power_w": np.nan,
                 "test_loss": float("nan"),
                 "test_auc": auc_val,
                 "test_precision": final_metrics["precision"],
@@ -1344,7 +1405,12 @@ def main():
                 "test_avg_batch_time_ms": test_avg_batch_time_ms,
                 "test_inference_latency_ms_img": test_inference_latency_ms_img,
                 "test_inference_latency_ms_batch": test_inference_latency_ms_batch,
-                "test_gpu_mem_avg_mb": test_mem_avg,
+                "test_gpu_mem_avg_mb": (
+                    _test_scope.avg_mem_mb if _test_scope.avg_mem_mb is not None else test_mem_avg
+                ),
+                "test_gpu_mem_peak_mb": _test_scope.peak_mem_mb,
+                "test_energy_j": _test_scope.energy_j,
+                "test_avg_power_w": _test_scope.avg_power_w,
                 "lr": opt.param_groups[0]["lr"],
                 "total_train_time_s": final_elapsed,
             }

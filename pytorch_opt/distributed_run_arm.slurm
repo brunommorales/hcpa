@@ -4,7 +4,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1
 #SBATCH --cpus-per-task=8
-#SBATCH --array=0-9%1
+#SBATCH --array=0-0%0
 #SBATCH --time=04:00:00
 #SBATCH --partition=grace
 #SBATCH --nodelist=grace1

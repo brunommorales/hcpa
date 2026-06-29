@@ -38,6 +38,17 @@ RUN set -eu; \
     # pip install --extra-index-url https://developer.download.nvidia.com/compute/redist nvidia-dali-cuda120 && \
     rm -rf /root/.cache/pip
 
+# Fix torch.compile/TorchInductor: o backend Inductor compila kernels Triton e
+# exige libcuda.so, mas a imagem NGC traz apenas libcuda.so.1 em compat/lib.
+# Sem este symlink, torch.compile falha com "libcuda.so cannot found!" e cai
+# silenciosamente em eager mode (anulando a otimização por compilação).
+RUN set -eux; \
+    for d in /usr/local/cuda/compat/lib /usr/local/cuda/lib64/stubs; do \
+        if [ -f "$d/libcuda.so.1" ] && [ ! -e "$d/libcuda.so" ]; then \
+            ln -s "$d/libcuda.so.1" "$d/libcuda.so"; \
+        fi; \
+    done
+
 # Troca para não-root
 USER ${USERNAME}
 

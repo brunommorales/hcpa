@@ -39,6 +39,24 @@ from tfrecord import example_pb2
 from lib.dali_pipeline import build_dali_pipeline, create_dali_iterator
 from lib.runtime_profiling import RuntimeProfiler
 
+import sys
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_SELF_DIR = Path(__file__).resolve().parent  # gpu_energy.py vive ao lado do script (robusto ao mount do container)
+for _p in (str(_SELF_DIR), str(_PROJECT_ROOT)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+from gpu_energy import GpuTelemetry, EnergyScope
+
+_GPU_TELE = None
+
+
+def _gpu_tele() -> GpuTelemetry:
+    """Singleton lazy de telemetria NVML (energia/potência/memória real)."""
+    global _GPU_TELE
+    if _GPU_TELE is None:
+        _GPU_TELE = GpuTelemetry()
+    return _GPU_TELE
+
 
 COMMON_CSV_FIELDS = [
     "epoch",
@@ -57,6 +75,9 @@ COMMON_CSV_FIELDS = [
     "train_inference_latency_ms_img",
     "train_inference_latency_ms_batch",
     "train_gpu_mem_avg_mb",
+    "train_gpu_mem_peak_mb",
+    "train_energy_j",
+    "train_avg_power_w",
     "val_loss",
     "val_auc",
     "val_precision",
@@ -71,6 +92,9 @@ COMMON_CSV_FIELDS = [
     "val_inference_latency_ms_img",
     "val_inference_latency_ms_batch",
     "val_gpu_mem_avg_mb",
+    "val_gpu_mem_peak_mb",
+    "val_energy_j",
+    "val_avg_power_w",
     "test_loss",
     "test_auc",
     "test_precision",
@@ -85,6 +109,9 @@ COMMON_CSV_FIELDS = [
     "test_inference_latency_ms_img",
     "test_inference_latency_ms_batch",
     "test_gpu_mem_avg_mb",
+    "test_gpu_mem_peak_mb",
+    "test_energy_j",
+    "test_avg_power_w",
     "lr",
     "total_train_time_s",
 ]
@@ -1250,13 +1277,25 @@ def main():
             print(f"[DataLoader] workers(valid)={valid_num_workers}")
 
     model = create_backbone(MODEL_NAME, IMG)
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and os.environ.get("PT_DISABLE_COMPILE", "0") != "1":
+        # NOTA: torch.compile() apenas devolve um wrapper preguiçoso aqui; a
+        # compilação efetiva (TorchInductor -> kernels Triton) só acontece na 1a
+        # passada. Falhas nesse momento (ex.: "libcuda.so cannot found!" quando o
+        # container não tem o symlink libcuda.so -> libcuda.so.1) são suprimidas
+        # pelo dynamo, que cai em EAGER silenciosamente. Para verificar se a
+        # compilação realmente valeu, confira a AUSÊNCIA de "BackendCompilerFailed"
+        # / "libcuda" no log. Use PT_DISABLE_COMPILE=1 para rodar baseline eager.
         try:
-            # Usar reduce-overhead para melhor estabilidade numérica
+            torch._dynamo.config.suppress_errors = True  # não derruba o treino
             model = torch.compile(model, mode="reduce-overhead")
+            if rank == 0:
+                print("[torch.compile] solicitado (mode=reduce-overhead); "
+                      "compilação efetiva ocorre na 1a passada.")
         except Exception as exc:
             if rank == 0:
-                print(f"[WARN] torch.compile falhou; seguindo sem compilar: {exc}")
+                print(f"[WARN] torch.compile indisponível; seguindo em eager: {exc}")
+    elif rank == 0 and os.environ.get("PT_DISABLE_COMPILE", "0") == "1":
+        print("[torch.compile] desativado por PT_DISABLE_COMPILE=1 (eager mode).")
 
     ddp_model = model.to(device)
     core_model = ddp_model
@@ -1492,7 +1531,10 @@ def main():
                     torch.cuda.synchronize(device)
                     allocated_mb = torch.cuda.memory_allocated(device) / (1024 ** 2)
                     reserved_mb = torch.cuda.memory_reserved(device) / (1024 ** 2)
-                    memory_samples_mb.append(max(allocated_mb, reserved_mb))
+                    _used_mb = _gpu_tele().memory_used_mb()
+                    memory_samples_mb.append(
+                        _used_mb if _used_mb is not None else max(allocated_mb, reserved_mb)
+                    )
 
             runtime_profiler.step(stage_name)
             step_idx += 1
@@ -1597,6 +1639,8 @@ def main():
         mixup_alpha_now = mixup_alpha_for_epoch(epoch)
         cutmix_alpha_now = CUTMIX_ALPHA
 
+        _train_scope = EnergyScope(_gpu_tele())
+        _train_scope.start()
         (
             train_loss,
             train_auc,
@@ -1614,6 +1658,9 @@ def main():
             mixup_alpha=mixup_alpha_now,
             cutmix_alpha=cutmix_alpha_now,
         )
+        _train_scope.stop()
+        _val_scope = EnergyScope(_gpu_tele())
+        _val_scope.start()
         (
             val_loss,
             val_auc,
@@ -1627,7 +1674,8 @@ def main():
         ) = run_epoch(
             valid_loader, train=False, epoch_idx=epoch, mixup_alpha=0.0, cutmix_alpha=0.0
         )
-        
+        _val_scope.stop()
+
         if scheduler is not None:
             scheduler.step()
 
@@ -1663,7 +1711,12 @@ def main():
                     "train_avg_batch_time_ms": train_avg_batch_time_ms,
                     "train_inference_latency_ms_img": train_inference_latency_ms_img,
                     "train_inference_latency_ms_batch": train_inference_latency_ms_batch,
-                    "train_gpu_mem_avg_mb": train_mem_avg,
+                    "train_gpu_mem_avg_mb": (
+                        _train_scope.avg_mem_mb if _train_scope.avg_mem_mb is not None else train_mem_avg
+                    ),
+                    "train_gpu_mem_peak_mb": _train_scope.peak_mem_mb,
+                    "train_energy_j": _train_scope.energy_j,
+                    "train_avg_power_w": _train_scope.avg_power_w,
                     "val_loss": val_loss,
                     "val_auc": val_auc,
                     "val_precision": val_epoch_metrics["precision"],
@@ -1677,7 +1730,12 @@ def main():
                     "val_avg_batch_time_ms": val_avg_batch_time_ms,
                     "val_inference_latency_ms_img": val_inference_latency_ms_img,
                     "val_inference_latency_ms_batch": val_inference_latency_ms_batch,
-                    "val_gpu_mem_avg_mb": val_mem_avg,
+                    "val_gpu_mem_avg_mb": (
+                        _val_scope.avg_mem_mb if _val_scope.avg_mem_mb is not None else val_mem_avg
+                    ),
+                    "val_gpu_mem_peak_mb": _val_scope.peak_mem_mb,
+                    "val_energy_j": _val_scope.energy_j,
+                    "val_avg_power_w": _val_scope.avg_power_w,
                     "test_loss": np.nan,
                     "test_auc": np.nan,
                     "test_precision": np.nan,
@@ -1692,6 +1750,9 @@ def main():
                     "test_inference_latency_ms_img": np.nan,
                     "test_inference_latency_ms_batch": np.nan,
                     "test_gpu_mem_avg_mb": np.nan,
+                    "test_gpu_mem_peak_mb": np.nan,
+                    "test_energy_j": np.nan,
+                    "test_avg_power_w": np.nan,
                     "lr": opt.param_groups[0]["lr"],
                     "total_train_time_s": None,
                 }
@@ -1737,6 +1798,8 @@ def main():
                 print(f"[WARN] falha ao aplicar melhor estado em memória: {exc}")
         model_for_eval.eval()
 
+        _test_scope = EnergyScope(_gpu_tele())
+        _test_scope.start()
         y_true = []
         y_score = []
         with torch.no_grad():
@@ -1786,8 +1849,12 @@ def main():
                     if use_cuda and device.type == "cuda":
                         allocated_mb = torch.cuda.memory_allocated(device) / (1024 ** 2)
                         reserved_mb = torch.cuda.memory_reserved(device) / (1024 ** 2)
-                        eval_memory_samples_mb.append(max(allocated_mb, reserved_mb))
+                        _used_mb = _gpu_tele().memory_used_mb()
+                        eval_memory_samples_mb.append(
+                            _used_mb if _used_mb is not None else max(allocated_mb, reserved_mb)
+                        )
                 runtime_profiler.step("eval")
+        _test_scope.stop()
         y_true = np.concatenate(y_true)
         y_score = np.concatenate(y_score)
         auc_val = roc_auc_score(y_true, y_score)
@@ -1864,6 +1931,9 @@ def main():
                 "train_inference_latency_ms_img": np.nan,
                 "train_inference_latency_ms_batch": np.nan,
                 "train_gpu_mem_avg_mb": None,
+                "train_gpu_mem_peak_mb": np.nan,
+                "train_energy_j": np.nan,
+                "train_avg_power_w": np.nan,
                 "val_loss": np.nan,
                 "val_auc": np.nan,
                 "val_precision": np.nan,
@@ -1878,6 +1948,9 @@ def main():
                 "val_inference_latency_ms_img": np.nan,
                 "val_inference_latency_ms_batch": np.nan,
                 "val_gpu_mem_avg_mb": np.nan,
+                "val_gpu_mem_peak_mb": np.nan,
+                "val_energy_j": np.nan,
+                "val_avg_power_w": np.nan,
                 "test_loss": np.nan,
                 "test_auc": auc_val,
                 "test_precision": final_metrics["precision"],
@@ -1891,7 +1964,12 @@ def main():
                 "test_avg_batch_time_ms": val_avg_batch_time_ms,
                 "test_inference_latency_ms_img": test_inference_latency_ms_img,
                 "test_inference_latency_ms_batch": test_inference_latency_ms_batch,
-                "test_gpu_mem_avg_mb": eval_mem_avg,
+                "test_gpu_mem_avg_mb": (
+                    _test_scope.avg_mem_mb if _test_scope.avg_mem_mb is not None else eval_mem_avg
+                ),
+                "test_gpu_mem_peak_mb": _test_scope.peak_mem_mb,
+                "test_energy_j": _test_scope.energy_j,
+                "test_avg_power_w": _test_scope.avg_power_w,
                 "lr": opt.param_groups[0]["lr"],
                 "total_train_time_s": final_elapsed,
             }

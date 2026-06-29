@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=tensorflow_opt
 #SBATCH --nodes=1
-#SBATCH --array=0-9%1
+#SBATCH --array=0-0%0
 #SBATCH --time=04:00:00
 #SBATCH --partition=grace
 #SBATCH --nodelist=grace1

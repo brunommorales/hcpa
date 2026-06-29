@@ -337,7 +337,10 @@ def choose_strategy():
 
 
 def _read_gpu_current_memory_mb():
-    """Retorna a memória GPU corrente em MB, usando a maior GPU visível."""
+    """Retorna a memória GPU corrente em MB. Prefere o uso REAL via NVML."""
+    _used = _gpu_tele().memory_used_mb()
+    if _used is not None:
+        return _used
     try:
         logical_gpus = tf.config.list_logical_devices("GPU")
         currents = []
@@ -387,16 +390,24 @@ class GPUMemoryLogger(keras.callbacks.Callback):
         self.enabled = enabled
         self.train_samples = []
         self.val_samples = []
+        self.power_samples = []
+        self._energy_start_j = None
+        self._tele = _gpu_tele()
 
     def on_epoch_begin(self, epoch, logs=None):
         if self.enabled:
             self.train_samples = []
             self.val_samples = []
+            self.power_samples = []
+            self._energy_start_j = self._tele.energy_j()
 
     def _sample(self, samples):
         current_mb = _read_gpu_current_memory_mb()
         if current_mb is not None:
             samples.append(float(current_mb))
+        _pw = self._tele.power_w()
+        if _pw is not None:
+            self.power_samples.append(_pw)
 
     def on_train_batch_end(self, batch, logs=None):
         if self.enabled:
@@ -414,6 +425,14 @@ class GPUMemoryLogger(keras.callbacks.Callback):
             logs["train_gpu_mem_avg_mb"] = float(np.mean(self.train_samples))
         if self.val_samples:
             logs["val_gpu_mem_avg_mb"] = float(np.mean(self.val_samples))
+        all_mem = self.train_samples + self.val_samples
+        if all_mem:
+            logs["train_gpu_mem_peak_mb"] = float(np.max(all_mem))
+        if self.power_samples:
+            logs["train_avg_power_w"] = float(np.mean(self.power_samples))
+        _e_end = self._tele.energy_j()
+        if self._energy_start_j is not None and _e_end is not None:
+            logs["train_energy_j"] = max(0.0, _e_end - self._energy_start_j)
 
 
 class ExactEvalMetricsLogger(keras.callbacks.Callback):
@@ -513,6 +532,25 @@ def _dataset_cardinality(dataset):
         return None
 
 
+import sys as _sys
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_SELF_DIR = Path(__file__).resolve().parent  # gpu_energy.py vive ao lado do script (robusto ao mount do container)
+for _p in (str(_SELF_DIR), str(_PROJECT_ROOT)):
+    if _p not in _sys.path:
+        _sys.path.insert(0, _p)
+from gpu_energy import GpuTelemetry, EnergyScope
+
+_GPU_TELE = None
+
+
+def _gpu_tele() -> GpuTelemetry:
+    """Singleton lazy de telemetria NVML (energia/potência/memória real)."""
+    global _GPU_TELE
+    if _GPU_TELE is None:
+        _GPU_TELE = GpuTelemetry()
+    return _GPU_TELE
+
+
 COMMON_CSV_FIELDS = [
     "epoch",
     "stage",
@@ -530,6 +568,9 @@ COMMON_CSV_FIELDS = [
     "train_inference_latency_ms_img",
     "train_inference_latency_ms_batch",
     "train_gpu_mem_avg_mb",
+    "train_gpu_mem_peak_mb",
+    "train_energy_j",
+    "train_avg_power_w",
     "val_loss",
     "val_auc",
     "val_precision",
@@ -544,6 +585,9 @@ COMMON_CSV_FIELDS = [
     "val_inference_latency_ms_img",
     "val_inference_latency_ms_batch",
     "val_gpu_mem_avg_mb",
+    "val_gpu_mem_peak_mb",
+    "val_energy_j",
+    "val_avg_power_w",
     "test_loss",
     "test_auc",
     "test_precision",
@@ -558,6 +602,9 @@ COMMON_CSV_FIELDS = [
     "test_inference_latency_ms_img",
     "test_inference_latency_ms_batch",
     "test_gpu_mem_avg_mb",
+    "test_gpu_mem_peak_mb",
+    "test_energy_j",
+    "test_avg_power_w",
     "lr",
     "total_train_time_s",
 ]
@@ -680,6 +727,9 @@ class EpochCsvLogger(keras.callbacks.Callback):
         val_inference_latency_ms_batch = val_avg_batch_time_ms
         train_mem_avg = logs.get("train_gpu_mem_avg_mb")
         val_mem_avg = logs.get("val_gpu_mem_avg_mb")
+        train_mem_peak = logs.get("train_gpu_mem_peak_mb")
+        train_energy_j = logs.get("train_energy_j")
+        train_avg_power_w = logs.get("train_avg_power_w")
 
         row = {
             "epoch": int(epoch),
@@ -698,6 +748,9 @@ class EpochCsvLogger(keras.callbacks.Callback):
             "train_inference_latency_ms_img": None,
             "train_inference_latency_ms_batch": None,
             "train_gpu_mem_avg_mb": train_mem_avg,
+            "train_gpu_mem_peak_mb": train_mem_peak,
+            "train_energy_j": train_energy_j,
+            "train_avg_power_w": train_avg_power_w,
             "val_loss": val_loss,
             "val_auc": val_auc,
             "val_precision": val_precision,
@@ -712,6 +765,9 @@ class EpochCsvLogger(keras.callbacks.Callback):
             "val_inference_latency_ms_img": val_inference_latency_ms_img,
             "val_inference_latency_ms_batch": val_inference_latency_ms_batch,
             "val_gpu_mem_avg_mb": val_mem_avg,
+            "val_gpu_mem_peak_mb": None,
+            "val_energy_j": None,
+            "val_avg_power_w": None,
             "test_loss": None,
             "test_auc": None,
             "test_precision": None,
@@ -726,6 +782,9 @@ class EpochCsvLogger(keras.callbacks.Callback):
             "test_inference_latency_ms_img": None,
             "test_inference_latency_ms_batch": None,
             "test_gpu_mem_avg_mb": None,
+            "test_gpu_mem_peak_mb": None,
+            "test_energy_j": None,
+            "test_avg_power_w": None,
             "lr": self._resolve_lr(),
             "total_train_time_s": None,
         }
@@ -1203,6 +1262,8 @@ def main():
     y_true = []
     y_score = []
     eval_predict_start = time.time()
+    _test_scope = EnergyScope(_gpu_tele())
+    _test_scope.start()
     eval_batches = 0
     eval_inference_time_s = 0.0
     eval_memory_samples_mb = []
@@ -1217,6 +1278,7 @@ def main():
         current_mem = _read_gpu_current_memory_mb()
         if current_mem is not None:
             eval_memory_samples_mb.append(float(current_mem))
+    _test_scope.stop()
     eval_predict_elapsed = time.time() - eval_predict_start
     y_true = np.concatenate(y_true)
     y_score = np.concatenate(y_score)
@@ -1273,6 +1335,9 @@ def main():
         "train_inference_latency_ms_img": None,
         "train_inference_latency_ms_batch": None,
         "train_gpu_mem_avg_mb": None,
+        "train_gpu_mem_peak_mb": None,
+        "train_energy_j": None,
+        "train_avg_power_w": None,
         "val_loss": None,
         "val_auc": None,
         "val_precision": None,
@@ -1287,6 +1352,9 @@ def main():
         "val_inference_latency_ms_img": None,
         "val_inference_latency_ms_batch": None,
         "val_gpu_mem_avg_mb": None,
+        "val_gpu_mem_peak_mb": None,
+        "val_energy_j": None,
+        "val_avg_power_w": None,
         "test_loss": None,
         "test_auc": auc_val,
         "test_precision": final_metrics["precision"],
@@ -1300,7 +1368,12 @@ def main():
         "test_avg_batch_time_ms": (eval_predict_elapsed / max(eval_batches, 1)) * 1000.0 if eval_batches > 0 else None,
         "test_inference_latency_ms_img": test_inference_latency_ms_img,
         "test_inference_latency_ms_batch": test_inference_latency_ms_batch,
-        "test_gpu_mem_avg_mb": test_gpu_mem_avg_mb,
+        "test_gpu_mem_avg_mb": (
+            _test_scope.avg_mem_mb if _test_scope.avg_mem_mb is not None else test_gpu_mem_avg_mb
+        ),
+        "test_gpu_mem_peak_mb": _test_scope.peak_mem_mb,
+        "test_energy_j": _test_scope.energy_j,
+        "test_avg_power_w": _test_scope.avg_power_w,
         "lr": None,
         "total_train_time_s": elapsed,
     }

@@ -4,8 +4,8 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-task=1
 #SBATCH --cpus-per-task=8
-#SBATCH --array=0-9%1
-#SBATCH --time=08:00:00
+#SBATCH --array=0-1%1
+#SBATCH --time=04:00:00
 #SBATCH --partition=grace
 #SBATCH --output=logs/%x_%j_%N.out
 #SBATCH --error=logs/%x_%j_%N.err

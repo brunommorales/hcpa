@@ -23,9 +23,20 @@ From: nvcr.io/nvidia/pytorch:24.11-py3
     python -m pip install -r /opt/requirements-ngc.txt ${C}
     # Enable DALI if/when needed:
     # python -m pip install --extra-index-url https://developer.download.nvidia.com/compute/redist nvidia-dali-cuda120
+    # gpu_energy.py precisa do modulo pynvml; instala so se faltar (conflict-proof)
+    python -c "import pynvml" 2>/dev/null || python -m pip install nvidia-ml-py
     rm -rf /root/.cache/pip
     mkdir -p /workspace
     chmod 777 /workspace
+    # Fix torch.compile/TorchInductor: o backend Inductor compila kernels Triton e
+    # exige libcuda.so, mas a imagem NGC traz apenas libcuda.so.1 em compat/lib.
+    # Sem este symlink, torch.compile falha com "libcuda.so cannot found!" e cai
+    # silenciosamente em eager mode (anulando a otimizacao por compilacao).
+    for d in /usr/local/cuda/compat/lib /usr/local/cuda/lib64/stubs; do
+        if [ -f "$d/libcuda.so.1" ] && [ ! -e "$d/libcuda.so" ]; then
+            ln -s "$d/libcuda.so.1" "$d/libcuda.so"
+        fi
+    done
 
 %environment
     export KERAS_BACKEND=torch

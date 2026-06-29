@@ -61,6 +61,12 @@ def get_args() -> argparse.Namespace:
         help="Treinar backbone e head",
     )
     parser.set_defaults(freeze_backbone=False)
+    parser.add_argument(
+        "--freeze_epochs",
+        type=int,
+        default=0,
+        help="LP-FT: numero de epocas com backbone congelado antes de descongelar (0=desativado)",
+    )
 
     parser.add_argument("--epochs", type=int, default=200, help="Numero de epocas")
     parser.add_argument("--lrate", type=float, default=5e-5, help="Learning rate inicial")
