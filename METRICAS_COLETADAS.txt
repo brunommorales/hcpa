@@ -1,0 +1,198 @@
+================================================================================
+  MÉTRICAS COLETADAS NO ESTUDO HCPA — o que cada uma faz, como é coletada,
+  e se a forma de coleta é a correta.
+  (documento de referência — atualizado 2026-07-08)
+================================================================================
+
+COMO LER: cada métrica tem 3 linhas:
+  • O QUE É   -> explicação simples.
+  • COMO      -> de onde o número vem (função de hardware ou cálculo).
+  • CORRETO?  -> se é a melhor forma de medir, com ressalvas honestas.
+
+Existem 4 FONTES de dados:
+  (1) NVML   = telemetria de hardware da GPU NVIDIA (energia, potência, uso...).
+  (2) TIMER  = relógio do computador (tempo de parede).
+  (3) MODELO = as previsões da rede vs. os rótulos (métricas clínicas).
+  (4) DERIVADA = calculada a partir das outras, depois (não é "medida").
+
+Regra de ouro: SÓ medimos a FASE DE TREINO (o forward+backward). Validação,
+salvamento de checkpoint e leitura de disco NÃO entram na energia nem no tempo
+de treino. A validação é medida à parte.
+
+
+================================================================================
+  MÉTRICAS CLÍNICAS  (fonte: MODELO — não usam hardware)
+================================================================================
+Todas saem da comparação entre a probabilidade prevista e o rótulo real, no
+limiar (threshold) padrão de 0.5. São contagens de acertos/erros (TP, FP, TN, FN).
+
+AUC
+  • O QUE É : o quão bem o modelo separa doente de não-doente, considerando
+             TODOS os limiares. 1.0 = perfeito, 0.5 = chute.
+  • COMO    : roc_auc_score / compute_auc sobre (previsões, rótulos).
+  • CORRETO?: Sim. É a medida padrão de discriminação; independe de limiar.
+
+PRECISION (precisão)
+  • O QUE É : dos que o modelo disse "doente", quantos eram mesmo. TP/(TP+FP).
+  • COMO    : contagem de confusão no limiar 0.5.
+  • CORRETO?: Sim.
+
+SENS (sensibilidade = recall)
+  • O QUE É : dos doentes reais, quantos o modelo pegou. TP/(TP+FN).
+  • COMO    : contagem de confusão no limiar 0.5.
+  • CORRETO?: Sim. (Obs.: "recall" foi removido por ser o MESMO número — evita
+             coluna duplicada.)
+
+SPEC (especificidade)
+  • O QUE É : dos saudáveis reais, quantos o modelo deixou passar como saudáveis.
+             TN/(TN+FP). Coletada SEMPRE, toda época, no limiar 0.5.
+  • COMO    : contagem de confusão no limiar 0.5.
+  • CORRETO?: Sim, e foi CORRIGIDA: antes o código gravava aqui, por engano, a
+             especificidade em 95% de sensibilidade (por isso parecia duplicada).
+             Agora é a especificidade "de verdade" no limiar 0.5.
+
+F1
+  • O QUE É : média harmônica de precisão e sensibilidade (equilíbrio das duas).
+  • COMO    : 2*TP/(2*TP+FP+FN) no limiar 0.5.
+  • CORRETO?: Sim.
+
+SPEC_AT_SENS95  (especificidade em 95% de sensibilidade)  [DERIVADA]
+  • O QUE É : a especificidade no ponto de operação clínico onde a sensibilidade
+             é 95% (rastreio precisa pegar quase todos os doentes). É a métrica
+             que aparece nos GRÁFICOS.
+  • COMO    : NÃO é coletada. É derivada depois, no script de gráficos, a partir
+             da curva ROC completa que já salvamos por run (*-thresholds.csv, que
+             tem sensibilidade e especificidade em cada limiar): pega-se o ponto
+             onde a sensibilidade cruza 95% e lê-se a especificidade ali.
+  • CORRETO?: Sim. Validado: o valor derivado bate EXATAMENTE com o que era
+             gravado antes (diferença 0.0000). Coletar só 'spec' e derivar este
+             no gráfico evita guardar duas colunas de especificidade.
+
+
+================================================================================
+  MÉTRICAS DE ENERGIA E POTÊNCIA  (fonte: NVML — hardware da GPU)
+================================================================================
+ENERGY_J  (energia, em Joules)
+  • O QUE É : a energia elétrica que a GPU gastou DURANTE O TREINO da época.
+             É o número central do estudo (eficiência energética).
+  • COMO    : função nvmlDeviceGetTotalEnergyConsumption — um CONTADOR de
+             hardware que soma energia continuamente. Lemos ele no começo do
+             treino e na fronteira treino->validação; a diferença é a energia só
+             do treino ("kernel-only", sem a validação).
+  • CORRETO?: Sim — é a MELHOR forma que existe. O contador é exato (integra a
+             potência a cada instante) e mede só a GPU. Adicionamos um
+             "synchronize" antes de ler para a borda ser limpa.
+             RESSALVA: ele mede a energia da GPU durante o treino, o que inclui o
+             consumo de base (idle) nos micro-instantes em que a GPU espera a CPU.
+             Isolar "só quando o kernel roda" exigiria CUPTI/Nsight (fora do
+             escopo). A CONFIRMAR no hardware GH200: que o contador é do módulo
+             Hopper (GPU) e não inclui a CPU Grace (script tools/
+             g5k_energy_domain_check.py faz esse teste no smoke-test).
+
+AVG_POWER_W  (potência média, em Watts)
+  • O QUE É : a "força" elétrica média puxada pela GPU durante o treino.
+  • COMO    : função nvmlDeviceGetPowerUsage, amostrada várias vezes e tirada a
+             média.
+  • CORRETO?: Correto, mas é SECUNDÁRIO. A potência BOA de reportar é a DERIVADA
+             (energia ÷ tempo), que é exata por construção. A amostrada serve de
+             conferência; ela pode subestimar picos.
+
+
+================================================================================
+  MÉTRICAS DE UTILIZAÇÃO  (fonte: NVML — hardware da GPU)
+================================================================================
+GPU_UTIL_PCT  (utilização de compute, %)
+  • O QUE É : a fração do tempo em que a GPU estava DE FATO rodando kernel
+             (calculando). Baixo = GPU parada esperando a CPU/dados.
+  • COMO    : função nvmlDeviceGetUtilizationRates, campo .gpu. Amostrada no
+             treino, tira-se a média.
+  • CORRETO?: É o padrão pragmático. RESSALVA: é uma medida GROSSA (o driver já
+             agrega numa janela interna ~1s). Serve muito bem para a média por
+             época; para precisão fina de kernel seria preciso CUPTI/DCGM.
+
+MEM_UTIL_PCT  (utilização de banda de memória, %)
+  • O QUE É : a fração do tempo em que a memória da GPU estava lendo/escrevendo.
+             Ajuda a diagnosticar o gargalo:
+               util alto + mem alto  = GPU saturada (saudável)
+               util alto + mem baixo = presa em cálculo (compute-bound)
+               util baixo + mem alto = presa em memória (memory-bound)
+               util baixo + mem baixo= faminta, esperando a CPU (host-bound)
+  • COMO    : MESMA função nvmlDeviceGetUtilizationRates, campo .memory (vem no
+             mesmo call do gpu_util, custo zero extra).
+  • CORRETO?: Sim. ATENÇÃO: isto NÃO é "quanto de memória foi usado" (isso é a
+             métrica de memória abaixo) — é atividade do barramento.
+
+
+================================================================================
+  MÉTRICA DE MEMÓRIA  (fonte: NVML — hardware da GPU)
+================================================================================
+GPU_MEM_PEAK_MB  (pico de memória usada, em MB)
+  • O QUE É : quanto de memória da GPU a abordagem exige (o footprint real).
+             Usamos o PICO, não a média.
+  • COMO    : função nvmlDeviceGetMemoryInfo, campo .used. Amostrada, guarda-se o
+             máximo.
+  • CORRETO?: Sim, é a forma justa para comparar frameworks (mede a ocupação real
+             do device com o mesmo critério para todos). Usamos o PICO de
+             propósito: a MÉDIA sofreria "efeito de subutilização" (diluiria os
+             momentos de warmup e subestimaria a necessidade real) — por isso a
+             coluna de média foi removida.
+             RESSALVA: com "caching allocator" (PyTorch/TF), o .used reflete o que
+             o framework RESERVOU (>= o que os tensores realmente precisam), mas
+             essa é a ocupação real do device.
+
+
+================================================================================
+  MÉTRICAS DE TEMPO  (fonte: TIMER — relógio de parede)
+================================================================================
+ELAPSED_S  (tempo da fase de treino, em segundos)
+  • O QUE É : quanto tempo durou o treino da época (só forward+backward).
+  • COMO    : relógio time.perf_counter em volta do laço de treino.
+  • CORRETO?: Sim para "tempo da fase de treino". RESSALVA: é tempo de parede —
+             inclui os micro-instantes em que a GPU espera a CPU/dados dentro do
+             step. Para o tempo SÓ da GPU, ver BUSY_TIME_S.
+
+AVG_BATCH_TIME_MS  (tempo médio por passo, em ms)
+  • O QUE É : quanto demora, em média, processar um batch.
+  • COMO    : elapsed_s ÷ número de passos.
+  • CORRETO?: Sim (é uma conta simples do tempo de treino).
+
+THROUGHPUT_IMG_S  (vazão, imagens por segundo)
+  • O QUE É : quantas imagens a abordagem processa por segundo no treino.
+  • COMO    : número de imagens ÷ elapsed_s.
+  • CORRETO?: Sim.
+
+BUSY_TIME_S  (tempo GPU-ativa, em segundos)  [DERIVADA]
+  • O QUE É : do tempo de treino, quanto a GPU REALMENTE trabalhou (tirando a
+             ociosidade/espera de CPU). É o "tempo real de uso da GPU".
+  • COMO    : elapsed_s x (gpu_util/100).
+  • CORRETO?: Sim como ESTIMATIVA. É derivado do gpu_util (NVML), que é grosso;
+             a diferença (elapsed - busy) é o tempo perdido esperando a CPU.
+
+
+================================================================================
+  MÉTRICAS AGREGADAS POR RUN  (fonte: DERIVADA — calculadas no make_plots)
+================================================================================
+TRAIN_COMPUTE_S    : soma dos elapsed_s de todas as épocas = tempo total de
+                     GPU-treino do run (sem validação/IO). Comparação justa.
+TOTAL_TIME_S       : tempo de parede do JOB INTEIRO (inclui tudo: validação,
+                     compilação, checkpoint, IO). NÃO é só treino — é o custo
+                     ponta-a-ponta.
+TOTAL_ENERGY_KJ    : soma das energias de treino por época (em kJ).
+AVG_POWER_DERIVED_W: energia total ÷ tempo total. Potência exata por construção
+                     (potência x tempo = energia). Preferida à amostrada.
+BEST_AUC_EPOCH     : a época em que a AUC de validação foi máxima (convergência).
+
+
+================================================================================
+  RESUMO DA QUALIDADE DA COLETA
+================================================================================
+• Energia .......... contador de hardware exato (melhor opção que existe).
+• Memória (pico) ... device real via NVML (justo entre frameworks).
+• Clínicas ......... cálculo exato das previsões.
+• Potência ......... a DERIVADA (energia/tempo) é a exata; a amostrada é conferência.
+• Utilização ....... padrão pragmático (NVML); grosso, ótimo para médias por época.
+• Tempo ............ de parede da fase de treino; busy_time isola a parte GPU-ativa.
+• Borda das medições sincronizada (torch.cuda.synchronize) para não cortar kernels.
+• A CONFIRMAR no GH200: que a energia é do módulo Hopper (GPU) e não da Grace (CPU)
+  — teste em tools/g5k_energy_domain_check.py, rodar no smoke-test.
+================================================================================

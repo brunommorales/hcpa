@@ -130,14 +130,15 @@ def compute_binary_metrics(y_true: np.ndarray, y_score: np.ndarray, threshold: f
     fp = np.sum((preds == 1) & (y_true == 0))
     precision = tp / (tp + fp + 1e-8)
     recall = tp / (tp + fn + 1e-8)
-    specificity = specificity_at_sensitivity(y_true, y_score)
+    specificity = tn / (tn + fp + 1e-8)  # especificidade no threshold (0.5)
+    specificity_95 = specificity_at_sensitivity(y_true, y_score)  # spec @95% sens
     f1 = (2.0 * tp) / (2.0 * tp + fp + fn + 1e-8)
     return {
         "precision": float(precision),
         "recall": float(recall),
         "sensitivity": float(recall),
         "specificity": float(specificity),
-        "specificity_at_sens95": float(specificity),
+        "specificity_at_sens95": float(specificity_95),
         "f1": float(f1),
     }
 
@@ -391,7 +392,10 @@ class GPUMemoryLogger(keras.callbacks.Callback):
         self.train_samples = []
         self.val_samples = []
         self.power_samples = []
+        self.util_samples = []            # util% da GPU (só na fase de treino)
+        self.mem_util_samples = []        # util% de banda de memória (só treino)
         self._energy_start_j = None
+        self._train_end_energy_j = None   # energia no fim do treino (fronteira on_test_begin)
         self._tele = _gpu_tele()
 
     def on_epoch_begin(self, epoch, logs=None):
@@ -399,6 +403,9 @@ class GPUMemoryLogger(keras.callbacks.Callback):
             self.train_samples = []
             self.val_samples = []
             self.power_samples = []
+            self.util_samples = []
+            self._train_end_energy_j = None
+            self.mem_util_samples = []
             self._energy_start_j = self._tele.energy_j()
 
     def _sample(self, samples):
@@ -408,6 +415,13 @@ class GPUMemoryLogger(keras.callbacks.Callback):
         _pw = self._tele.power_w()
         if _pw is not None:
             self.power_samples.append(_pw)
+        if samples is self.train_samples:   # util SÓ na fase de treino
+            _u = self._tele.util_pct()
+            if _u is not None:
+                self.util_samples.append(_u)
+            _mu = self._tele.mem_util_pct()
+            if _mu is not None:
+                self.mem_util_samples.append(_mu)
 
     def on_train_batch_end(self, batch, logs=None):
         if self.enabled:
@@ -416,6 +430,12 @@ class GPUMemoryLogger(keras.callbacks.Callback):
     def on_test_batch_end(self, batch, logs=None):
         if self.enabled:
             self._sample(self.val_samples)
+
+    def on_test_begin(self, logs=None):
+        # Fronteira treino->validação: energia acumulada ao FIM do treino, para que
+        # train_energy_j seja KERNEL-ONLY de treino (exclui a validação da janela).
+        if self.enabled and self._energy_start_j is not None:
+            self._train_end_energy_j = self._tele.energy_j()
 
     def on_epoch_end(self, epoch, logs=None):
         if not self.enabled:
@@ -430,9 +450,16 @@ class GPUMemoryLogger(keras.callbacks.Callback):
             logs["train_gpu_mem_peak_mb"] = float(np.max(all_mem))
         if self.power_samples:
             logs["train_avg_power_w"] = float(np.mean(self.power_samples))
+        if self.util_samples:
+            logs["train_gpu_util_pct"] = float(np.mean(self.util_samples))
+        if self.mem_util_samples:
+            logs["train_mem_util_pct"] = float(np.mean(self.mem_util_samples))
         _e_end = self._tele.energy_j()
-        if self._energy_start_j is not None and _e_end is not None:
-            logs["train_energy_j"] = max(0.0, _e_end - self._energy_start_j)
+        # KERNEL-ONLY: se houve validação, usa a energia até on_test_begin (só treino);
+        # senão, o fim da época já é só treino.
+        _e_train_end = self._train_end_energy_j if self._train_end_energy_j is not None else _e_end
+        if self._energy_start_j is not None and _e_train_end is not None:
+            logs["train_energy_j"] = max(0.0, _e_train_end - self._energy_start_j)
 
 
 class ExactEvalMetricsLogger(keras.callbacks.Callback):
@@ -557,51 +584,39 @@ COMMON_CSV_FIELDS = [
     "train_loss",
     "train_auc",
     "train_precision",
-    "train_recall",
     "train_f1",
     "train_sens",
     "train_spec",
-    "train_spec_at_sens95",
     "train_throughput_img_s",
     "train_elapsed_s",
     "train_avg_batch_time_ms",
-    "train_inference_latency_ms_img",
-    "train_inference_latency_ms_batch",
-    "train_gpu_mem_avg_mb",
     "train_gpu_mem_peak_mb",
     "train_energy_j",
     "train_avg_power_w",
+    "train_gpu_util_pct",
+    "train_mem_util_pct",
+    "train_busy_time_s",
     "val_loss",
     "val_auc",
     "val_precision",
-    "val_recall",
     "val_f1",
     "val_sens",
     "val_spec",
-    "val_spec_at_sens95",
     "val_throughput_img_s",
     "val_elapsed_s",
     "val_avg_batch_time_ms",
-    "val_inference_latency_ms_img",
-    "val_inference_latency_ms_batch",
-    "val_gpu_mem_avg_mb",
     "val_gpu_mem_peak_mb",
     "val_energy_j",
     "val_avg_power_w",
     "test_loss",
     "test_auc",
     "test_precision",
-    "test_recall",
     "test_f1",
     "test_sens",
     "test_spec",
-    "test_spec_at_sens95",
     "test_throughput_img_s",
     "test_elapsed_s",
     "test_avg_batch_time_ms",
-    "test_inference_latency_ms_img",
-    "test_inference_latency_ms_batch",
-    "test_gpu_mem_avg_mb",
     "test_gpu_mem_peak_mb",
     "test_energy_j",
     "test_avg_power_w",
@@ -634,7 +649,7 @@ class EpochCsvLogger(keras.callbacks.Callback):
         mode = "a" if self.append and self.csv_path.exists() else "w"
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
         self._file = self.csv_path.open(mode, newline="", encoding="utf-8")
-        self._writer = csv.DictWriter(self._file, fieldnames=self._fields)
+        self._writer = csv.DictWriter(self._file, fieldnames=self._fields, extrasaction="ignore")
         if self._file.tell() == 0:
             self._writer.writeheader()
             self._file.flush()
@@ -730,6 +745,13 @@ class EpochCsvLogger(keras.callbacks.Callback):
         train_mem_peak = logs.get("train_gpu_mem_peak_mb")
         train_energy_j = logs.get("train_energy_j")
         train_avg_power_w = logs.get("train_avg_power_w")
+        train_gpu_util_pct = logs.get("train_gpu_util_pct")
+        train_mem_util_pct = logs.get("train_mem_util_pct")
+        # tempo GPU-ATIVA (kernel-only) = tempo de treino x util/100 (remove ociosidade/CPU)
+        train_busy_time_s = (
+            self._train_elapsed * (train_gpu_util_pct / 100.0)
+            if (train_gpu_util_pct is not None and self._train_elapsed > 0) else None
+        )
 
         row = {
             "epoch": int(epoch),
@@ -751,6 +773,9 @@ class EpochCsvLogger(keras.callbacks.Callback):
             "train_gpu_mem_peak_mb": train_mem_peak,
             "train_energy_j": train_energy_j,
             "train_avg_power_w": train_avg_power_w,
+            "train_gpu_util_pct": train_gpu_util_pct,
+            "train_mem_util_pct": train_mem_util_pct,
+            "train_busy_time_s": train_busy_time_s,
             "val_loss": val_loss,
             "val_auc": val_auc,
             "val_precision": val_precision,
@@ -1379,7 +1404,7 @@ def main():
     }
     try:
         with csv_path.open("a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=EpochCsvLogger._fields)
+            writer = csv.DictWriter(f, fieldnames=EpochCsvLogger._fields, extrasaction="ignore")
             if f.tell() == 0:
                 writer.writeheader()
             writer.writerow(final_row)

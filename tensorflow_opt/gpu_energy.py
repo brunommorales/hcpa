@@ -137,6 +137,29 @@ class GpuTelemetry:
         except Exception:
             return None
 
+    def util_pct(self):
+        """Utilização do núcleo GPU em % (0-100), via nvmlDeviceGetUtilizationRates.
+        É a fração do intervalo em que houve >=1 kernel executando. Serve para
+        separar tempo GPU-ativo de tempo host/CPU (GPU ociosa). None se indisponível."""
+        if self._h is None:
+            return None
+        try:
+            return float(_nvml.nvmlDeviceGetUtilizationRates(self._h).gpu)
+        except Exception:
+            return None
+
+    def mem_util_pct(self):
+        """Utilização de BANDA de memória em % (0-100) — nvmlDeviceGetUtilizationRates().memory.
+        É o % do tempo em que o controlador de memória esteve lendo/escrevendo. NÃO é
+        ocupação (MB) — para MB use memory_used_mb(). Serve para diagnosticar
+        memory-bound (mem_util alto) vs compute-bound vs faminta/host-bound (ambos baixos)."""
+        if self._h is None:
+            return None
+        try:
+            return float(_nvml.nvmlDeviceGetUtilizationRates(self._h).memory)
+        except Exception:
+            return None
+
     def memory_used_mb(self):
         """Uso REAL de memória do device (MB). Em nó exclusivo = footprint do processo."""
         if self._h is None:
@@ -160,18 +183,46 @@ class GpuTelemetry:
         return None
 
 
+def _effective_interval(passed: float) -> float:
+    """Intervalo efetivo de amostragem (s). A env var HCPA_GPU_SAMPLE_MS, se definida,
+    SOBREPÕE qualquer valor passado — uma única manopla para toda a telemetria.
+
+    Regra de projeto: a amostragem deve ser <= ~10% do tempo de um step de kernel
+    para resolver potência/util no nível do step. Para o step estável mais rápido
+    (~25 ms), isso é ~2.5 ms. Ex.: `export HCPA_GPU_SAMPLE_MS=2`.
+
+    IMPORTANTE: (1) NÃO afeta a energia — o contador NVML é integrado em HW e exato
+    independentemente do intervalo; só melhora a média/pico de potência/util.
+    (2) nvmlDeviceGetUtilizationRates tem janela interna própria de agregação
+    (dependente do device); intervalos muito finos re-amostram o mesmo valor —
+    resolução por-kernel real exige CUDA events/CUPTI, não NVML.
+    (3) Efeito observador: intervalos muito finos adicionam carga de CPU que pode
+    perturbar o próprio step — validar overhead no smoke-test."""
+    ov = os.environ.get("HCPA_GPU_SAMPLE_MS")
+    if ov:
+        try:
+            v = float(ov) / 1000.0
+            if v > 0:
+                return v
+        except Exception:
+            pass
+    return passed
+
+
 class _Sampler(threading.Thread):
-    """Amostra potência e memória real em background, guardando as séries."""
+    """Amostra potência, memória real e utilização em background, guardando as séries."""
 
     def __init__(self, tele: GpuTelemetry, interval: float = 0.2):
         super().__init__(daemon=True)
         self._tele = tele
-        self._interval = interval
+        self._interval = _effective_interval(interval)
         # NÃO usar self._stop: threading.Thread já tem um método interno _stop()
         # (chamado por join()/_after_fork); sobrescrevê-lo quebra o join.
         self._stop_event = threading.Event()
         self.mem_samples = []
         self.power_samples = []
+        self.util_samples = []
+        self.mem_util_samples = []
 
     def run(self):
         while not self._stop_event.is_set():
@@ -181,10 +232,29 @@ class _Sampler(threading.Thread):
             p = self._tele.power_w()
             if p is not None:
                 self.power_samples.append(p)
+            u = self._tele.util_pct()
+            if u is not None:
+                self.util_samples.append(u)
+            mu = self._tele.mem_util_pct()
+            if mu is not None:
+                self.mem_util_samples.append(mu)
             self._stop_event.wait(self._interval)
 
     def stop(self):
         self._stop_event.set()
+
+
+def _cuda_sync():
+    """Sincroniza a GPU (torch) antes de ler energia/tempo, para a fronteira da
+    medição refletir o trabalho de fato CONCLUÍDO (CUDA é assíncrono). Só age se o
+    torch já estiver usando CUDA (processos PyTorch); em processos TF (torch.cuda não
+    inicializado) é no-op — no TF a fronteira on_test_begin já é sincronizada pelo Keras."""
+    try:
+        import torch
+        if torch.cuda.is_available() and torch.cuda.is_initialized():
+            torch.cuda.synchronize()
+    except Exception:
+        pass
 
 
 class EnergyScope:
@@ -212,6 +282,11 @@ class EnergyScope:
         self.avg_power_w = None
         self.peak_power_w = None
         self.elapsed_s = None
+        self.avg_util_pct = None       # utilização média de COMPUTE da GPU no intervalo (0-100)
+        self.peak_util_pct = None
+        self.avg_mem_util_pct = None   # utilização média de BANDA de memória (0-100)
+        self.peak_mem_util_pct = None
+        self.busy_time_s = None        # tempo GPU-ATIVA = elapsed_s * avg_util_pct/100 (tira ociosidade/CPU)
         self._e0 = None
         self._t0 = None
         self._sampler = None
@@ -225,6 +300,7 @@ class EnergyScope:
         return self.__exit__(None, None, None)
 
     def __enter__(self):
+        _cuda_sync()   # borda limpa: garante que o trabalho anterior terminou
         self._t0 = time.perf_counter()
         self._e0 = self.tele.energy_j()
         if self._bg and self.tele.available:
@@ -233,6 +309,7 @@ class EnergyScope:
         return self
 
     def __exit__(self, *exc):
+        _cuda_sync()   # borda limpa: garante que os kernels da região terminaram
         self.elapsed_s = time.perf_counter() - self._t0
         e1 = self.tele.energy_j()
         if self._e0 is not None and e1 is not None:
@@ -246,9 +323,18 @@ class EnergyScope:
             if self._sampler.power_samples:
                 self.peak_power_w = max(self._sampler.power_samples)
                 self.avg_power_w = sum(self._sampler.power_samples) / len(self._sampler.power_samples)
+            if self._sampler.util_samples:
+                self.peak_util_pct = max(self._sampler.util_samples)
+                self.avg_util_pct = sum(self._sampler.util_samples) / len(self._sampler.util_samples)
+            if self._sampler.mem_util_samples:
+                self.peak_mem_util_pct = max(self._sampler.mem_util_samples)
+                self.avg_mem_util_pct = sum(self._sampler.mem_util_samples) / len(self._sampler.mem_util_samples)
         # Fallback de energia: integrar potência média × tempo, se o contador faltar.
         if self.energy_j is None and self.avg_power_w is not None and self.elapsed_s:
             self.energy_j = self.avg_power_w * self.elapsed_s
+        # Tempo GPU-ATIVA (kernel-only): remove a ociosidade/espera-CPU do tempo de parede.
+        if self.avg_util_pct is not None and self.elapsed_s is not None:
+            self.busy_time_s = self.elapsed_s * (self.avg_util_pct / 100.0)
         return False
 
 
@@ -272,6 +358,9 @@ def make_keras_energy_callback(telemetry: GpuTelemetry | None = None,
             self.train_avg_mem_mb = None
             self.train_avg_power_w = None
             self.train_peak_power_w = None
+            self.train_avg_util_pct = None
+            self.train_peak_util_pct = None
+            self.train_busy_time_s = None
             self._scope = None
 
         def on_train_begin(self, logs=None):
@@ -286,5 +375,8 @@ def make_keras_energy_callback(telemetry: GpuTelemetry | None = None,
                 self.train_avg_mem_mb = self._scope.avg_mem_mb
                 self.train_avg_power_w = self._scope.avg_power_w
                 self.train_peak_power_w = self._scope.peak_power_w
+                self.train_avg_util_pct = self._scope.avg_util_pct
+                self.train_peak_util_pct = self._scope.peak_util_pct
+                self.train_busy_time_s = self._scope.busy_time_s
 
     return _EnergyCallback()

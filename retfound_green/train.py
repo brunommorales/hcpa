@@ -211,6 +211,8 @@ def run_epoch(
     num_batches = 0
     memory_samples_mb = []
     power_samples_w = []
+    util_samples_pct = []
+    mem_util_samples_pct = []
     _tele = _gpu_tele()
     inference_time_s = 0.0
     inference_batches = 0
@@ -322,6 +324,12 @@ def run_epoch(
                 _pw = _tele.power_w()
                 if _pw is not None:
                     power_samples_w.append(_pw)
+                _u = _tele.util_pct()
+                if _u is not None:
+                    util_samples_pct.append(_u)
+                _mu = _tele.mem_util_pct()
+                if _mu is not None:
+                    mem_util_samples_pct.append(_mu)
 
         if runtime_profiler:
             runtime_profiler.step(stage_name)
@@ -414,6 +422,17 @@ def run_epoch(
     epoch_profile["memory_peak_mb"] = max(memory_samples_mb) if memory_samples_mb else float("nan")
     epoch_profile["avg_power_w"] = (
         sum(power_samples_w) / len(power_samples_w) if power_samples_w else float("nan")
+    )
+    epoch_profile["gpu_util_pct"] = (
+        sum(util_samples_pct) / len(util_samples_pct) if util_samples_pct else float("nan")
+    )
+    epoch_profile["mem_util_pct"] = (
+        sum(mem_util_samples_pct) / len(mem_util_samples_pct) if mem_util_samples_pct else float("nan")
+    )
+    # tempo GPU-ATIVA (kernel-only) = tempo da época x util/100 (remove ociosidade/CPU)
+    epoch_profile["busy_time_s"] = (
+        epoch_profile["epoch_time"] * epoch_profile["gpu_util_pct"] / 100.0
+        if util_samples_pct else float("nan")
     )
     results = {
         "loss": avg_loss,

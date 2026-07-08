@@ -1,0 +1,41 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+.cache/
+
+# --- Ambientes virtuais ---
+env/
+env_graph/
+venv/
+.venv/
+
+# --- Dados / datasets ---
+data/
+*.tfrec
+*.tfrec.idx
+
+# --- Containers ---
+*.sif
+
+# --- Saidas de treino (regeneraveis) ---
+**/results/
+**/logs/
+**/checkpoints/
+**/models/
+*.pt
+*.ckpt
+.g5k_run_scripts/
+
+# --- Resultados/figuras da bateria (dados, nao codigo) ---
+new_results/nvidia-*/
+new_results/comparison/
+new_results/checkpoints/
+new_results/models/
+
+# --- Backups / saidas soltas ---
+_backup_regressed_*/
+clean_hcpa_pytorch/
+*.bak
+*.bak_pre_exclude
+batch96_*.csv
+copy_sdd.sh
