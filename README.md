@@ -86,14 +86,33 @@ sequence of tokens into a Transformer encoder.
 | `tensorflow_opt` | ✓ | flag | flag | — | — | ✓ | — | ✓ Cosine+WU |
 | `pytorch_base` | — | — | — | — | — | — | — | — |
 | `pytorch_opt` | ✓ | ✓ | — | — | ✓ | ✓ | — | ✓ Cosine+WU |
-| `hybrid_simple` | flag | — | — | — | flag | — | — | flag |
-| `hybrid_token_reduction` | ✓ | — | — | — | — | — | ✓ 50% | ✓ Cosine+WU |
-| `hybrid_token_reduction_opt` | ✓ bf16 | — | ✓ | ✓ | ✓ | ✓ | ✓ 50%+WU | ✓ Cosine+WU |
+| `hybrid_simple` | — | — | — | — | — | — | — | — |
+| `hybrid_token_reduction` | — | — | — | — | — | — | ✓ 50% | — |
+| `hybrid_token_reduction_opt` | ✓ bf16 | — | ✓ | — | — | — | ✓ 50%+WU | ✓ Cosine+WU |
 | `retfound_green` | ✓ | — | — | — | ✓ | — | — | ✓ Cosine+WU |
 | `vit_pure` | ✓ | — | — | flag | ✓ | — | — | ✓ Cosine+WU |
 
 **Legend:** `✓` = enabled by default · `flag` = available via CLI argument · `—` = not implemented  
 **WU** = linear warmup · **bf16** = BFloat16 preferred over FP16
+
+Every switch above is a launcher default and can be overridden per run through an
+environment variable (`ENABLE_AMP`, `ENABLE_COSINE`, `ENABLE_MIXUP_CUTMIX`,
+`ENABLE_FLASH_ATTENTION`, `KEEP_RATIO`, …), so a configuration is always recorded in the
+command that produced it rather than hidden in an argparse default.
+
+### The three hybrids are an incremental ablation
+
+The hybrid variants are meant to be read as one progression, adding a single group of
+changes at a time:
+
+| Step | Variant | What it adds |
+|---|---|---|
+| 1 | `hybrid_simple` | nothing — the plain CNN+Transformer baseline, no AMP, no cosine |
+| 2 | `hybrid_token_reduction` | token reduction only (keeps 50 % of the 64 stem tokens) |
+| 3 | `hybrid_token_reduction_opt` | mixed precision, cosine schedule and `torch.compile` |
+
+Flash attention and mixup/CutMix are **off by default** in step 3 so that the step isolates
+the runtime recipe. Turn them on explicitly if you want them.
 
 ---
 
@@ -341,14 +360,53 @@ Batch size:     32  (smaller — quadratic attention over 400 tokens)
 | Feature | `hybrid_simple` | `hybrid_token_reduction` | `hybrid_token_reduction_opt` |
 |---|---|---|---|
 | Token Reduction | — | ✓ 50 % | ✓ 50 % + 5-epoch warmup |
-| AMP | flag | ✓ FP16 | ✓ bf16 preferred |
-| Flash Attention | — | — | ✓ |
+| AMP | — | — | ✓ bf16 preferred |
+| Cosine LR | — | — | ✓ |
 | torch.compile | — | — | ✓ reduce-overhead |
 | Channels Last | — | — | ✓ |
-| EMA | flag | — | ✓ |
-| Mixup + CutMix | — | — | ✓ |
 | NaN/Inf checks | — | — | ✓ |
-| Cosine LR | flag | ✓ | ✓ |
+| Flash Attention | — | — | available, off by default |
+| Mixup + CutMix | — | — | available, off by default |
+| EMA | available, off | available, off | available, off |
+
+Steps 1 and 2 carry no optimization at all, so the difference between them isolates token
+reduction and the difference between 2 and 3 isolates the runtime recipe.
+
+---
+
+## Reproducing the runs reported in the paper
+
+The launcher defaults above were **corrected after** the 160 runs reported in the paper were
+executed: the plain hybrid used to enable AMP and cosine despite being described as the
+unoptimized baseline, and the optimized hybrid used to enable flash attention and
+mixup/CutMix while running *without* a cosine schedule. The defaults now express the clean
+progression described above.
+
+The configuration actually used for the reported runs is the one printed in Table 1 of the
+paper. To reproduce it with this code, set the environment variables explicitly:
+
+```bash
+# hybrid_simple            (as run for the paper)
+ENABLE_AMP=1 ENABLE_COSINE=1 ./run_g5k_hydra.sh
+
+# hybrid_token_reduction   (as run for the paper)
+ENABLE_AMP=1 ENABLE_COSINE=1 KEEP_RATIO=0.5 ./run_g5k_hydra.sh
+
+# hybrid_token_reduction_opt (as run for the paper)
+ENABLE_AMP=1 ENABLE_COSINE=0 ENABLE_FLASH_ATTENTION=1 \
+ENABLE_MIXUP_CUTMIX=1 KEEP_RATIO=0.5 ./run_g5k_hydra.sh
+```
+
+The remaining six approaches are unchanged with respect to the reported runs.
+
+---
+
+## What this repository does not contain
+
+| Not included | Why |
+|---|---|
+| The fundus images | Patient data from HCPA; cannot be redistributed |
+| Per-run outputs, checkpoints and figures | Regenerable from the code; excluded via `.gitignore` |
 
 ---
 
