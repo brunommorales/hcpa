@@ -383,6 +383,7 @@ class HybridSimple(nn.Module):
         self,
         backbone: nn.Module,
         d_model: int,
+        backbone_feature_dim: Optional[int] = None,
         num_transformer_layers: int = 4,
         num_heads: int = 4,
         d_ff: int = 2048,
@@ -394,10 +395,13 @@ class HybridSimple(nn.Module):
         super().__init__()
         self.backbone = backbone
         self.d_model = int(d_model)
+        # Dimensao dos canais que a CNN produz (ex.: 2048 no InceptionV3). A projecao
+        # comprime backbone_feature_dim -> d_model. Se None, mantem d_model (modelo antigo).
+        self.backbone_feature_dim = int(backbone_feature_dim) if backbone_feature_dim is not None else self.d_model
         self.aggregation = aggregation
         self.use_cls_token = bool(use_cls_token)
 
-        self.token_projection = nn.Linear(self.d_model, self.d_model)
+        self.token_projection = nn.Linear(self.backbone_feature_dim, self.d_model)
         self.token_norm = nn.LayerNorm(self.d_model)
         self.input_dropout = nn.Dropout(transformer_dropout)
         self.pos_encoding = PositionalEncoding(
@@ -433,9 +437,9 @@ class HybridSimple(nn.Module):
     def _prepare_tokens(self, x: torch.Tensor) -> tuple[torch.Tensor, int, int]:
         features = extract_last_feature_map(self.backbone(x))
         channels = features.size(1)
-        if channels != self.d_model:
+        if channels != self.backbone_feature_dim:
             raise ValueError(
-                f"Dimensao do backbone ({channels}) difere de d_model ({self.d_model}). "
+                f"Dimensao do backbone ({channels}) difere de backbone_feature_dim ({self.backbone_feature_dim}). "
                 "Ajuste backbone_dim/config para o backbone escolhido."
             )
 
@@ -494,19 +498,28 @@ class HybridSimple(nn.Module):
 def create_hybrid_simple_model(
     backbone: nn.Module,
     backbone_feature_dim: int,
+    transformer_dim: Optional[int] = None,
     num_transformer_layers: int = 4,
     num_heads: int = 4,
     use_cls_token: bool = False,
     enable_flash_attention: bool = False,
     device: str = "cuda",
 ) -> HybridSimple:
-    """Factory function para criar modelo hibrido simples."""
+    """Factory function para criar modelo hibrido simples.
+
+    backbone_feature_dim: canais de saida da CNN (ex.: 2048 InceptionV3).
+    transformer_dim: dimensao de trabalho do Transformer. Se None, usa
+        backbone_feature_dim (comportamento antigo, ~200M params). Reduzir para
+        256/384 corta o custo do Transformer por (backbone_feature_dim/transformer_dim)^2.
+    """
+    d_model = int(transformer_dim) if transformer_dim is not None else int(backbone_feature_dim)
     model = HybridSimple(
         backbone=backbone,
-        d_model=backbone_feature_dim,
+        d_model=d_model,
+        backbone_feature_dim=backbone_feature_dim,
         num_transformer_layers=num_transformer_layers,
         num_heads=num_heads,
-        d_ff=backbone_feature_dim * 4,
+        d_ff=d_model * 4,
         transformer_dropout=0.1,
         aggregation="mean",
         use_cls_token=use_cls_token,

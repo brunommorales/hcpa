@@ -75,6 +75,15 @@ def init_distributed() -> tuple:
         torch.cuda.set_device(local_rank)
         device = torch.device(f'cuda:{local_rank}')
     else:
+        # Abortar ALTO se nao houver GPU. Sem isto o treino roda na CPU em
+        # silencio e grava um CSV cuja energia/tempo nao tem relacao com GPU
+        # nenhuma (aconteceu no chuc: singularity --nv sem /usr/sbin/ldconfig.real).
+        if not torch.cuda.is_available() and os.environ.get("HCPA_ALLOW_CPU") != "1":
+            raise SystemExit(
+                "[Hardware] Execucao requer GPU, mas torch.cuda.is_available() e False.\n"
+                "  Cheque: singularity exec --nv | /usr/sbin/ldconfig.real | driver vs container.\n"
+                "  Para forcar CPU (debug apenas): HCPA_ALLOW_CPU=1"
+            )
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     return rank, world_size, local_rank, device
@@ -257,7 +266,9 @@ def load_model_state_dict(model: nn.Module, state_dict: dict) -> None:
     unwrap_model_for_state_dict(model).load_state_dict(state_dict)
 
 
-from gpu_energy import GpuTelemetry
+from gpu_energy import GpuTelemetry, EnergyScope, DEFAULT_SAMPLE_INTERVAL_S
+
+_SAMPLE_INTERVAL_S = DEFAULT_SAMPLE_INTERVAL_S
 
 _GPU_TELE = None
 
@@ -305,9 +316,6 @@ def run_epoch(
     num_batches = 0
     total_samples = 0
     memory_samples_mb = []
-    power_samples_w = []
-    util_samples_pct = []
-    mem_util_samples_pct = []
     _tele = _gpu_tele()
     inference_time_s = 0.0
     inference_batches = 0
@@ -322,7 +330,12 @@ def run_epoch(
     use_channels_last = bool(getattr(args, "use_channels_last", False))
     check_finite = bool(getattr(args, "enable_finite_checks", False))
     epoch_start_time = time.perf_counter()
-    _energy_start_j = _tele.energy_j()
+    # Telemetria em THREAD DE FUNDO (nunca no laço de batches): o overhead não
+    # depende do número de batches, então util%/potência ficam comparáveis entre
+    # abordagens. A versão anterior amostrava por batch e ainda sincronizava a GPU
+    # a cada batch — o que serializava o pipeline e inflava a ociosidade medida.
+    _scope = EnergyScope(_tele, _SAMPLE_INTERVAL_S)
+    _scope.start()
 
     loader_iter = iter(loader)
     batch_idx = 0
@@ -468,8 +481,8 @@ def run_epoch(
 
             else:
                 with torch.inference_mode():
-                    if device.type == "cuda":
-                        torch.cuda.synchronize(device)
+                    # sem synchronize por-batch: serializava o pipeline de validacao
+                    # e a latencia de inferencia nao entra no schema de 33 colunas.
                     inference_start = time.perf_counter()
                     with runtime_profiler.range(f"{stage_name}/forward") if runtime_profiler else nullcontext():
                         logits, loss = forward_loss_with_optional_amp(
@@ -515,8 +528,6 @@ def run_epoch(
                             runtime_profiler.step(stage_name)
                         batch_idx += 1
                         continue
-                    if device.type == "cuda":
-                        torch.cuda.synchronize(device)
                     inference_time_s += time.perf_counter() - inference_start
                     inference_batches += 1
                     inference_samples += int(images.size(0))
@@ -532,23 +543,6 @@ def run_epoch(
 
             if profiler:
                 profiler.end_batch(images.size(0))
-            elif device.type == "cuda":
-                torch.cuda.synchronize(device)
-                allocated_mb = torch.cuda.memory_allocated(device) / (1024 ** 2)
-                reserved_mb = torch.cuda.memory_reserved(device) / (1024 ** 2)
-                _used_mb = _tele.memory_used_mb()
-                memory_samples_mb.append(
-                    _used_mb if _used_mb is not None else max(allocated_mb, reserved_mb)
-                )
-                _pw = _tele.power_w()
-                if _pw is not None:
-                    power_samples_w.append(_pw)
-                _u = _tele.util_pct()
-                if _u is not None:
-                    util_samples_pct.append(_u)
-                _mu = _tele.mem_util_pct()
-                if _mu is not None:
-                    mem_util_samples_pct.append(_mu)
 
         if runtime_profiler:
             runtime_profiler.step(stage_name)
@@ -621,26 +615,20 @@ def run_epoch(
         epoch_profile["avg_batch_time_ms"] = (
             epoch_profile["epoch_time"] / max(num_batches, 1)
         ) * 1000.0 if num_batches > 0 else 0.0
-        _energy_end_j = _tele.energy_j()
-        epoch_profile["energy_j"] = (
-            max(0.0, _energy_end_j - _energy_start_j)
-            if (_energy_start_j is not None and _energy_end_j is not None)
-            else float("nan")
-        )
-        epoch_profile["memory_peak_mb"] = max(memory_samples_mb) if memory_samples_mb else float("nan")
-        epoch_profile["avg_power_w"] = (
-            sum(power_samples_w) / len(power_samples_w) if power_samples_w else float("nan")
-        )
-        epoch_profile["gpu_util_pct"] = (
-            sum(util_samples_pct) / len(util_samples_pct) if util_samples_pct else float("nan")
-        )
+        _scope.stop()   # idempotente
+        _nan = float("nan")
+        _u_avg = _scope.avg_util_pct
+        epoch_profile["energy_j"] = _scope.energy_j if _scope.energy_j is not None else _nan
+        epoch_profile["memory_peak_mb"] = _scope.peak_mem_mb if _scope.peak_mem_mb is not None else _nan
+        epoch_profile["avg_power_w"] = _scope.avg_power_w if _scope.avg_power_w is not None else _nan
+        epoch_profile["gpu_util_pct"] = _u_avg if _u_avg is not None else _nan
         epoch_profile["mem_util_pct"] = (
-            sum(mem_util_samples_pct) / len(mem_util_samples_pct) if mem_util_samples_pct else float("nan")
+            _scope.avg_mem_util_pct if _scope.avg_mem_util_pct is not None else _nan
         )
-        # tempo GPU-ATIVA (kernel-only) = tempo da época x util/100 (remove ociosidade/CPU)
+        # tempo GPU-ATIVA (kernel-only) = tempo da época x util/100 (remove ociosidade/CPU).
+        # Usa epoch_time (reduzido entre ranks no DDP), não o elapsed interno do scope.
         epoch_profile["busy_time_s"] = (
-            epoch_profile["epoch_time"] * epoch_profile["gpu_util_pct"] / 100.0
-            if util_samples_pct else float("nan")
+            epoch_profile["epoch_time"] * _u_avg / 100.0 if _u_avg is not None else _nan
         )
         return epoch_profile
 
@@ -777,7 +765,7 @@ def main():
     runtime_profiler = RuntimeProfiler(args.results_dir, rank=rank, project_name="hybrid_token_reduction_opt")
     metrics_csv_path = os.path.join(args.results_dir, f"metrics_exec{args.exec_id}.csv")
     metrics_rows = []
-    wall_clock_start = time.time()
+    wall_clock_start = time.perf_counter()
 
     # Load data
     if rank == 0:
@@ -811,6 +799,7 @@ def main():
     model = create_hybrid_token_reduction_model(
         backbone=backbone,
         backbone_feature_dim=args.backbone_dim,
+        transformer_dim=args.transformer_dim,
         keep_ratio=args.keep_ratio,
         keep_k=args.keep_k,
         num_transformer_layers=args.num_transformer_layers,
@@ -882,6 +871,7 @@ def main():
     # Training loop
     best_auc = 0.0
     best_epoch = 0
+    best_state_dict = None  # best-checkpoint EM MEMÓRIA (RAM), sem IO em disco
 
     for epoch in range(args.epochs):
         if scheduler is not None:
@@ -954,9 +944,11 @@ def main():
                 best_auc = val_metrics['auc']
                 best_epoch = epoch
 
-                checkpoint_path = os.path.join(args.results_dir, f"best_model_exec{args.exec_id}.pt")
-                torch.save(get_state_dict(model), checkpoint_path)
-                print(f"Saved best model: {checkpoint_path}")
+                # Best-checkpoint EM MEMÓRIA (RAM, clone na CPU) — sem IO em disco.
+                # get_state_dict aqui já captura o estado EMA (shadow), preservando a
+                # semântica original. Antes: torch.save() a cada melhora (IO).
+                best_state_dict = {k: v.detach().cpu().clone() for k, v in get_state_dict(model).items()}
+                print(f"[BEST] checkpoint em memória atualizado: epoch={best_epoch} val_auc={best_auc:.6f}")
 
         if rank == 0:
             print(
@@ -996,16 +988,14 @@ def main():
             )
             save_metrics_history_csv(metrics_csv_path, metrics_rows)
 
-    best_checkpoint_path = os.path.join(args.results_dir, f"best_model_exec{args.exec_id}.pt")
     loaded_best_checkpoint = False
-    if os.path.exists(best_checkpoint_path):
+    if best_state_dict is not None:
         if rank == 0:
-            print(f"\nLoading best checkpoint for final evaluation: {best_checkpoint_path}")
-        state_dict = torch.load(best_checkpoint_path, map_location=device)
-        load_model_state_dict(model, state_dict)
+            print(f"\nRestaurando best checkpoint em memória para avaliação final (epoch={best_epoch}, val_auc={best_auc:.6f})")
+        load_model_state_dict(model, best_state_dict)
         loaded_best_checkpoint = True
     elif rank == 0:
-        print(f"\n[WARN] Best checkpoint not found; evaluating final model state: {best_checkpoint_path}")
+        print("\n[WARN] Sem best checkpoint em memória; avaliando estado final do modelo.")
 
     # Final evaluation
     if rank == 0:
@@ -1047,7 +1037,7 @@ def main():
             args.dataset,
             args.exec_id,
         )
-        total_train_time_s = round(time.time() - wall_clock_start, 1)
+        total_train_time_s = round(time.perf_counter() - wall_clock_start, 1)
         metrics_rows.append(
             make_metrics_row(
                 epoch=args.epochs,

@@ -200,6 +200,7 @@ class HybridTokenReduction(nn.Module):
         self,
         backbone: nn.Module,
         d_model: int,
+        backbone_feature_dim: Optional[int] = None,
         num_transformer_layers: int = 4,
         num_heads: int = 4,
         d_ff: int = 2048,
@@ -213,17 +214,21 @@ class HybridTokenReduction(nn.Module):
         super().__init__()
         self.backbone = backbone
         self.d_model = int(d_model)
+        # Canais de saida da CNN (ex.: 2048). Nesta variante otimizada a selecao de
+        # tokens ocorre ANTES da projecao, entao o TokenSelector opera na dimensao do
+        # backbone; a projecao comprime backbone_feature_dim -> d_model em seguida.
+        self.backbone_feature_dim = int(backbone_feature_dim) if backbone_feature_dim is not None else self.d_model
         self.aggregation = aggregation
         self.use_cls_token = bool(use_cls_token)
         self.keep_ratio = float(keep_ratio)
         self.current_keep_ratio = float(keep_ratio)
         self.enable_flash_attention = bool(enable_flash_attention)
 
-        self.token_projection = nn.Linear(self.d_model, self.d_model)
+        self.token_projection = nn.Linear(self.backbone_feature_dim, self.d_model)
         self.token_norm = nn.LayerNorm(self.d_model)
         self.input_dropout = nn.Dropout(transformer_dropout)
         self.token_selector = TokenSelector(
-            token_dim=self.d_model,
+            token_dim=self.backbone_feature_dim,
             keep_ratio=keep_ratio,
             keep_k=keep_k,
             include_cls_token=False,
@@ -261,9 +266,9 @@ class HybridTokenReduction(nn.Module):
     def _extract_tokens(self, x: torch.Tensor) -> tuple[torch.Tensor, int, int]:
         features = extract_last_feature_map(self.backbone(x))
         channels = features.size(1)
-        if channels != self.d_model:
+        if channels != self.backbone_feature_dim:
             raise ValueError(
-                f"Dimensao do backbone ({channels}) difere de d_model ({self.d_model}). "
+                f"Dimensao do backbone ({channels}) difere de backbone_feature_dim ({self.backbone_feature_dim}). "
                 "Ajuste backbone_dim/config para o backbone escolhido."
             )
 
@@ -359,6 +364,7 @@ class HybridTokenReduction(nn.Module):
 def create_hybrid_token_reduction_model(
     backbone: nn.Module,
     backbone_feature_dim: int,
+    transformer_dim: Optional[int] = None,
     keep_ratio: float = 0.5,
     keep_k: Optional[int] = None,
     num_transformer_layers: int = 4,
@@ -367,13 +373,21 @@ def create_hybrid_token_reduction_model(
     enable_flash_attention: bool = True,
     device: str = "cuda",
 ) -> HybridTokenReduction:
-    """Factory function para criar modelo otimizado com token reduction."""
+    """Factory function para criar modelo otimizado com token reduction.
+
+    transformer_dim: dimensao de trabalho do Transformer. Se None, usa
+        backbone_feature_dim (modelo antigo ~200M params). Reduzir para 256/384
+        corta o custo por (backbone_feature_dim/transformer_dim)^2. A selecao de
+        tokens ocorre na dimensao do backbone antes da projecao.
+    """
+    d_model = int(transformer_dim) if transformer_dim is not None else int(backbone_feature_dim)
     model = HybridTokenReduction(
         backbone=backbone,
-        d_model=backbone_feature_dim,
+        d_model=d_model,
+        backbone_feature_dim=backbone_feature_dim,
         num_transformer_layers=num_transformer_layers,
         num_heads=num_heads,
-        d_ff=backbone_feature_dim * 4,
+        d_ff=d_model * 4,
         transformer_dropout=0.1,
         keep_ratio=keep_ratio,
         keep_k=keep_k,

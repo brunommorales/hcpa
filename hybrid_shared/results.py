@@ -20,39 +20,46 @@ except Exception:
     sklearn_roc_curve = None
 
 
+# Schema do CSV por época. O writer projeta as linhas sobre esta lista, então
+# retirar um nome daqui basta para parar de gravá-lo.
+#
+# Removidos na auditoria (2026-07):
+#   train_auc/precision/f1/sens/spec  -> calculados sobre lotes com augmentation
+#                                        (mixup/cutmix): enganosos como métrica clínica.
+#   val_gpu_util_pct, val_busy_time_s -> a validação não entra em Q1/Q2.
+#   *_avg_power_w (val/test)          -> redundante: energia / tempo.
+#   *_avg_batch_time_ms (val/test)    -> redundante com elapsed / nº de batches.
+#   *_inference_latency_*             -> não usado; é ~1/throughput.
+#   *_gpu_mem_avg_mb                  -> o que importa é o PICO (footprint).
+#
+# spec@95sens NAO e' coletado no CSV: e' uma metrica DERIVADA (exige a curva ROC
+# completa). Coletamos apenas spec (spec@0.5) e sens; o make_plots.py deriva o
+# spec@95sens a partir do *-thresholds.csv. (Antes existia val/test_spec_at_sens95
+# aqui, mas caiam num fallback SILENCIOSO para spec@0.5 -> valor inflado. Removidas.)
 METRICS_CSV_FIELDS = [
     "epoch",
     "stage",
+    # --- treino: só custo computacional (as métricas clínicas do treino são enganosas)
     "train_loss",
-    "train_auc",
-    "train_precision",
-    "train_f1",
-    "train_sens",
-    "train_spec",
     "train_throughput_img_s",
     "train_elapsed_s",
-    "train_avg_batch_time_ms",
     "train_gpu_mem_peak_mb",
     "train_energy_j",
     "train_avg_power_w",
     "train_gpu_util_pct",
     "train_mem_util_pct",
     "train_busy_time_s",
+    # --- validação: trajetória clínica limpa (sem augmentation) + custo
     "val_loss",
     "val_auc",
     "val_precision",
     "val_f1",
     "val_sens",
     "val_spec",
-    "val_throughput_img_s",
     "val_elapsed_s",
-    "val_avg_batch_time_ms",
     "val_gpu_mem_peak_mb",
     "val_energy_j",
-    "val_avg_power_w",
-    "val_gpu_util_pct",
-    "val_busy_time_s",
-    "test_loss",
+    # --- teste final (linha stage=final_test)
     "test_auc",
     "test_precision",
     "test_f1",
@@ -60,10 +67,8 @@ METRICS_CSV_FIELDS = [
     "test_spec",
     "test_throughput_img_s",
     "test_elapsed_s",
-    "test_avg_batch_time_ms",
     "test_gpu_mem_peak_mb",
     "test_energy_j",
-    "test_avg_power_w",
     "lr",
     "total_train_time_s",
 ]
@@ -91,7 +96,6 @@ def _split_metrics(prefix: str, metrics: dict[str, Any] | None) -> dict[str, Any
             f"{prefix}_f1": math.nan,
             f"{prefix}_sens": math.nan,
             f"{prefix}_spec": math.nan,
-            f"{prefix}_spec_at_sens95": math.nan,
             f"{prefix}_throughput_img_s": math.nan,
             f"{prefix}_elapsed_s": math.nan,
             f"{prefix}_avg_batch_time_ms": math.nan,
@@ -106,7 +110,9 @@ def _split_metrics(prefix: str, metrics: dict[str, Any] | None) -> dict[str, Any
             f"{prefix}_busy_time_s": math.nan,
         }
 
-    specificity_at_sens95 = metrics.get("specificity_at_sens95", metrics.get("specificity"))
+    # spec@95sens NAO e' coletado aqui: e' uma metrica DERIVADA (precisa da curva
+    # ROC completa) e o make_plots.py a calcula a partir do *-thresholds.csv.
+    # Coletamos apenas spec (spec@0.5) e sens brutos.
     return {
         f"{prefix}_loss": _scalar_or_nan(metrics.get("loss")),
         f"{prefix}_auc": _scalar_or_nan(metrics.get("auc")),
@@ -115,7 +121,6 @@ def _split_metrics(prefix: str, metrics: dict[str, Any] | None) -> dict[str, Any
         f"{prefix}_f1": _scalar_or_nan(metrics.get("f1")),
         f"{prefix}_sens": _scalar_or_nan(metrics.get("sensitivity")),
         f"{prefix}_spec": _scalar_or_nan(metrics.get("specificity")),
-        f"{prefix}_spec_at_sens95": _scalar_or_nan(specificity_at_sens95),
         f"{prefix}_throughput_img_s": _scalar_or_nan(metrics.get("throughput")),
         f"{prefix}_elapsed_s": _scalar_or_nan(metrics.get("epoch_time")),
         f"{prefix}_avg_batch_time_ms": _scalar_or_nan(metrics.get("avg_batch_time_ms")),

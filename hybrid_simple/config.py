@@ -74,7 +74,15 @@ def get_args() -> argparse.Namespace:
         "--backbone_dim",
         type=int,
         default=2048,
-        help="Dimensão das features do backbone",
+        help="Dimensão das features do backbone (canais de saída da CNN)",
+    )
+    parser.add_argument(
+        "--transformer_dim",
+        type=int,
+        default=256,
+        help="Dimensão de trabalho do Transformer. A projeção comprime backbone_dim -> "
+             "transformer_dim antes da atenção, reduzindo o custo (~params/FLOPs) por "
+             "(backbone_dim/transformer_dim)^2. Use --transformer_dim 2048 para o modelo antigo.",
     )
     parser.add_argument(
         "--num_transformer_layers",

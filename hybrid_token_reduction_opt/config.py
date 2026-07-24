@@ -74,7 +74,16 @@ def get_args() -> argparse.Namespace:
         "--backbone_dim",
         type=int,
         default=2048,
-        help="Dimensão do backbone",
+        help="Dimensão do backbone (canais de saída da CNN)",
+    )
+    parser.add_argument(
+        "--transformer_dim",
+        type=int,
+        default=256,
+        help="Dimensão de trabalho do Transformer. Aqui a seleção de tokens ocorre na "
+             "dimensão do backbone e a projeção comprime backbone_dim -> transformer_dim "
+             "antes da atenção, reduzindo o custo por (backbone_dim/transformer_dim)^2. "
+             "Use --transformer_dim 2048 para o modelo antigo.",
     )
     parser.add_argument(
         "--num_transformer_layers",
@@ -159,7 +168,7 @@ def get_args() -> argparse.Namespace:
         action="store_false",
         help="Disable Flash Attention",
     )
-    parser.set_defaults(enable_flash_attention=True)
+    parser.set_defaults(enable_flash_attention=False)  # paridade c/ pytorch_opt (sem extra)
     parser.add_argument(
         "--freeze_backbone_epochs",
         type=int,
@@ -298,7 +307,7 @@ def get_args() -> argparse.Namespace:
         action="store_false",
         help="Disable warmup + cosine LR scheduler",
     )
-    parser.set_defaults(enable_cosine=False)
+    parser.set_defaults(enable_cosine=True)   # paridade c/ pytorch_opt (cosine+warmup)
     parser.add_argument(
         "--enable_compile",
         dest="enable_compile",
@@ -311,7 +320,7 @@ def get_args() -> argparse.Namespace:
         action="store_false",
         help="Disable torch.compile",
     )
-    parser.set_defaults(enable_compile=False)
+    parser.set_defaults(enable_compile=True)  # paridade c/ pytorch_opt (torch.compile)
     parser.add_argument(
         "--enable_channels_last",
         dest="enable_channels_last",

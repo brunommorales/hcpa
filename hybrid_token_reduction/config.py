@@ -74,7 +74,15 @@ def get_args() -> argparse.Namespace:
         "--backbone_dim",
         type=int,
         default=2048,
-        help="Dimensão do backbone",
+        help="Dimensão do backbone (canais de saída da CNN)",
+    )
+    parser.add_argument(
+        "--transformer_dim",
+        type=int,
+        default=256,
+        help="Dimensão de trabalho do Transformer. A projeção comprime backbone_dim -> "
+             "transformer_dim antes da atenção, reduzindo o custo por "
+             "(backbone_dim/transformer_dim)^2. Use --transformer_dim 2048 para o modelo antigo.",
     )
     parser.add_argument(
         "--num_transformer_layers",
@@ -221,7 +229,7 @@ def get_args() -> argparse.Namespace:
         action="store_false",
         help="Disable AMP",
     )
-    parser.set_defaults(enable_amp=True)
+    parser.set_defaults(enable_amp=False)   # variante isola SO' token reduction
     parser.add_argument(
         "--enable_ema",
         dest="enable_ema",
@@ -266,7 +274,7 @@ def get_args() -> argparse.Namespace:
         action="store_false",
         help="Disable warmup + cosine LR scheduler",
     )
-    parser.set_defaults(enable_cosine=True)
+    parser.set_defaults(enable_cosine=False)  # sem otimizacao alem do token reduction
     parser.add_argument(
         "--enable_performance_profiler",
         dest="enable_performance_profiler",

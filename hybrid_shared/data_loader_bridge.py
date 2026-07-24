@@ -156,17 +156,21 @@ def get_data_loaders(
         if not train_files:
             raise ValueError(f"Nenhum arquivo train*.tfrec encontrado em {tfrec_dir}")
 
-        # O dataset atual usa apenas train/test. Se não houver split de validação,
-        # reutilizamos o split de teste para manter a interface dos hybrids.
-        if not val_files:
-            val_files = test_files
+        # NAO reutilizar test como validacao: o best-checkpoint e selecionado pela
+        # val, entao val==test escolheria o modelo no proprio teste (vazamento P1).
         if not test_files:
             test_files = val_files
 
         if not val_files or not test_files:
             raise ValueError(
-                f"Não foi possível resolver os splits de validação/teste em {tfrec_dir}. "
-                "Esperado ao menos train*.tfrec e test*.tfrec."
+                f"Não foi possível resolver os splits de validação (val*) e teste (test*) "
+                f"em {tfrec_dir}. Sem split val* proprio, use data/all-tfrec-v2 (vazamento P1)."
+            )
+        # GUARDA P1: val e test disjuntos.
+        if set(val_files) & set(test_files):
+            raise ValueError(
+                f"val e test compartilham TFRecords em {tfrec_dir}: vazamento P1. "
+                "Use data/all-tfrec-v2."
             )
 
         # Parâmetros DALI/Torch
