@@ -46,6 +46,7 @@ for _p in (str(_SELF_DIR), str(_PROJECT_ROOT)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 from gpu_energy import GpuTelemetry, EnergyScope
+from gpu_kernel_profile import KernelProfiler
 
 _GPU_TELE = None
 
@@ -58,40 +59,50 @@ def _gpu_tele() -> GpuTelemetry:
     return _GPU_TELE
 
 
+def _ddp_sum_float(value):
+    """Soma um escalar entre TODOS os ranks DDP (retorna a soma) — para energia no
+    distribuido: cada rank mede a energia da SUA GPU (current_device), e o total do
+    job = soma entre ranks (cobre multi-GPU num node E multi-node). No-op se
+    world_size==1 / dist nao iniciado. None -> None (metrica ausente).
+    TODOS os ranks devem chamar (all_reduce e coletivo)."""
+    if value is None:
+        return None
+    try:
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            dev = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+            t = torch.tensor([float(value)], dtype=torch.float64, device=dev)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            return float(t.item())
+    except Exception:
+        pass
+    return value
+
+
 COMMON_CSV_FIELDS = [
     "epoch",
     "stage",
+    # --- treino: so custo computacional. As metricas clinicas do treino sao
+    #     calculadas sobre lotes com augmentation (mixup/cutmix) e enganam.
     "train_loss",
-    "train_auc",
-    "train_precision",
-    "train_f1",
-    "train_sens",
-    "train_spec",
     "train_throughput_img_s",
     "train_elapsed_s",
-    "train_avg_batch_time_ms",
     "train_gpu_mem_peak_mb",
     "train_energy_j",
     "train_avg_power_w",
     "train_gpu_util_pct",
     "train_mem_util_pct",
     "train_busy_time_s",
+    # --- validacao: trajetoria clinica limpa (sem augmentation) + custo
     "val_loss",
     "val_auc",
     "val_precision",
     "val_f1",
     "val_sens",
     "val_spec",
-    "val_throughput_img_s",
     "val_elapsed_s",
-    "val_avg_batch_time_ms",
     "val_gpu_mem_peak_mb",
     "val_energy_j",
-    "val_avg_power_w",
-    "val_gpu_util_pct",
-    "val_mem_util_pct",
-    "val_busy_time_s",
-    "test_loss",
+    # --- teste final (linha stage=final_test)
     "test_auc",
     "test_precision",
     "test_f1",
@@ -99,10 +110,8 @@ COMMON_CSV_FIELDS = [
     "test_spec",
     "test_throughput_img_s",
     "test_elapsed_s",
-    "test_avg_batch_time_ms",
     "test_gpu_mem_peak_mb",
     "test_energy_j",
-    "test_avg_power_w",
     "lr",
     "total_train_time_s",
 ]
@@ -353,7 +362,10 @@ def resolve_split_files(
 
 
 def default_validation_fallbacks(preferred_prefix: str) -> list[str]:
-    ordered = ["val", "valid", "test"]
+    # NUNCA cair em "test": usar o teste como validacao faz o best-checkpoint ser
+    # escolhido no proprio teste (vazamento P1). Se val*/valid* nao existir, o
+    # chamador falha alto (ver checagem de disjuncao no build dos loaders).
+    ordered = ["val", "valid"]
     return [prefix for prefix in ordered if prefix != preferred_prefix]
 
 
@@ -379,6 +391,7 @@ class RetinaTFRecordDataset(Dataset):
         augment: bool,
         fundus_crop_ratio: float,
         model_name: str,
+        cache_in_memory: bool = True,
     ):
         if len(tfrecord_paths) != len(index_paths):
             raise ValueError("Listas de TFRecords e índices possuem tamanhos distintos.")
@@ -404,6 +417,46 @@ class RetinaTFRecordDataset(Dataset):
 
         if not self._entries:
             raise RuntimeError("Nenhuma entrada encontrada no conjunto de TFRecords/idx.")
+
+        # PARIDADE DE PIPELINE COM O TENSORFLOW: cache in-memory da imagem
+        # decodificada+redimensionada (uint8), ANTES do augment aleatorio.
+        # Sem isto, cada worker redecodifica o JPEG toda epoca (era o gargalo
+        # que a CUPTI via como cpu_wait); o tf.data cacheia no mesmo ponto.
+        # Fork-safety: guardamos UM ndarray contiguo (nao lista de objetos) para
+        # que os workers do DataLoader herdem as paginas por copy-on-write, sem
+        # duplicar 8x na RAM. Rotulos vao num ndarray separado pela mesma razao.
+        self._cache_imgs = None   # ndarray (N, S, S, 3) uint8
+        self._cache_labels = None  # ndarray (N,) float32
+        if cache_in_memory:
+            self._build_memory_cache()
+
+    def _build_memory_cache(self) -> None:
+        n = len(self._entries)
+        s = self.img_size
+        imgs = np.empty((n, s, s, 3), dtype=np.uint8)
+        labels = np.empty((n,), dtype=np.float32)
+        for i, (tf_path, offset) in enumerate(self._entries):
+            data = self._read_record_at(tf_path, offset)
+            example = example_pb2.Example()
+            example.ParseFromString(data)
+            feats = example.features.feature
+            if ("imagem" not in feats) or ("retinopatia" not in feats):
+                raise KeyError("TFRecord não contém as chaves esperadas 'imagem'/'retinopatia'.")
+            img = Image.open(io.BytesIO(feats["imagem"].bytes_list.value[0])).convert("RGB")
+            img = self._center_crop_fundus(img)
+            if s > 0 and img.size != (s, s):
+                img = img.resize((s, s), Image.BILINEAR)
+            imgs[i] = np.asarray(img, dtype=np.uint8)
+            labels[i] = float(feats["retinopatia"].int64_list.value[0])
+        # Fecha handles usados na construcao: apos o cache nao ha mais I/O.
+        for fh in self._file_handles.values():
+            try:
+                fh.close()
+            except Exception:
+                pass
+        self._file_handles = {}
+        self._cache_imgs = imgs
+        self._cache_labels = labels
 
     def __len__(self):
         return len(self._entries)
@@ -481,22 +534,30 @@ class RetinaTFRecordDataset(Dataset):
         return image
 
     def __getitem__(self, idx: int):
-        tf_path, offset = self._entries[idx]
-        data = self._read_record_at(tf_path, offset)
-        example = example_pb2.Example()
-        example.ParseFromString(data)
-        feats = example.features.feature
-        if ("imagem" not in feats) or ("retinopatia" not in feats):
-            raise KeyError("TFRecord não contém as chaves esperadas 'imagem'/'retinopatia'.")
+        if self._cache_imgs is not None:
+            # Caminho cacheado (paridade com o tf.data): le a imagem ja
+            # decodificada+redimensionada da RAM; so o augment (aleatorio) roda
+            # por acesso, exatamente como no TF (cache -> augment).
+            img = Image.fromarray(self._cache_imgs[idx])
+            img = self._apply_augmentations(img)
+            label = float(self._cache_labels[idx])
+        else:
+            tf_path, offset = self._entries[idx]
+            data = self._read_record_at(tf_path, offset)
+            example = example_pb2.Example()
+            example.ParseFromString(data)
+            feats = example.features.feature
+            if ("imagem" not in feats) or ("retinopatia" not in feats):
+                raise KeyError("TFRecord não contém as chaves esperadas 'imagem'/'retinopatia'.")
 
-        img_bytes = feats["imagem"].bytes_list.value[0]
-        label = float(feats["retinopatia"].int64_list.value[0])
+            img_bytes = feats["imagem"].bytes_list.value[0]
+            label = float(feats["retinopatia"].int64_list.value[0])
 
-        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        img = self._center_crop_fundus(img)
-        if self.img_size > 0 and img.size != (self.img_size, self.img_size):
-            img = img.resize((self.img_size, self.img_size), Image.BILINEAR)
-        img = self._apply_augmentations(img)
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            img = self._center_crop_fundus(img)
+            if self.img_size > 0 and img.size != (self.img_size, self.img_size):
+                img = img.resize((self.img_size, self.img_size), Image.BILINEAR)
+            img = self._apply_augmentations(img)
 
         x = np.asarray(img, dtype=np.float32)
         x = self._normalize(x)
@@ -635,6 +696,16 @@ def build_dali_loader(
     return create_dali_iterator([pipe], auto_reset=True, last_batch_policy=LastBatchPolicy.PARTIAL)
 
 
+def _seed_worker(worker_id: int) -> None:
+    # Sem worker_init_fn, os workers do DataLoader herdam (via fork) o MESMO estado
+    # global de np.random do processo pai e aplicam augmentacoes IDENTICAS, reduzindo
+    # a diversidade do augment. torch ja semeia cada worker de forma deterministica
+    # (base_seed derivado do seed global + worker_id); propagamos para numpy/random.
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
 def build_torch_loader(
     tfrec_files: list[str],
     *,
@@ -650,6 +721,9 @@ def build_torch_loader(
     shuffle: bool,
 ):
     idx_files = [infer_index_file(f) for f in tfrec_files]
+    # Cache in-memory ligado por padrao (paridade com o tf.data das abordagens TF).
+    # HCPA_CACHE_IN_MEMORY=0 desliga (debug / no que a RAM nao couber).
+    cache_in_memory = os.environ.get("HCPA_CACHE_IN_MEMORY", "1").strip().lower() not in ("0", "false", "no")
     dataset = RetinaTFRecordDataset(
         tfrecord_paths=tfrec_files,
         index_paths=idx_files,
@@ -658,6 +732,7 @@ def build_torch_loader(
         augment=augment,
         fundus_crop_ratio=fundus_crop_ratio,
         model_name=model_name,
+        cache_in_memory=cache_in_memory,
     )
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle) if world_size > 1 else None
     num_workers = min(8, os.cpu_count() or 4)
@@ -673,6 +748,7 @@ def build_torch_loader(
         drop_last=shuffle,
         persistent_workers=(num_workers > 0),
         prefetch_factor=(4 if num_workers > 0 else None),
+        worker_init_fn=_seed_worker,
     )
     return loader, sampler, dataset, num_workers
 
@@ -717,6 +793,7 @@ def build_csv_loader(
         drop_last=shuffle,
         persistent_workers=(num_workers > 0),
         prefetch_factor=(4 if num_workers > 0 else None),
+        worker_init_fn=_seed_worker,
     )
     return loader, sampler, dataset, num_workers
 
@@ -1050,6 +1127,17 @@ def main():
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     use_cuda = torch.cuda.is_available()
+    # Abortar ALTO. Sem isto o torch apenas emite um UserWarning e treina na CPU:
+    # o run "termina", grava CSV, e a energia/tempo medidos nao tem relacao com
+    # GPU nenhuma. Aconteceu no chuc quando `singularity --nv` nao achava as libs
+    # do host (faltava /usr/sbin/ldconfig.real). Um estudo de energia de GPU nao
+    # pode rodar sem GPU.
+    if not use_cuda and os.environ.get("HCPA_ALLOW_CPU") != "1":
+        raise SystemExit(
+            "[Hardware] Execucao requer GPU, mas torch.cuda.is_available() e False.\n"
+            "  Cheque: singularity exec --nv | /usr/sbin/ldconfig.real | driver vs container.\n"
+            "  Para forcar CPU (debug apenas): HCPA_ALLOW_CPU=1"
+        )
     device = torch.device("cuda", local_rank) if use_cuda else torch.device("cpu")
 
     if args.cores > 0:
@@ -1106,7 +1194,16 @@ def main():
         if not train_files or not valid_files or not test_files:
             raise SystemExit(
                 f"É necessário ter TFRecords de treino/validação em {args.tfrec_dir} "
-                f"(train={args.train_split}, val={args.val_split})."
+                f"(train={args.train_split}, val={args.val_split}). "
+                "Sem split val* proprio o codigo NAO cai mais em test (vazamento P1); "
+                "use um dataset com val*, ex.: data/all-tfrec-v2."
+            )
+        # GUARDA P1: val e test devem ser DISJUNTOS. Se compartilham arquivos, o
+        # best-checkpoint (selecionado pela val) estaria sendo escolhido no teste.
+        if set(valid_files) & set(test_files):
+            raise SystemExit(
+                f"val ({valid_split_name}) e test ({test_split_name}) compartilham "
+                f"TFRecords em {args.tfrec_dir}: vazamento P1. Use data/all-tfrec-v2."
             )
 
     results_dir = Path(args.results)
@@ -1117,6 +1214,14 @@ def main():
     csv_writer = None
     if rank == 0:
         csv_writer = pd.DataFrame(columns=csv_fields)
+
+    # Profiling de kernel (CUPTI). Desligado a menos que HCPA_PROFILE_EPOCHS
+    # esteja definido; só o rank 0 grava, para não sobrescrever os traces.
+    _kprof = KernelProfiler(
+        approach="pytorch_opt",
+        out_dir=results_dir / f"kprof-{args.exec}",
+        epochs=None if rank == 0 else set(),
+    )
 
     use_dali = bool(getattr(args, "use_dali", True)) and not csv_mode
     use_cosine_scheduler = bool(getattr(args, "use_cosine_scheduler", True))
@@ -1279,10 +1384,19 @@ def main():
         # / "libcuda" no log. Use PT_DISABLE_COMPILE=1 para rodar baseline eager.
         try:
             torch._dynamo.config.suppress_errors = True  # não derruba o treino
-            model = torch.compile(model, mode="reduce-overhead")
+            # `reduce-overhead` usa CUDA graphs. CUDA graphs + DDP + NCCL e uma
+            # combinacao NAO suportada: o autotuning fica patologicamente lento e
+            # os ranks TRAVAM em D-state (uninterruptible) num hang de coletivo.
+            # Regra: single-GPU (world_size<=1) pode usar reduce-overhead; sob DDP
+            # (world_size>1) cai para 'default' (mesma fusao TorchInductor, SEM
+            # CUDA graphs). HCPA_COMPILE_MODE sobrepoe (p/ ex.: forcar 'default' no
+            # single-GPU tambem, e manter o estudo de escalabilidade consistente).
+            _default_mode = "reduce-overhead" if world_size <= 1 else "default"
+            compile_mode = os.environ.get("HCPA_COMPILE_MODE", _default_mode).strip()
+            model = torch.compile(model, mode=compile_mode)
             if rank == 0:
-                print("[torch.compile] solicitado (mode=reduce-overhead); "
-                      "compilação efetiva ocorre na 1a passada.")
+                print(f"[torch.compile] solicitado (mode={compile_mode}, "
+                      f"world_size={world_size}); compilação efetiva na 1a passada.")
         except Exception as exc:
             if rank == 0:
                 print(f"[WARN] torch.compile indisponível; seguindo em eager: {exc}")
@@ -1446,7 +1560,7 @@ def main():
         inference_time_s = 0.0
         inference_batches = 0
         inference_samples = 0
-        t_start = time.time()
+        t_start = time.perf_counter()
         loader_iter = iter(loader)
         step_idx = 0
         while True:
@@ -1519,14 +1633,11 @@ def main():
                         all_probs.append(probs.detach())
                         all_labels.append(yb_original.detach())
 
-                if track_memory:
-                    torch.cuda.synchronize(device)
-                    allocated_mb = torch.cuda.memory_allocated(device) / (1024 ** 2)
-                    reserved_mb = torch.cuda.memory_reserved(device) / (1024 ** 2)
-                    _used_mb = _gpu_tele().memory_used_mb()
-                    memory_samples_mb.append(
-                        _used_mb if _used_mb is not None else max(allocated_mb, reserved_mb)
-                    )
+                # (removido) amostragem de memoria POR BATCH: ela chamava
+                # torch.cuda.synchronize() a cada batch do TREINO, serializando o
+                # pipeline e inflando a ociosidade medida — enquanto o TensorFlow
+                # rodava livre. O pico de memoria vem do EnergyScope (thread de
+                # fundo, NVML), e a media foi removida do schema.
 
             runtime_profiler.step(stage_name)
             step_idx += 1
@@ -1563,7 +1674,7 @@ def main():
         inference_latency_ms_batch = (
             inference_time_s / inference_batches * 1000.0 if inference_batches > 0 else float("nan")
         )
-        elapsed = time.time() - t_start
+        elapsed = time.perf_counter() - t_start
         global_samples = n_samples
         if dist.is_initialized():
             n_samples_tensor = torch.tensor([n_samples], device=device, dtype=torch.float64)
@@ -1611,7 +1722,7 @@ def main():
     best_val_auc = -1.0
     best_epoch = 0
     best_state_dict = None
-    start_time = time.time()
+    start_time = time.perf_counter()
 
     for epoch in range(EPOCHS):
         if current_stage == "freeze" and epoch >= FREEZE_EPOCHS:
@@ -1633,24 +1744,35 @@ def main():
 
         _train_scope = EnergyScope(_gpu_tele())
         _train_scope.start()
-        (
-            train_loss,
-            train_auc,
-            train_epoch_metrics,
-            train_thpt,
-            train_elapsed,
-            train_avg_batch_time_ms,
-            train_inference_latency_ms_img,
-            train_inference_latency_ms_batch,
-            train_mem_avg,
-        ) = run_epoch(
-            train_loader,
-            train=True,
-            epoch_idx=epoch,
-            mixup_alpha=mixup_alpha_now,
-            cutmix_alpha=cutmix_alpha_now,
-        )
+        # CUPTI só nas épocas de HCPA_PROFILE_EPOCHS (no-op nas demais). Estas
+        # épocas ficam CONTAMINADAS pelo overhead do profiler: use-as para medir
+        # busy_time exato, não para comparar tempo/energia.
+        with _kprof.epoch(epoch):
+            (
+                train_loss,
+                train_auc,
+                train_epoch_metrics,
+                train_thpt,
+                train_elapsed,
+                train_avg_batch_time_ms,
+                train_inference_latency_ms_img,
+                train_inference_latency_ms_batch,
+                train_mem_avg,
+            ) = run_epoch(
+                train_loader,
+                train=True,
+                epoch_idx=epoch,
+                mixup_alpha=mixup_alpha_now,
+                cutmix_alpha=cutmix_alpha_now,
+            )
         _train_scope.stop()
+        # NAO usar all_reduce manual aqui: um coletivo NCCL proprio, injetado no
+        # meio do loop de treino DDP, colide/desincroniza com os coletivos internos
+        # do DDP (gradient allreduce) e TRAVA os ranks em D-state (diagnosticado por
+        # py-spy: rank preso em _ddp_sum_float). A energia TOTAL das N GPUs do node
+        # e medida SEM coletivo: com HCPA_ENERGY_ALL_VISIBLE_GPUS=1, o gpu_energy do
+        # rank 0 (unico que grava o CSV) soma os contadores NVML de todas as GPUs
+        # locais visiveis. Ver gpu_energy._resolve_all_local_handles.
         _val_scope = EnergyScope(_gpu_tele())
         _val_scope.start()
         (
@@ -1667,6 +1789,7 @@ def main():
             valid_loader, train=False, epoch_idx=epoch, mixup_alpha=0.0, cutmix_alpha=0.0
         )
         _val_scope.stop()
+        # idem treino: sem all_reduce (energia total via HCPA_ENERGY_ALL_VISIBLE_GPUS).
 
         if scheduler is not None:
             scheduler.step()
@@ -1711,7 +1834,14 @@ def main():
                     "train_avg_power_w": _train_scope.avg_power_w,
                     "train_gpu_util_pct": _train_scope.avg_util_pct,
                     "train_mem_util_pct": _train_scope.avg_mem_util_pct,
-                    "train_busy_time_s": _train_scope.busy_time_s,
+                    # Derivado do MESMO train_elapsed_s que vai ao CSV. Antes vinha do
+                    # elapsed interno do EnergyScope, que cobre uma janela maior (inclui
+                    # o sync das bordas e, nas epocas perfiladas, o export do CUPTI) —
+                    # e por isso busy_time chegava a passar do elapsed reportado.
+                    "train_busy_time_s": (
+                        train_elapsed * _train_scope.avg_util_pct / 100.0
+                        if _train_scope.avg_util_pct is not None else np.nan
+                    ),
                     "val_loss": val_loss,
                     "val_auc": val_auc,
                     "val_precision": val_epoch_metrics["precision"],
@@ -1853,6 +1983,9 @@ def main():
                         )
                 runtime_profiler.step("eval")
         _test_scope.stop()
+        # NAO fazer all_reduce aqui: o teste roda so no rank 0 (bloco `if rank == 0`);
+        # um coletivo travaria os demais ranks. test_energy_j = GPU do rank 0 (1 GPU),
+        # aceitavel por ser uma inferencia final unica, nao a energia de treino.
         y_true = np.concatenate(y_true)
         y_score = np.concatenate(y_score)
         auc_val = roc_auc_score(y_true, y_score)
@@ -1900,7 +2033,7 @@ def main():
         plt.savefig(pdf_path, format="pdf", bbox_inches="tight")
         plt.close()
 
-        final_elapsed = round(time.time() - start_time, 1)
+        final_elapsed = round(time.perf_counter() - start_time, 1)
         avg_gpu_memory_mb = eval_mem_avg
         if csv_writer is not None:
             for field in ("train_gpu_mem_avg_mb", "val_gpu_mem_avg_mb", "test_gpu_mem_avg_mb"):

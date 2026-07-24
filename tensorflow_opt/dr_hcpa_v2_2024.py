@@ -73,8 +73,10 @@ _SELF_DIR = Path(__file__).resolve().parent  # gpu_energy.py vive ao lado do scr
 for _p in (str(_SELF_DIR), str(_PROJECT_ROOT)):
     if _p not in _sys.path:
         _sys.path.insert(0, _p)
-from gpu_energy import GpuTelemetry, EnergyScope
+from gpu_energy import GpuTelemetry, EnergyScope, DEFAULT_SAMPLE_INTERVAL_S
+from gpu_kernel_profile import KernelProfiler
 
+_SAMPLE_INTERVAL_S = DEFAULT_SAMPLE_INTERVAL_S
 _GPU_TELE = None
 
 
@@ -89,34 +91,28 @@ def _gpu_tele() -> GpuTelemetry:
 COMMON_CSV_FIELDS = [
     "epoch",
     "stage",
+    # --- treino: so custo computacional. As metricas clinicas do treino sao
+    #     calculadas sobre lotes com augmentation (mixup/cutmix) e enganam.
     "train_loss",
-    "train_auc",
-    "train_precision",
-    "train_f1",
-    "train_sens",
-    "train_spec",
     "train_throughput_img_s",
     "train_elapsed_s",
-    "train_avg_batch_time_ms",
     "train_gpu_mem_peak_mb",
     "train_energy_j",
     "train_avg_power_w",
     "train_gpu_util_pct",
     "train_mem_util_pct",
     "train_busy_time_s",
+    # --- validacao: trajetoria clinica limpa (sem augmentation) + custo
     "val_loss",
     "val_auc",
     "val_precision",
     "val_f1",
     "val_sens",
     "val_spec",
-    "val_throughput_img_s",
     "val_elapsed_s",
-    "val_avg_batch_time_ms",
     "val_gpu_mem_peak_mb",
     "val_energy_j",
-    "val_avg_power_w",
-    "test_loss",
+    # --- teste final (linha stage=final_test)
     "test_auc",
     "test_precision",
     "test_f1",
@@ -124,10 +120,8 @@ COMMON_CSV_FIELDS = [
     "test_spec",
     "test_throughput_img_s",
     "test_elapsed_s",
-    "test_avg_batch_time_ms",
     "test_gpu_mem_peak_mb",
     "test_energy_j",
-    "test_avg_power_w",
     "lr",
     "total_train_time_s",
 ]
@@ -253,6 +247,13 @@ def parse_args():
     parser.add_argument('--dali_threads', type=int, default=4, help='Number of threads per DALI pipeline')
     parser.add_argument('--dali_layout', type=str, default='NHWC', choices=['NHWC', 'NCHW'], help='Image layout produced by DALI pipeline')
     parser.add_argument('--dali_seed', type=int, default=2024, help='Seed used by DALI pipeline (offset per worker)')
+    parser.add_argument('--ema_decay', type=float, default=0.0,
+                        help='Decay do EMA dos pesos. 0 = DESLIGADO (padrão). '
+                             'Medido: com best-checkpoint ativo os pesos do EMA nunca chegam ao '
+                             'teste (applied_ema=False), e o EMA custa ~6,6%% de energia por época '
+                             'a partir de --ema_start_frac. Use >0 apenas para a ablação.')
+    parser.add_argument('--ema_start_frac', type=float, default=0.6,
+                        help='Fração das épocas a partir da qual o EMA passa a acumular (se ligado)')
     parser.add_argument('--recompute_backbone', action='store_true', help='Habilita tf.recompute_grad no backbone para economizar memória (pode reduzir throughput)')
     parser.add_argument('--jit_compile', action='store_true', help='Habilita jit_compile no Keras/TensorFlow se suportado (pode acelerar, mas aumenta compilação)')
     parser.add_argument('--auc_target', type=float, default=0.95, help='Valor de AUC de validação para registrar tempo de chegada (não interrompe o treino)')
@@ -532,6 +533,15 @@ def create_model(model_name, input_shape):
 class LogMetrics(Callback):
     pass
 
+    def _implements_train_batch_hooks(self):
+        return False
+
+    def _implements_test_batch_hooks(self):
+        return False
+
+    def _implements_predict_batch_hooks(self):
+        return False
+
 
 class EnsureScalarMetrics(Callback):
     def __init__(self, strategy):
@@ -576,13 +586,10 @@ class GpuMemoryTracker(Callback):
         self._get_memory_info = getattr(tf.config.experimental, "get_memory_info", None)
         self._tele = _gpu_tele()
         self.enabled = bool(self.device_names) or self._tele.available
-        self.train_samples = []
-        self.val_samples = []
-        self.power_samples = []
-        self.util_samples = []            # util% da GPU (só na fase de treino)
-        self.mem_util_samples = []        # util% de banda de memória (só treino)
-        self._energy_start_j = None
-        self._train_end_energy_j = None   # energia no fim do treino (fronteira on_test_begin)
+        self._scope = None       # EnergyScope aberto da fase de treino da época atual
+        self._closed = None      # último scope de treino fechado, pronto para leitura
+        self._val_scope = None   # idem para a fase de validação
+        self._val_closed = None
         self.avg_memory_mb = 0.0
 
     def _read_nvidia_smi_usage(self):
@@ -628,72 +635,75 @@ class GpuMemoryTracker(Callback):
         return self._read_nvidia_smi_usage()
 
     def on_epoch_begin(self, epoch, logs=None):
-        self.train_samples = []
-        self.val_samples = []
-        self.power_samples = []
-        self.util_samples = []
-        self._train_end_energy_j = None
-        self.mem_util_samples = []
-        self._energy_start_j = self._tele.energy_j()
+        # Janela KERNEL-ONLY de treino: abre aqui, fecha em on_test_begin (antes da
+        # validação). A amostragem roda em THREAD DE FUNDO — nunca no laço de treino —
+        # para que o overhead de instrumentação não dependa do número de batches e
+        # seja idêntico ao do PyTorch. Ver gpu_energy._effective_interval.
+        if not self.enabled:
+            return
+        self._scope = EnergyScope(self._tele, _SAMPLE_INTERVAL_S)
+        self._scope.__enter__()
 
-    def _sample(self, samples):
-        current_mb = self._read_current_memory_mb()
-        if current_mb is not None:
-            samples.append(float(current_mb))
-        _pw = self._tele.power_w()
-        if _pw is not None:
-            self.power_samples.append(_pw)
-        if samples is self.train_samples:   # util SÓ na fase de treino
-            _u = self._tele.util_pct()
-            if _u is not None:
-                self.util_samples.append(_u)
-            _mu = self._tele.mem_util_pct()
-            if _mu is not None:
-                self.mem_util_samples.append(_mu)
-
-    def on_train_batch_end(self, batch, logs=None):
-        if self.enabled:
-            self._sample(self.train_samples)
-
-    def on_test_batch_end(self, batch, logs=None):
-        if self.enabled:
-            self._sample(self.val_samples)
+    def _close_scope(self):
+        if self._scope is not None:
+            self._scope.__exit__(None, None, None)
+            self._closed = self._scope
+            self._scope = None
 
     def on_test_begin(self, logs=None):
-        # Fronteira treino->validação: energia acumulada ao FIM do treino, para que
-        # train_energy_j seja KERNEL-ONLY de treino (exclui a validação da janela).
-        if self._energy_start_j is not None:
-            self._train_end_energy_j = self._tele.energy_j()
+        # Fronteira treino->validação: fecha a janela de treino (para que
+        # train_energy_j / train_busy_time_s / train_gpu_util_pct sejam SÓ da fase
+        # de treino) e ABRE a janela da validação.
+        self._close_scope()
+        if self.enabled:
+            self._val_scope = EnergyScope(self._tele, _SAMPLE_INTERVAL_S)
+            self._val_scope.__enter__()
+
+    def on_test_end(self, logs=None):
+        # A validação custa energia REAL: 12-23 % do total nas abordagens PyTorch.
+        # O TF antes gravava val_energy_j=None fixo, o que subestimava o custo de
+        # rodar 200 épocas e tornava a comparação com o PyTorch injusta.
+        if self._val_scope is not None:
+            self._val_scope.__exit__(None, None, None)
+            self._val_closed = self._val_scope
+            self._val_scope = None
 
     def on_epoch_end(self, epoch, logs=None):
         if not self.enabled or logs is None:
             return
-        if self.train_samples:
-            logs["train_gpu_mem_avg_mb"] = float(np.mean(self.train_samples))
-        if self.val_samples:
-            logs["val_gpu_mem_avg_mb"] = float(np.mean(self.val_samples))
-        samples = self.train_samples + self.val_samples
-        if samples:
-            self.avg_memory_mb = float(np.mean(samples))
-            logs["train_gpu_mem_peak_mb"] = float(np.max(samples))
-        if self.power_samples:
-            logs["train_avg_power_w"] = float(np.mean(self.power_samples))
-        if self.util_samples:
-            logs["train_gpu_util_pct"] = float(np.mean(self.util_samples))
-        if self.mem_util_samples:
-            logs["train_mem_util_pct"] = float(np.mean(self.mem_util_samples))
-        _e_end = self._tele.energy_j()
-        # KERNEL-ONLY: se houve validação, usa a energia até on_test_begin (só treino);
-        # senão, o fim da época já é só treino.
-        _e_train_end = self._train_end_energy_j if self._train_end_energy_j is not None else _e_end
-        if self._energy_start_j is not None and _e_train_end is not None:
-            logs["train_energy_j"] = max(0.0, _e_train_end - self._energy_start_j)
+        self._close_scope()          # no-op se on_test_begin já fechou (houve validação)
+        v = self._val_closed
+        if v is not None:
+            if v.energy_j is not None:
+                logs["val_energy_j"] = v.energy_j
+            if v.peak_mem_mb is not None:
+                logs["val_gpu_mem_peak_mb"] = v.peak_mem_mb
+            self._val_closed = None
+        s = self._closed
+        if s is None:
+            return
+        if s.energy_j is not None:
+            logs["train_energy_j"] = s.energy_j
+        if s.avg_power_w is not None:
+            logs["train_avg_power_w"] = s.avg_power_w
+        if s.avg_util_pct is not None:
+            logs["train_gpu_util_pct"] = s.avg_util_pct
+        if s.avg_mem_util_pct is not None:
+            logs["train_mem_util_pct"] = s.avg_mem_util_pct
+        if s.busy_time_s is not None:
+            logs["train_busy_time_s"] = s.busy_time_s
+        if s.peak_mem_mb is not None:
+            logs["train_gpu_mem_peak_mb"] = s.peak_mem_mb
+        if s.avg_mem_mb is not None:
+            self.avg_memory_mb = s.avg_mem_mb
+        self._closed = None
 
+    # Sem hooks por-batch: a telemetria não toca o laço de treino.
     def _implements_train_batch_hooks(self):
-        return True
+        return False
 
     def _implements_test_batch_hooks(self):
-        return True
+        return False
 
     def _implements_predict_batch_hooks(self):
         return False
@@ -733,13 +743,23 @@ class ExactEvalMetricsLogger(Callback):
         if not self._is_due(epoch):
             return
         logs = logs if logs is not None else {}
+        # Passada de validacao COMPILADA (tf.function), nao eager. Chamar o
+        # modelo XLA-compilado eagerly por-batch custava ~2 s/epoca e inflava o
+        # overhead ("cinza") de forma desigual vs. PyTorch (que faz UMA passada
+        # de validacao e computa loss + metricas exatas dela). Uma tf.function
+        # cacheada roda em modo grafo, ~igual a validacao embutida do Keras.
+        if getattr(self, "_predict_fn", None) is None:
+            @tf.function(reduce_retracing=True)
+            def _predict_fn(x):
+                return self.model(x, training=False)
+            self._predict_fn = _predict_fn
         labels = []
         scores = []
         for batch_idx, batch in enumerate(self.dataset):
             if self.steps is not None and batch_idx >= self.steps:
                 break
             batch_images, batch_labels = batch[0], batch[1]
-            preds = self.model(batch_images, training=False)
+            preds = self._predict_fn(batch_images)
             labels.append(np.asarray(batch_labels.numpy()).reshape(-1))
             scores.append(np.asarray(preds.numpy()).reshape(-1))
         if not labels:
@@ -762,6 +782,12 @@ class ExactEvalMetricsLogger(Callback):
         logs[f"{prefix}specificity_at_sens95"] = metrics["specificity_at_sens95"]
         logs[f"{prefix}f1"] = metrics["f1"]
 
+    def _implements_train_batch_hooks(self):
+        return False
+
+    def _implements_test_batch_hooks(self):
+        return False
+
 
 class TrainingSpeedLogger(Callback):
     """Mede tempo por época, throughput e registra tempo para atingir AUC alvo."""
@@ -782,12 +808,16 @@ class TrainingSpeedLogger(Callback):
             self._train_start = time.time()
 
     def on_epoch_begin(self, epoch, logs=None):
-        self._epoch_start = time.time()
+        self._epoch_start = time.perf_counter()
 
     def on_epoch_end(self, epoch, logs=None):
         if self._epoch_start is None:
             return
-        duration = max(time.time() - self._epoch_start, 1e-6)
+        # BUG FIX: _epoch_start vem de time.perf_counter() (on_epoch_begin); subtrair
+        # de time.time() misturava dois relogios -> duration virava um TIMESTAMP Unix
+        # (~1.78e9) e throughput_img_s virava lixo (~5e-6). Ambos os relogios agora
+        # sao perf_counter (monotonico), dando o elapsed real da epoca.
+        duration = max(time.perf_counter() - self._epoch_start, 1e-6)
         imgs = self.steps_per_epoch * self.global_batch_size
         throughput = imgs / duration
         if logs is not None:
@@ -1086,17 +1116,39 @@ class TuningFileCallback(Callback):
 
 
 class SaveBestLastCallback(Callback):
-    """Salva pesos 'last.ckpt' a cada época e 'best.ckpt' quando val_AUC melhora."""
+    """Guarda o melhor checkpoint EM MEMORIA (paridade com pytorch_opt, que faz
+    `best_state_dict = {k: v.detach().cpu().clone() ...}` sem tocar disco).
+
+    Antes: `self.model.save_weights()` gravava o modelo inteiro em disco em
+    QUASE TODA epoca (best.ckpt na melhora + last.ckpt sempre que val_AUC>0.5001).
+    Medido: ~5s/epoca de I/O, 200 epocas -> ~17min/run (45% do tempo total no
+    2-GPU) que nao aparecem em train_elapsed_s/val_elapsed_s (a escrita roda em
+    on_epoch_end, DEPOIS das duas janelas de energia/tempo ja terem fechado) —
+    ou seja, nao mede nada, so estica total_train_time_s sem contrapartida.
+
+    last.ckpt em disco so tem UM consumidor: TuningFileCallback, que so existe
+    se HCPA_TUNING_FILE estiver setado (rollback ao vivo do autotuner). Nos
+    runs deste estudo essa env var nunca e passada -> last.ckpt nunca era lido
+    por ninguem. Mantido condicional: grava em disco SO quando o autotuner
+    estiver de fato ativo (preserva a feature pra quem usar); best.ckpt vira
+    100% em memoria sempre, pareado com o pytorch_opt.
+    """
 
     def __init__(self, checkpoints_dir: Path, monitor: str = "val_AUC"):
         super().__init__()
         self.checkpoints_dir = Path(checkpoints_dir)
-        self.checkpoints_dir.mkdir(parents=True, exist_ok=True)
         self.monitor = monitor
         self.best_auc = -math.inf
-        self.best_path = self.checkpoints_dir / "best.ckpt"
+        self.best_epoch = None
+        self.best_weights = None  # lista de ndarrays (get_weights(), ja copiados)
         self.last_path = self.checkpoints_dir / "last.ckpt"
         self.meta_path = self.checkpoints_dir / "best_meta.json"
+        # Unico consumidor de last.ckpt e o TuningFileCallback (rollback do
+        # autotuner), que so existe com HCPA_TUNING_FILE setado. Sem isso,
+        # gravar last.ckpt e I/O morto.
+        self._write_last_to_disk = bool(os.environ.get("HCPA_TUNING_FILE", "").strip())
+        if self._write_last_to_disk:
+            self.checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
     def on_epoch_end(self, epoch, logs=None):
         if logs is None:
@@ -1114,17 +1166,23 @@ class SaveBestLastCallback(Callback):
         # (sensibilidade≈0, especificidade≈1.0 — como no exemplo do usuário).
         # Preservar last.ckpt anterior para que o rollback tenha algo útil.
         # best.ckpt só é sobrescrito quando val_f > self.best_auc (nunca em colapso).
-        if val_f > 0.5001:
+        if self._write_last_to_disk and val_f > 0.5001:
             try:
                 self.model.save_weights(str(self.last_path))
             except Exception:
                 pass
         if val_f > self.best_auc:
             self.best_auc = val_f
+            self.best_epoch = int(epoch)
             try:
-                self.model.save_weights(str(self.best_path))
-                meta = {"epoch": int(epoch), "val_auc": val_f, "path": str(self.best_path)}
-                self.meta_path.write_text(json.dumps(meta, indent=2))
+                # best-checkpoint 100% EM MEMORIA (pareado com pytorch_opt/base e os
+                # hibridos): so guarda os pesos na RAM, so quando a val MELHORA.
+                self.best_weights = self.model.get_weights()
+                # metadata em disco SO quando o autotuner esta ativo (mesmo gate do
+                # last.ckpt); no estudo o caminho de checkpoint nao toca o disco.
+                if self._write_last_to_disk:
+                    meta = {"epoch": int(epoch), "val_auc": val_f, "path": "in-memory"}
+                    self.meta_path.write_text(json.dumps(meta, indent=2))
             except Exception:
                 pass
 
@@ -1188,19 +1246,19 @@ class EpochCsvLogger(Callback):
     def on_epoch_begin(self, epoch, logs=None):
         self._train_elapsed = 0.0
         self._val_elapsed = 0.0
-        self._epoch_start = time.time()
+        self._epoch_start = time.perf_counter()
         self._train_end_time = None
     
     def on_test_begin(self, logs=None):
         # Marca o fim do treino e início da validação
         if self._epoch_start is not None:
-            self._train_end_time = time.time()
+            self._train_end_time = time.perf_counter()
             self._train_elapsed = self._train_end_time - self._epoch_start
     
     def on_test_end(self, logs=None):
         # Calcula tempo de validação
         if self._train_end_time is not None:
-            self._val_elapsed = time.time() - self._train_end_time
+            self._val_elapsed = time.perf_counter() - self._train_end_time
 
     def _resolve_lr(self):
         try:
@@ -1257,9 +1315,9 @@ class EpochCsvLogger(Callback):
         train_recall = train_sens
         train_f1 = _compute_f1_from_precision_recall(train_precision, train_recall)
         train_spec = self._resolve_metric(logs, "specificity")
+        # NAO cair para train_spec: sao metricas diferentes (spec@0.5 vs spec@95sens).
+        # Se a metrica sumir do compile, a coluna deve ficar vazia, nao mentir.
         train_spec_at_sens95 = self._resolve_metric(logs, "specificity_at_sens95")
-        if train_spec_at_sens95 is None:
-            train_spec_at_sens95 = train_spec
         val_loss = logs.get("val_loss")
         val_auc = self._resolve_auc(logs, prefix="val_")
         val_precision = self._resolve_metric(logs, "val_precision")
@@ -1268,8 +1326,6 @@ class EpochCsvLogger(Callback):
         val_f1 = _compute_f1_from_precision_recall(val_precision, val_recall)
         val_spec = self._resolve_metric(logs, "val_specificity")
         val_spec_at_sens95 = self._resolve_metric(logs, "val_specificity_at_sens95")
-        if val_spec_at_sens95 is None:
-            val_spec_at_sens95 = val_spec
 
         train_seen = self.train_steps * self.global_batch_size
         val_seen = self.val_steps * self.global_batch_size
@@ -1333,8 +1389,9 @@ class EpochCsvLogger(Callback):
             "val_inference_latency_ms_img": val_inference_latency_ms_img,
             "val_inference_latency_ms_batch": val_inference_latency_ms_batch,
             "val_gpu_mem_avg_mb": val_mem_avg,
-            "val_gpu_mem_peak_mb": None,
-            "val_energy_j": None,
+            "val_gpu_mem_peak_mb": self._resolve_metric(logs, "val_gpu_mem_peak_mb"),
+            # medido pelo GpuMemoryTracker/GPUMemoryLogger (janela on_test_begin->on_test_end)
+            "val_energy_j": self._resolve_metric(logs, "val_energy_j"),
             "val_avg_power_w": None,
             "test_loss": None,
             "test_auc": None,
@@ -1620,6 +1677,12 @@ def unfreeze_batchnorm_layers(base_model):
             layer.trainable = True
 
 
+# epsilon do Adam/AdamW. Alinhado ao pytorch_opt (que usa 1e-7) para que a
+# comparação entre frameworks isole o runtime, não o otimizador. 1e-7 também é o
+# valor mais conservador sob AMP/FP16.
+ADAM_EPS = 1e-7
+
+
 def build_optimizer(learning_rate, weight_decay, clipnorm, optimizer_name="adamw"):
     name = str(optimizer_name).lower()
     clip_value = clipnorm if clipnorm and clipnorm > 0 else None
@@ -1628,7 +1691,7 @@ def build_optimizer(learning_rate, weight_decay, clipnorm, optimizer_name="adamw
             learning_rate=learning_rate,
             beta_1=0.9,
             beta_2=0.999,
-            epsilon=1e-8,
+            epsilon=ADAM_EPS,
             weight_decay=weight_decay,
             clipnorm=clip_value,
         )
@@ -1637,7 +1700,7 @@ def build_optimizer(learning_rate, weight_decay, clipnorm, optimizer_name="adamw
             learning_rate=learning_rate,
             beta_1=0.9,
             beta_2=0.999,
-            epsilon=1e-8,
+            epsilon=ADAM_EPS,
             clipnorm=clip_value,
         )
     if name in ("sgd", "sgd_mom", "sgd-mom"):
@@ -1980,7 +2043,11 @@ def get_training_dataset(
             lambda image, label: (normalize_image(image, normalize_mode, preprocess_fn), label),
             num_parallel_calls=tf.data.experimental.AUTOTUNE
         )
-    dataset = dataset.shuffle(2048, seed=int(seed), reshuffle_each_iteration=True)
+    # Shuffle COMPLETO (buffer >= train=9350), como o sampler do PyTorch. Antes
+    # o buffer era 2048 (~22% do dataset): embaralhamento parcial que so misturava
+    # imagens vizinhas na ordem do TFRecord — assimetria de regularizacao contra
+    # o PyTorch (que embaralha todos os indices). 12000 cobre train e val.
+    dataset = dataset.shuffle(12000, seed=int(seed), reshuffle_each_iteration=True)
     dataset = dataset.repeat()
     dataset = dataset.batch(GLOBAL_BATCH_SIZE)
     if mixup_alpha_ref is not None or cutmix_alpha_ref is not None:
@@ -2319,6 +2386,51 @@ class Sensitivity(tf.keras.metrics.Metric):
         self.fn.assign(0.0)
 
 
+class Specificity(tf.keras.metrics.Metric):
+    """Especificidade tn/(tn+fp) com threshold fixo em 0.5.
+
+    Existe porque `tf.keras.metrics.SpecificityAtSensitivity` mede outra coisa:
+    a especificidade NO PONTO em que a sensibilidade atinge o alvo (0.95). As duas
+    eram gravadas com o mesmo nome `specificity`, o que fazia o `val_spec` do TF
+    ser spec@95 enquanto o do PyTorch era spec@0.5 — números não comparáveis.
+    """
+
+    def __init__(self, name="specificity", **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.tn = self.add_weight(
+            name="tn",
+            initializer="zeros",
+            aggregation=tf.VariableAggregation.SUM,
+            synchronization=tf.VariableSynchronization.ON_WRITE,
+        )
+        self.fp = self.add_weight(
+            name="fp",
+            initializer="zeros",
+            aggregation=tf.VariableAggregation.SUM,
+            synchronization=tf.VariableSynchronization.ON_WRITE,
+        )
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(tf.round(y_pred), tf.float32)
+        tn = tf.reduce_sum((1.0 - y_true) * (1.0 - y_pred))
+        fp = tf.reduce_sum((1.0 - y_true) * y_pred)
+        if sample_weight is not None:
+            sample_weight = tf.cast(sample_weight, tf.float32)
+            tn = tf.multiply(tn, tf.reduce_mean(sample_weight))
+            fp = tf.multiply(fp, tf.reduce_mean(sample_weight))
+        self.tn.assign_add(tn)
+        self.fp.assign_add(fp)
+
+    def result(self):
+        denom = self.tn + self.fp + tf.keras.backend.epsilon()
+        return self.tn / denom
+
+    def reset_states(self):
+        self.tn.assign(0.0)
+        self.fp.assign(0.0)
+
+
 def generate_thresholds(num_thresholds, kepsilon=1e-7):
     thresholds = [
         (i + 1) * 1.0 / (num_thresholds -1) for i in range(num_thresholds -2)
@@ -2366,11 +2478,14 @@ def compile_model(model, learning_rate, weight_decay, clipnorm, optimizer_name="
             tf.keras.metrics.AUC(num_thresholds=num_thresholds, name='AUC'),
             tf.keras.metrics.Precision(name='precision'),
             Sensitivity(name='sensitivity'),
+            # spec no threshold 0.5 — mesma definição do pytorch_*
+            Specificity(name='specificity'),
+            # spec no ponto de 95% de sensibilidade — o custo clínico por época (Q2)
             tf.keras.metrics.SpecificityAtSensitivity(
                 SPECIFICITY_TARGET_SENSITIVITY,
                 num_thresholds=num_thresholds,
-                name='specificity',
-            )
+                name='specificity_at_sens95',
+            ),
         ]
         model._hcpa_user_metrics = list(metrics)
 
@@ -2572,12 +2687,20 @@ if __name__ == "__main__":
     cache_dir_arg = args.cache_dir.strip()
     if cache_dir_arg.lower() == 'none':
         CACHE_BASE_DIR = None
+    elif cache_dir_arg.lower() == 'memory':
+        # Cache in-memory (.cache() sem path, linha ~1967): CACHE_BASE_DIR e
+        # apenas um FLAG que liga o cache. Nenhum path e escrito em disco. Este
+        # e o modo usado nas rodadas single-GPU do G5K, para paridade com o
+        # cache in-memory do PyTorch (RetinaTFRecordDataset.cache_in_memory).
+        CACHE_BASE_DIR = 'memory'
     else:
         cache_root = Path(cache_dir_arg) if cache_dir_arg else Path(results) / 'tfdata_cache'
         cache_root.mkdir(parents=True, exist_ok=True)
         CACHE_BASE_DIR = str(cache_root)
 
-    if CACHE_BASE_DIR:
+    # O bloco de subdir por-worker so faz sentido para cache EM DISCO (path real).
+    # Para 'memory' (in-memory) e irrelevante: .cache() ignora o path.
+    if CACHE_BASE_DIR and CACHE_BASE_DIR != 'memory':
         worker_id = None
         worker_type = None
         tf_config_raw = os.environ.get('TF_CONFIG')
@@ -2630,9 +2753,23 @@ if __name__ == "__main__":
 
     # CREATE TRAIN AND VALIDATION SUBSETS
     TRAINING_FILENAMES = tf.io.gfile.glob(TFREC_DIR + '/train*.tfrec')
-    VALID_FILENAMES = tf.io.gfile.glob(TFREC_DIR + '/test*.tfrec')
+    # P1: validacao (selecao de modelo por epoca) usa val*; teste final usa test*.
+    # Antes VALID_FILENAMES caia em test* -> o best-ckpt era escolhido no PROPRIO
+    # teste (vies otimista). NAO cair mais em test: falhar alto se val* nao existir.
+    VALID_FILENAMES = (tf.io.gfile.glob(TFREC_DIR + '/val*.tfrec')
+                       or tf.io.gfile.glob(TFREC_DIR + '/valid*.tfrec'))
+    TEST_FILENAMES = (tf.io.gfile.glob(TFREC_DIR + '/test*.tfrec') or VALID_FILENAMES)
+    if not VALID_FILENAMES:
+        raise SystemExit(
+            f'Dataset em {TFREC_DIR} sem split val*: usaria val==test (vazamento P1). '
+            'Use data/all-tfrec-v2.')
+    if set(VALID_FILENAMES) & set(TEST_FILENAMES):
+        raise SystemExit(
+            '[P1] val e test se sobrepoem (dataset sem split val* proprio). '
+            'Use data/all-tfrec-v2.')
     print('Train TFRecord files', len(TRAINING_FILENAMES))
-    print('Train TFRecord files', len(VALID_FILENAMES))
+    print('Valid TFRecord files', len(VALID_FILENAMES))
+    print('Test  TFRecord files', len(TEST_FILENAMES))
 
     train_image_count = count_data_items(TRAINING_FILENAMES) if TRAINING_FILENAMES else 0
     valid_image_count = count_data_items(VALID_FILENAMES) if VALID_FILENAMES else 0
@@ -2641,7 +2778,12 @@ if __name__ == "__main__":
         print('Number of validation images', valid_image_count)
     if train_image_count <= 0 or valid_image_count <= 0:
         raise SystemExit("Nenhum arquivo TFRecord de treino/validação encontrado.")
-    train_steps = max(1, math.ceil(train_image_count / GLOBAL_BATCH_SIZE))
+    # P5: drop_last uniforme. O treino usa .repeat() + steps; com FLOOR, processa
+    # so batches CHEIOS (descarta o resto parcial), igual ao drop_last=True do
+    # pytorch (11000/96 -> 114 batches, nao 115). Batches de tamanho uniforme =
+    # energia/tempo por batch comparaveis. A validacao/teste usa CEIL (ve todas
+    # as amostras — nunca se descarta dado de avaliacao).
+    train_steps = max(1, math.floor(train_image_count / GLOBAL_BATCH_SIZE))
     valid_steps = max(1, math.ceil(valid_image_count / GLOBAL_BATCH_SIZE))
 
     K.clear_session()
@@ -2667,9 +2809,17 @@ if __name__ == "__main__":
     mixup_alpha_var = tf.Variable(mixup_alpha, dtype=tf.float32, trainable=False, name="mixup_alpha") if mixup_alpha > 0.0 else None
     cutmix_alpha_const = tf.constant(cutmix_alpha, dtype=tf.float32) if cutmix_alpha > 0.0 else None
     mixup_schedule_cb = MixupScheduleCallback(mixup_alpha_var, mixup_alpha, EPOCHS, freeze_epochs) if mixup_alpha_var is not None else None
-    ema_start_epoch = max(0, int(0.6 * EPOCHS))
-    ema_callback = EMACallback(decay=0.999, start_epoch=ema_start_epoch)
-    ema_callback.set_model(model)
+    # EMA desligado por padrão (--ema_decay 0). Quando ligado, entra na lista de
+    # callbacks; quando desligado, `ema_callback is None` e não custa nada.
+    ema_decay = float(getattr(args, "ema_decay", 0.0))
+    ema_callback = None
+    if ema_decay > 0.0:
+        ema_start_epoch = max(0, int(float(args.ema_start_frac) * EPOCHS))
+        ema_callback = EMACallback(decay=ema_decay, start_epoch=ema_start_epoch)
+        ema_callback.set_model(model)
+        print(f"[EMA] ativo: decay={ema_decay} start_epoch={ema_start_epoch}")
+    else:
+        print("[EMA] desativado (--ema_decay 0)")
 
     if use_dali:
         train_idx_files = build_idx_list(TRAINING_FILENAMES)
@@ -2739,6 +2889,14 @@ if __name__ == "__main__":
 
     scalar_metrics_cb = EnsureScalarMetrics(strategy)
     gpu_memory_cb = GpuMemoryTracker()
+    # Profiling de kernel (CUPTI via tf.profiler). Desligado a menos que
+    # HCPA_PROFILE_EPOCHS esteja definido; só o worker primário grava.
+    _kprof = KernelProfiler(
+        approach="tensorflow_opt",
+        out_dir=Path(args.results) / f"kprof-{args.exec}",
+        epochs=None if primary_worker else set(),
+    )
+    kprof_cb = _kprof.keras_callback() if _kprof.enabled else None
     exact_val_logger = ExactEvalMetricsLogger(
         valid_dataset,
         prefix="val",
@@ -2769,7 +2927,7 @@ if __name__ == "__main__":
         primary_worker=primary_worker,
     )
 
-    tStart = time.time()
+    tStart = time.perf_counter()
     history_stage1 = None
 
     def next_epoch_from_history(history_obj, fallback_epoch):
@@ -2800,7 +2958,15 @@ if __name__ == "__main__":
             weight_decay=HEAD_WEIGHT_DECAY,
             clipnorm=grad_clip_norm,
         ) if TUNING_FILE else None
-        callbacks_stage1 = [scalar_metrics_cb, gpu_memory_cb, exact_val_logger, csv_logger_stage1, ema_callback, speed_logger]
+        callbacks_stage1 = [scalar_metrics_cb, gpu_memory_cb, exact_val_logger, csv_logger_stage1, speed_logger]
+        if kprof_cb is not None:
+            # PRIMEIRO da lista: seu on_test_begin (que para o profiler e exporta o
+            # trace, custando segundos) precisa rodar ANTES do gpu_memory_cb abrir a
+            # janela de energia da validacao. Senao esse custo entra em val_energy_j
+            # (medimos 5525 J vs ~330 J nas epocas nao perfiladas).
+            callbacks_stage1.insert(0, kprof_cb)
+        if ema_callback is not None:
+            callbacks_stage1.append(ema_callback)
         if fit_profiler_cb is not None:
             callbacks_stage1.append(fit_profiler_cb)
         if save_ckpt_cb is not None:
@@ -2902,7 +3068,8 @@ if __name__ == "__main__":
             pos_weight=pos_weight,
             num_thresholds=num_thresholds,
         )
-        ema_callback.rebuild_shadow_variables()
+        if ema_callback is not None:
+            ema_callback.rebuild_shadow_variables()
         if VERBOSE and base_model is not None:
             trainable_layers = sum(1 for layer in base_model.layers if layer.trainable)
             print(f"[fine-tune] lr={fine_tune_lr:.4e}  trainable_layers={trainable_layers}/{total_layers}  start_layer={ft_state['start']}  freeze_bn={ft_state['freeze_bn']}")
@@ -2955,7 +3122,11 @@ if __name__ == "__main__":
             weight_decay=FINE_TUNE_WEIGHT_DECAY,
             clipnorm=grad_clip_norm,
         ) if TUNING_FILE else None
-        stage2_callbacks_base = [scalar_metrics_cb, gpu_memory_cb, exact_val_logger, csv_logger_stage2, scheduler_cb, ema_callback, speed_logger]
+        stage2_callbacks_base = [scalar_metrics_cb, gpu_memory_cb, exact_val_logger, csv_logger_stage2, scheduler_cb, speed_logger]
+        if kprof_cb is not None:
+            stage2_callbacks_base.insert(0, kprof_cb)   # ver nota no stage1
+        if ema_callback is not None:
+            stage2_callbacks_base.append(ema_callback)
         if fit_profiler_cb is not None:
             stage2_callbacks_base.append(fit_profiler_cb)
         if save_ckpt_cb is not None:
@@ -2981,7 +3152,8 @@ if __name__ == "__main__":
                     pos_weight=pos_weight,
                     num_thresholds=num_thresholds,
                 )
-                ema_callback.rebuild_shadow_variables()
+                if ema_callback is not None:
+                    ema_callback.rebuild_shadow_variables()
                 if tuning_cb_stage2 is not None:
                     tuning_cb_stage2.optimizer = model.optimizer
 
@@ -3019,41 +3191,41 @@ if __name__ == "__main__":
     if current_epoch < EPOCHS:
         raise RuntimeError(f"Treinamento encerrou antes das {EPOCHS} épocas previstas (concluídas: {current_epoch}).")
 
-    tElapsed = round(time.time() - tStart, 1)
+    tElapsed = round(time.perf_counter() - tStart, 1)
 
     print(' ')
     print('Time (sec) elapsed: ', tElapsed)
     print('...')
 
-    best_ckpt_path = checkpoints_dir / "best.ckpt"
-    best_ckpt_index = Path(str(best_ckpt_path) + ".index")
+    # Restaura o melhor checkpoint EM MEMORIA (save_ckpt_cb.best_weights), sem
+    # tocar disco — paridade com o "[BEST] Restaurado checkpoint em memória"
+    # do pytorch_opt. save_ckpt_cb e o mesmo objeto usado nos stages 1/2 (segue
+    # em escopo aqui); e None em workers nao-primarios.
     loaded_best_ckpt = False
-    if best_ckpt_path.exists() or best_ckpt_index.exists():
+    if save_ckpt_cb is not None and save_ckpt_cb.best_weights is not None:
         try:
-            model.load_weights(str(best_ckpt_path))
+            model.set_weights(save_ckpt_cb.best_weights)
             loaded_best_ckpt = True
-            best_meta_path = checkpoints_dir / "best_meta.json"
-            if best_meta_path.exists():
-                try:
-                    best_meta = json.loads(best_meta_path.read_text())
-                    print(
-                        "[BEST] Restaurado best.ckpt: "
-                        f"epoch={best_meta.get('epoch')} val_auc={best_meta.get('val_auc')}"
-                    )
-                except Exception:
-                    print(f"[BEST] Restaurado best.ckpt: {best_ckpt_path}")
-            else:
-                print(f"[BEST] Restaurado best.ckpt: {best_ckpt_path}")
+            print(
+                "[BEST] Restaurado checkpoint em memória: "
+                f"epoch={save_ckpt_cb.best_epoch} val_auc={save_ckpt_cb.best_auc:.6f}"
+            )
         except Exception as exc:
-            print(f"[WARN] Falha ao carregar best.ckpt; usando fallback EMA/final: {exc}")
+            print(f"[WARN] Falha ao restaurar best em memória; usando fallback EMA/final: {exc}")
 
     valid_eval_dataset = get_valid_dataset(
-        VALID_FILENAMES,
+        TEST_FILENAMES,                       # P1: TESTE FINAL usa test*, nao val*
         normalize_mode=normalize_mode,
         preprocess_fn=preprocess_fn,
         fundus_crop_ratio=fundus_crop_ratio
     )
-    applied_ema = False if loaded_best_ckpt else ema_callback.apply_ema_weights()
+    # Só cai nos pesos do EMA se (a) o EMA estiver ligado E (b) o best.ckpt não tiver
+    # carregado. Na prática (b) nunca ocorre — daí o EMA ser desligado por padrão.
+    applied_ema = (
+        ema_callback is not None
+        and not loaded_best_ckpt
+        and ema_callback.apply_ema_weights()
+    )
     eval_predict_start = time.time()
     _test_scope = EnergyScope(_gpu_tele())
     _test_scope.start()
@@ -3098,7 +3270,7 @@ if __name__ == "__main__":
         fundus_crop_ratio=fundus_crop_ratio
     )
     valid_eval_dataset_for_eval = get_valid_dataset(
-        VALID_FILENAMES,
+        TEST_FILENAMES,                       # P1: avaliacao final no teste
         normalize_mode=normalize_mode,
         preprocess_fn=preprocess_fn,
         fundus_crop_ratio=fundus_crop_ratio

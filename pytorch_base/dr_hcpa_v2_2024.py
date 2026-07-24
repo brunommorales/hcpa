@@ -58,37 +58,28 @@ def _gpu_tele() -> GpuTelemetry:
 COMMON_CSV_FIELDS = [
     "epoch",
     "stage",
+    # --- treino: so custo computacional. As metricas clinicas do treino sao
+    #     calculadas sobre lotes com augmentation (mixup/cutmix) e enganam.
     "train_loss",
-    "train_auc",
-    "train_precision",
-    "train_f1",
-    "train_sens",
-    "train_spec",
     "train_throughput_img_s",
     "train_elapsed_s",
-    "train_avg_batch_time_ms",
     "train_gpu_mem_peak_mb",
     "train_energy_j",
     "train_avg_power_w",
     "train_gpu_util_pct",
     "train_mem_util_pct",
     "train_busy_time_s",
+    # --- validacao: trajetoria clinica limpa (sem augmentation) + custo
     "val_loss",
     "val_auc",
     "val_precision",
     "val_f1",
     "val_sens",
     "val_spec",
-    "val_throughput_img_s",
     "val_elapsed_s",
-    "val_avg_batch_time_ms",
     "val_gpu_mem_peak_mb",
     "val_energy_j",
-    "val_avg_power_w",
-    "val_gpu_util_pct",
-    "val_mem_util_pct",
-    "val_busy_time_s",
-    "test_loss",
+    # --- teste final (linha stage=final_test)
     "test_auc",
     "test_precision",
     "test_f1",
@@ -96,10 +87,8 @@ COMMON_CSV_FIELDS = [
     "test_spec",
     "test_throughput_img_s",
     "test_elapsed_s",
-    "test_avg_batch_time_ms",
     "test_gpu_mem_peak_mb",
     "test_energy_j",
-    "test_avg_power_w",
     "lr",
     "total_train_time_s",
 ]
@@ -637,6 +626,15 @@ def set_global_seed(seed: Optional[int]):
     torch.cuda.manual_seed_all(s)
 
 
+def _seed_worker(worker_id: int) -> None:
+    # Sem worker_init_fn, os workers do DataLoader herdam (via fork) o MESMO estado
+    # global de np.random e aplicam augmentacoes IDENTICAS. torch semeia cada worker
+    # de forma deterministica; propagamos para numpy/random p/ diversificar o augment.
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
 def init_distributed(use_cuda: bool) -> Tuple[int, int, int]:
     if not dist.is_initialized():
         if "RANK" in os.environ or "WORLD_SIZE" in os.environ:
@@ -717,7 +715,8 @@ def main():
     train_paths = sorted(tfrec_dir.glob("train*.tfrec"))
     val_paths = sorted(tfrec_dir.glob("val*.tfrec")) + sorted(tfrec_dir.glob("valid*.tfrec"))
     test_paths = sorted(tfrec_dir.glob("test*.tfrec"))
-    valid_paths = val_paths or test_paths
+    # NAO cair em test como validacao (vazamento P1: best-ckpt escolhido no teste).
+    valid_paths = val_paths
     test_paths = test_paths or valid_paths
     if rank == 0:
         print(
@@ -725,7 +724,13 @@ def main():
             f"{len(valid_paths)} de validação e {len(test_paths)} de teste."
         )
     if not train_paths or not valid_paths or not test_paths:
-        raise SystemExit("É necessário ao menos um TFRecord de treino e um de validação/teste.")
+        raise SystemExit(
+            "É necessário TFRecords de treino, validação (val*) e teste (test*). "
+            "Sem split val* proprio, use data/all-tfrec-v2 (vazamento P1)."
+        )
+    # GUARDA P1: val e test disjuntos.
+    if set(valid_paths) & set(test_paths):
+        raise SystemExit("val e test compartilham TFRecords (vazamento P1). Use data/all-tfrec-v2.")
 
     train_idx = [infer_idx(p) for p in train_paths]
     valid_idx = [infer_idx(p) for p in valid_paths]
@@ -787,6 +792,7 @@ def main():
         drop_last=True,
         persistent_workers=True if num_workers > 0 else False,
         prefetch_factor=4 if num_workers > 0 else None,
+        worker_init_fn=_seed_worker,
     )
     valid_loader = DataLoader(
         valid_ds,
@@ -798,6 +804,7 @@ def main():
         drop_last=False,
         persistent_workers=True if num_workers > 0 else False,
         prefetch_factor=4 if num_workers > 0 else None,
+        worker_init_fn=_seed_worker,
     )
     test_loader = DataLoader(
         test_ds,
@@ -809,6 +816,7 @@ def main():
         drop_last=False,
         persistent_workers=True if num_workers > 0 else False,
         prefetch_factor=4 if num_workers > 0 else None,
+        worker_init_fn=_seed_worker,
     )
     if rank == 0:
         print(f"[DataLoader] num_workers={num_workers}, persistent_workers=True, prefetch_factor=4")
@@ -951,7 +959,7 @@ def main():
         inference_time_s = 0.0
         inference_batches = 0
         inference_samples = 0
-        t_start = time.time()
+        t_start = time.perf_counter()
         num_batches = 0
         loader_iter = iter(loader)
         while True:
@@ -1018,14 +1026,11 @@ def main():
                         all_probs.append(probs.detach())
                         all_labels.append(yb.detach())
 
-                if track_memory:
-                    torch.cuda.synchronize(device)
-                    allocated_mb = torch.cuda.memory_allocated(device) / (1024 ** 2)
-                    reserved_mb = torch.cuda.memory_reserved(device) / (1024 ** 2)
-                    _used_mb = _gpu_tele().memory_used_mb()
-                    memory_samples_mb.append(
-                        _used_mb if _used_mb is not None else max(allocated_mb, reserved_mb)
-                    )
+                # (removido) amostragem de memoria POR BATCH: ela chamava
+                # torch.cuda.synchronize() a cada batch do TREINO, serializando o
+                # pipeline e inflando a ociosidade medida — enquanto o TensorFlow
+                # rodava livre. O pico de memoria vem do EnergyScope (thread de
+                # fundo, NVML), e a media foi removida do schema.
 
             runtime_profiler.step(stage_name)
 
@@ -1061,7 +1066,7 @@ def main():
         inference_latency_ms_batch = (
             inference_time_s / inference_batches * 1000.0 if inference_batches > 0 else float("nan")
         )
-        elapsed = time.time() - t_start
+        elapsed = time.perf_counter() - t_start
         avg_batch_time_ms = (elapsed / max(num_batches, 1)) * 1000.0 if num_batches > 0 else 0.0
         # throughput global: soma samples de todos os ranks
         global_samples = n_samples
@@ -1109,7 +1114,7 @@ def main():
 
     best_val_auc = -1.0
     best_state_dict = None
-    start_time = time.time()
+    start_time = time.perf_counter()
 
     for epoch in range(EPOCHS):
         if current_stage == "freeze" and epoch >= freeze_epochs:
@@ -1189,7 +1194,14 @@ def main():
                     "train_avg_power_w": _train_scope.avg_power_w,
                     "train_gpu_util_pct": _train_scope.avg_util_pct,
                     "train_mem_util_pct": _train_scope.avg_mem_util_pct,
-                    "train_busy_time_s": _train_scope.busy_time_s,
+                    # Derivado do MESMO train_elapsed_s que vai ao CSV. Antes vinha do
+                    # elapsed interno do EnergyScope, que cobre uma janela maior (inclui
+                    # o sync das bordas e, nas epocas perfiladas, o export do CUPTI) —
+                    # e por isso busy_time chegava a passar do elapsed reportado.
+                    "train_busy_time_s": (
+                        train_elapsed * _train_scope.avg_util_pct / 100.0
+                        if _train_scope.avg_util_pct is not None else np.nan
+                    ),
                     "val_loss": val_loss,
                     "val_auc": val_auc,
                     "val_precision": val_epoch_metrics["precision"],
@@ -1351,7 +1363,7 @@ def main():
         plt.savefig(pdf_path, format="pdf", bbox_inches="tight")
         plt.close()
 
-        final_elapsed = round(time.time() - start_time, 1)
+        final_elapsed = round(time.perf_counter() - start_time, 1)
         if csv_writer is not None:
             final_row = {
                 "epoch": EPOCHS,

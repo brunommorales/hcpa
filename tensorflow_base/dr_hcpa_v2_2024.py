@@ -50,6 +50,34 @@ class Sensitivity(tf.keras.metrics.Metric):
         self.fn.assign(0.0)
 
 
+class Specificity(tf.keras.metrics.Metric):
+    """Especificidade tn/(tn+fp) com threshold fixo em 0.5.
+
+    Existe porque `keras.metrics.SpecificityAtSensitivity` mede outra coisa: a
+    especificidade NO PONTO em que a sensibilidade atinge o alvo (0.95). As duas
+    eram gravadas com o mesmo nome `specificity`, o que fazia o `val_spec` do TF
+    ser spec@95 enquanto o do PyTorch era spec@0.5 — números não comparáveis.
+    """
+
+    def __init__(self, name="specificity", **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.tn = self.add_weight(name="tn", initializer="zeros")
+        self.fp = self.add_weight(name="fp", initializer="zeros")
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(tf.round(y_pred), tf.float32)
+        self.tn.assign_add(tf.reduce_sum((1.0 - y_true) * (1.0 - y_pred)))
+        self.fp.assign_add(tf.reduce_sum((1.0 - y_true) * y_pred))
+
+    def result(self):
+        return self.tn / (self.tn + self.fp + tf.keras.backend.epsilon())
+
+    def reset_state(self):
+        self.tn.assign(0.0)
+        self.fp.assign(0.0)
+
+
 def _compute_f1_from_precision_recall(precision, recall):
     if precision is None or recall is None:
         return None
@@ -384,82 +412,87 @@ def _read_gpu_current_memory_mb():
 
 
 class GPUMemoryLogger(keras.callbacks.Callback):
-    """Amostra consumo corrente de memória GPU e grava média por época."""
+    """Telemetria da FASE DE TREINO de cada época (energia, potência, util, memória).
+
+    A janela abre em on_epoch_begin e fecha em on_test_begin — antes da validação —
+    logo tudo o que ela reporta é kernel-only de treino. A amostragem roda em THREAD
+    DE FUNDO, nunca no laço de treino, para que o overhead de instrumentação não
+    dependa do número de batches (o que enviesaria justamente o util%).
+    """
 
     def __init__(self, enabled: bool):
         super().__init__()
         self.enabled = enabled
-        self.train_samples = []
-        self.val_samples = []
-        self.power_samples = []
-        self.util_samples = []            # util% da GPU (só na fase de treino)
-        self.mem_util_samples = []        # util% de banda de memória (só treino)
-        self._energy_start_j = None
-        self._train_end_energy_j = None   # energia no fim do treino (fronteira on_test_begin)
         self._tele = _gpu_tele()
+        self._scope = None       # EnergyScope aberto da fase de treino da época atual
+        self._closed = None      # último scope de treino fechado, pronto para leitura
+        self._val_scope = None   # idem para a fase de validação
+        self._val_closed = None
 
     def on_epoch_begin(self, epoch, logs=None):
-        if self.enabled:
-            self.train_samples = []
-            self.val_samples = []
-            self.power_samples = []
-            self.util_samples = []
-            self._train_end_energy_j = None
-            self.mem_util_samples = []
-            self._energy_start_j = self._tele.energy_j()
+        if not self.enabled:
+            return
+        self._scope = EnergyScope(self._tele, _SAMPLE_INTERVAL_S)
+        self._scope.__enter__()
 
-    def _sample(self, samples):
-        current_mb = _read_gpu_current_memory_mb()
-        if current_mb is not None:
-            samples.append(float(current_mb))
-        _pw = self._tele.power_w()
-        if _pw is not None:
-            self.power_samples.append(_pw)
-        if samples is self.train_samples:   # util SÓ na fase de treino
-            _u = self._tele.util_pct()
-            if _u is not None:
-                self.util_samples.append(_u)
-            _mu = self._tele.mem_util_pct()
-            if _mu is not None:
-                self.mem_util_samples.append(_mu)
-
-    def on_train_batch_end(self, batch, logs=None):
-        if self.enabled:
-            self._sample(self.train_samples)
-
-    def on_test_batch_end(self, batch, logs=None):
-        if self.enabled:
-            self._sample(self.val_samples)
+    def _close_scope(self):
+        if self._scope is not None:
+            self._scope.__exit__(None, None, None)
+            self._closed = self._scope
+            self._scope = None
 
     def on_test_begin(self, logs=None):
-        # Fronteira treino->validação: energia acumulada ao FIM do treino, para que
-        # train_energy_j seja KERNEL-ONLY de treino (exclui a validação da janela).
-        if self.enabled and self._energy_start_j is not None:
-            self._train_end_energy_j = self._tele.energy_j()
+        self._close_scope()
+        if self.enabled:
+            self._val_scope = EnergyScope(self._tele, _SAMPLE_INTERVAL_S)
+            self._val_scope.__enter__()
+
+    def on_test_end(self, logs=None):
+        # A validação custa energia REAL (12-23 % do total nas abordagens PyTorch).
+        # Antes o TF gravava val_energy_j=None fixo.
+        if self._val_scope is not None:
+            self._val_scope.__exit__(None, None, None)
+            self._val_closed = self._val_scope
+            self._val_scope = None
 
     def on_epoch_end(self, epoch, logs=None):
         if not self.enabled:
             return
-        logs = logs or {}
-        if self.train_samples:
-            logs["train_gpu_mem_avg_mb"] = float(np.mean(self.train_samples))
-        if self.val_samples:
-            logs["val_gpu_mem_avg_mb"] = float(np.mean(self.val_samples))
-        all_mem = self.train_samples + self.val_samples
-        if all_mem:
-            logs["train_gpu_mem_peak_mb"] = float(np.max(all_mem))
-        if self.power_samples:
-            logs["train_avg_power_w"] = float(np.mean(self.power_samples))
-        if self.util_samples:
-            logs["train_gpu_util_pct"] = float(np.mean(self.util_samples))
-        if self.mem_util_samples:
-            logs["train_mem_util_pct"] = float(np.mean(self.mem_util_samples))
-        _e_end = self._tele.energy_j()
-        # KERNEL-ONLY: se houve validação, usa a energia até on_test_begin (só treino);
-        # senão, o fim da época já é só treino.
-        _e_train_end = self._train_end_energy_j if self._train_end_energy_j is not None else _e_end
-        if self._energy_start_j is not None and _e_train_end is not None:
-            logs["train_energy_j"] = max(0.0, _e_train_end - self._energy_start_j)
+        self._close_scope()          # no-op se on_test_begin já fechou
+        logs = logs if logs is not None else {}
+        v = self._val_closed
+        if v is not None:
+            if v.energy_j is not None:
+                logs["val_energy_j"] = v.energy_j
+            if v.peak_mem_mb is not None:
+                logs["val_gpu_mem_peak_mb"] = v.peak_mem_mb
+            self._val_closed = None
+        s = self._closed
+        if s is None:
+            return
+        if s.energy_j is not None:
+            logs["train_energy_j"] = s.energy_j
+        if s.avg_power_w is not None:
+            logs["train_avg_power_w"] = s.avg_power_w
+        if s.avg_util_pct is not None:
+            logs["train_gpu_util_pct"] = s.avg_util_pct
+        if s.avg_mem_util_pct is not None:
+            logs["train_mem_util_pct"] = s.avg_mem_util_pct
+        if s.busy_time_s is not None:
+            logs["train_busy_time_s"] = s.busy_time_s
+        if s.peak_mem_mb is not None:
+            logs["train_gpu_mem_peak_mb"] = s.peak_mem_mb
+        self._closed = None
+
+    # Sem hooks por-batch: a telemetria não toca o laço de treino.
+    def _implements_train_batch_hooks(self):
+        return False
+
+    def _implements_test_batch_hooks(self):
+        return False
+
+    def _implements_predict_batch_hooks(self):
+        return False
 
 
 class ExactEvalMetricsLogger(keras.callbacks.Callback):
@@ -476,13 +509,23 @@ class ExactEvalMetricsLogger(keras.callbacks.Callback):
         if not self.enabled:
             return
         logs = logs if logs is not None else {}
+        # Passada de validacao COMPILADA (tf.function), nao eager. Chamar o
+        # modelo XLA-compilado eagerly por-batch custava ~2 s/epoca e inflava o
+        # overhead ("cinza") de forma desigual vs. PyTorch (que faz UMA passada
+        # de validacao e computa loss + metricas exatas dela). Uma tf.function
+        # cacheada roda em modo grafo, ~igual a validacao embutida do Keras.
+        if getattr(self, "_predict_fn", None) is None:
+            @tf.function(reduce_retracing=True)
+            def _predict_fn(x):
+                return self.model(x, training=False)
+            self._predict_fn = _predict_fn
         labels = []
         scores = []
         for batch_idx, batch in enumerate(self.dataset):
             if self.steps is not None and batch_idx >= self.steps:
                 break
             batch_images, batch_labels = batch[0], batch[1]
-            preds = self.model(batch_images, training=False)
+            preds = self._predict_fn(batch_images)
             labels.append(np.asarray(batch_labels.numpy()).reshape(-1))
             scores.append(np.asarray(preds.numpy()).reshape(-1))
         if not labels:
@@ -504,6 +547,15 @@ class ExactEvalMetricsLogger(keras.callbacks.Callback):
         logs[f"{prefix}specificity"] = metrics["specificity"]
         logs[f"{prefix}specificity_at_sens95"] = metrics["specificity_at_sens95"]
         logs[f"{prefix}f1"] = metrics["f1"]
+
+    def _implements_train_batch_hooks(self):
+        return False
+
+    def _implements_test_batch_hooks(self):
+        return False
+
+    def _implements_predict_batch_hooks(self):
+        return False
 
 
 class BestWeightsTracker(keras.callbacks.Callback):
@@ -549,6 +601,15 @@ class BestWeightsTracker(keras.callbacks.Callback):
         model.set_weights(self.best_weights)
         return True
 
+    def _implements_train_batch_hooks(self):
+        return False
+
+    def _implements_test_batch_hooks(self):
+        return False
+
+    def _implements_predict_batch_hooks(self):
+        return False
+
 
 
 def _dataset_cardinality(dataset):
@@ -565,7 +626,9 @@ _SELF_DIR = Path(__file__).resolve().parent  # gpu_energy.py vive ao lado do scr
 for _p in (str(_SELF_DIR), str(_PROJECT_ROOT)):
     if _p not in _sys.path:
         _sys.path.insert(0, _p)
-from gpu_energy import GpuTelemetry, EnergyScope
+from gpu_energy import GpuTelemetry, EnergyScope, DEFAULT_SAMPLE_INTERVAL_S
+
+_SAMPLE_INTERVAL_S = DEFAULT_SAMPLE_INTERVAL_S
 
 _GPU_TELE = None
 
@@ -581,34 +644,28 @@ def _gpu_tele() -> GpuTelemetry:
 COMMON_CSV_FIELDS = [
     "epoch",
     "stage",
+    # --- treino: so custo computacional. As metricas clinicas do treino sao
+    #     calculadas sobre lotes com augmentation (mixup/cutmix) e enganam.
     "train_loss",
-    "train_auc",
-    "train_precision",
-    "train_f1",
-    "train_sens",
-    "train_spec",
     "train_throughput_img_s",
     "train_elapsed_s",
-    "train_avg_batch_time_ms",
     "train_gpu_mem_peak_mb",
     "train_energy_j",
     "train_avg_power_w",
     "train_gpu_util_pct",
     "train_mem_util_pct",
     "train_busy_time_s",
+    # --- validacao: trajetoria clinica limpa (sem augmentation) + custo
     "val_loss",
     "val_auc",
     "val_precision",
     "val_f1",
     "val_sens",
     "val_spec",
-    "val_throughput_img_s",
     "val_elapsed_s",
-    "val_avg_batch_time_ms",
     "val_gpu_mem_peak_mb",
     "val_energy_j",
-    "val_avg_power_w",
-    "test_loss",
+    # --- teste final (linha stage=final_test)
     "test_auc",
     "test_precision",
     "test_f1",
@@ -616,10 +673,8 @@ COMMON_CSV_FIELDS = [
     "test_spec",
     "test_throughput_img_s",
     "test_elapsed_s",
-    "test_avg_batch_time_ms",
     "test_gpu_mem_peak_mb",
     "test_energy_j",
-    "test_avg_power_w",
     "lr",
     "total_train_time_s",
 ]
@@ -660,19 +715,19 @@ class EpochCsvLogger(keras.callbacks.Callback):
     def on_epoch_begin(self, epoch, logs=None):
         self._train_elapsed = 0.0
         self._val_elapsed = 0.0
-        self._epoch_start = time.time()
+        self._epoch_start = time.perf_counter()
         self._train_end_time = None
     
     def on_test_begin(self, logs=None):
         # Marca o fim do treino e início da validação
         if self._epoch_start is not None:
-            self._train_end_time = time.time()
+            self._train_end_time = time.perf_counter()
             self._train_elapsed = self._train_end_time - self._epoch_start
     
     def on_test_end(self, logs=None):
         # Calcula tempo de validação
         if self._train_end_time is not None:
-            self._val_elapsed = time.time() - self._train_end_time
+            self._val_elapsed = time.perf_counter() - self._train_end_time
 
     def _resolve_lr(self):
         try:
@@ -706,9 +761,9 @@ class EpochCsvLogger(keras.callbacks.Callback):
         train_recall = train_sens
         train_f1 = _compute_f1_from_precision_recall(train_precision, train_recall)
         train_spec = self._resolve_metric(logs, "specificity")
+        # NAO cair para train_spec: sao metricas diferentes (spec@0.5 vs spec@95sens).
+        # Se a metrica sumir do compile, a coluna deve ficar vazia, nao mentir.
         train_spec_at_sens95 = self._resolve_metric(logs, "specificity_at_sens95")
-        if train_spec_at_sens95 is None:
-            train_spec_at_sens95 = train_spec
         val_loss = logs.get("val_loss")
         val_auc = self._resolve_auc(logs, prefix="val_")
         val_precision = self._resolve_metric(logs, "val_precision")
@@ -717,8 +772,6 @@ class EpochCsvLogger(keras.callbacks.Callback):
         val_f1 = _compute_f1_from_precision_recall(val_precision, val_recall)
         val_spec = self._resolve_metric(logs, "val_specificity")
         val_spec_at_sens95 = self._resolve_metric(logs, "val_specificity_at_sens95")
-        if val_spec_at_sens95 is None:
-            val_spec_at_sens95 = val_spec
 
         train_seen = None if self.train_steps is None else self.train_steps * self.global_batch_size
         val_seen = None if self.val_steps is None else self.val_steps * self.global_batch_size
@@ -790,8 +843,9 @@ class EpochCsvLogger(keras.callbacks.Callback):
             "val_inference_latency_ms_img": val_inference_latency_ms_img,
             "val_inference_latency_ms_batch": val_inference_latency_ms_batch,
             "val_gpu_mem_avg_mb": val_mem_avg,
-            "val_gpu_mem_peak_mb": None,
-            "val_energy_j": None,
+            "val_gpu_mem_peak_mb": self._resolve_metric(logs, "val_gpu_mem_peak_mb"),
+            # medido pelo GpuMemoryTracker/GPUMemoryLogger (janela on_test_begin->on_test_end)
+            "val_energy_j": self._resolve_metric(logs, "val_energy_j"),
             "val_avg_power_w": None,
             "test_loss": None,
             "test_auc": None,
@@ -825,6 +879,15 @@ class EpochCsvLogger(keras.callbacks.Callback):
                 pass
             self._file = None
             self._writer = None
+
+    def _implements_train_batch_hooks(self):
+        return False
+
+    def _implements_test_batch_hooks(self):
+        return False
+
+    def _implements_predict_batch_hooks(self):
+        return False
 
 
 def decode_example(example, img_size: int) -> Tuple[tf.Tensor, tf.Tensor]:
@@ -960,13 +1023,18 @@ def build_dataset(
 
     dataset = tf.data.TFRecordDataset(files, num_parallel_reads=tf.data.AUTOTUNE)
     dataset = dataset.with_options(options)
-    if training:
-        # Shuffle buffer maior para melhor randomização (8192 em vez de 2048)
-        dataset = dataset.shuffle(8192, reshuffle_each_iteration=True)
+    # PARIDADE DE PIPELINE com tensorflow_opt e PyTorch: decode PRIMEIRO, depois
+    # cache in-memory da imagem decodificada+redimensionada (elimina o JPEG decode
+    # nas epocas 2+). Antes o base NAO tinha .cache() e redecodificava toda epoca.
     dataset = dataset.map(
         lambda ex: decode_example(ex, img_size), num_parallel_calls=tf.data.AUTOTUNE
     )
+    dataset = dataset.cache()  # sem path = in-memory; aplica a train, valid e test
     if training:
+        # Shuffle COMPLETO (buffer >= train=9350) DEPOIS do cache: reembaralha os
+        # tensores cacheados a cada epoca, como o sampler do PyTorch. Antes era
+        # shuffle(8192) ANTES do decode — parcial e em ponto diferente do opt.
+        dataset = dataset.shuffle(12000, reshuffle_each_iteration=True)
         dataset = dataset.map(
             lambda img, label: (augment_image(img, augment_flag), label),
             num_parallel_calls=tf.data.AUTOTUNE,
@@ -1059,10 +1127,17 @@ def main():
     train_files = sorted(tfrec_dir.glob("train*.tfrec"))
     val_files = sorted(tfrec_dir.glob("val*.tfrec")) + sorted(tfrec_dir.glob("valid*.tfrec"))
     test_files = sorted(tfrec_dir.glob("test*.tfrec"))
-    valid_files = val_files or test_files
+    # NAO cair em test como validacao (vazamento P1: best-ckpt escolhido no teste).
+    valid_files = val_files
     test_files = test_files or valid_files
     if not train_files or not valid_files or not test_files:
-        raise SystemExit("É necessário ao menos um TFRecord de treino e um de validação/teste.")
+        raise SystemExit(
+            "É necessário TFRecords de treino, validação (val*) e teste (test*). "
+            "Sem split val* proprio, use data/all-tfrec-v2 (vazamento P1)."
+        )
+    # GUARDA P1: val e test disjuntos.
+    if set(valid_files) & set(test_files):
+        raise SystemExit("val e test compartilham TFRecords (vazamento P1). Use data/all-tfrec-v2.")
     print(
         f"Treino: {len(train_files)} arquivos | "
         f"Validação: {len(valid_files)} arquivos | Teste: {len(test_files)} arquivos"
@@ -1169,10 +1244,13 @@ def main():
                 keras.metrics.AUC(num_thresholds=args.num_thresholds, name="AUC"),
                 keras.metrics.Precision(name="precision"),
                 Sensitivity(name="sensitivity"),
+                # spec no threshold 0.5 — mesma definição do pytorch_*
+                Specificity(name="specificity"),
+                # spec no ponto de 95% de sensibilidade — o custo clínico por época (Q2)
                 keras.metrics.SpecificityAtSensitivity(
                     SPECIFICITY_TARGET_SENSITIVITY,
                     num_thresholds=args.num_thresholds,
-                    name="specificity",
+                    name="specificity_at_sens95",
                 ),
             ],
         )
@@ -1228,7 +1306,7 @@ def main():
         )
     callbacks.append(csv_logger)
 
-    t_start = time.time()
+    t_start = time.perf_counter()
     history = model.fit(
         train_ds,
         validation_data=valid_ds,
@@ -1272,7 +1350,7 @@ def main():
             print("[INFO] Pesos restaurados do melhor checkpoint em memoria para o final_test.")
     else:
         print("[WARN] Nenhum checkpoint em memoria encontrado para restaurar; usando pesos finais.")
-    elapsed = round(time.time() - t_start, 1)
+    elapsed = round(time.perf_counter() - t_start, 1)
 
     valid_eval = build_dataset(
         [str(p) for p in test_files],
