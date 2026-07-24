@@ -54,10 +54,14 @@ CODE_INCLUDES=(
   'pytorch_opt/***'
   'tensorflow_base/***'
   'tensorflow_opt/***'
+  'retfound_green/***'
+  'gpu_energy.py'
+  'gpu_kernel_profile.py'
 )
 
 COMMON_EXCLUDES=(
   '**/results/***'
+  '**/results_*/***'
   '**/logs/***'
   '**/.venv/***'
   '**/env/***'

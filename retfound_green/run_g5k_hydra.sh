@@ -16,7 +16,10 @@ EXEC_FLAG=--exec_id
 SEED_FLAG=--seed
 TRAIN_ACCEPTS_DATASET=1
 
-TARGET_EPOCHS="${EPOCHS:-200}"
+# HCPA_EPOCHS e a manopla UNICA de epocas nas 8 abordagens. Antes cada script
+# lia um nome diferente (TARGET_EPOCHS / EPOCHS / HCPA_EPOCHS): passar
+# HCPA_EPOCHS=5 aqui era ignorado e o run ia para 200 epocas em silencio.
+TARGET_EPOCHS="${HCPA_EPOCHS:-${TARGET_EPOCHS:-${EPOCHS:-200}}}"
 BATCH_SIZE="${BATCH_SIZE:-96}"
 LEARNING_RATE="${LEARNING_RATE:-5e-5}"
 IMG_SIZE="${IMG_SIZE:-392}"

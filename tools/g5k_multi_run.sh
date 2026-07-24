@@ -51,7 +51,7 @@ RUN_START="${RUN_START:-0}"
 RUN_END="${RUN_END:-9}"
 STATE_DIR_BASE="${STATE_DIR:-$HOME/.g5k_hcpa}"
 
-VALID_APPROACHES=(pytorch_opt tensorflow_opt vit_pure hybrid_simple hybrid_token_reduction hybrid_token_reduction_opt)
+VALID_APPROACHES=(pytorch_opt tensorflow_opt vit_pure hybrid_simple hybrid_token_reduction hybrid_token_reduction_opt pytorch_base tensorflow_base retfound_green)
 is_valid_approach() {
   local a x
   a="$1"

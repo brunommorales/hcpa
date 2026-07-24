@@ -20,7 +20,10 @@ EXEC_FLAG=--exec
 SEED_FLAG=""               # tensorflow_base nao tem --seed
 TRAIN_ACCEPTS_DATASET=1
 
-TARGET_EPOCHS="${TARGET_EPOCHS:-200}"
+# HCPA_EPOCHS e a manopla UNICA de epocas nas 8 abordagens. Antes cada script
+# lia um nome diferente (TARGET_EPOCHS / EPOCHS / HCPA_EPOCHS): passar
+# HCPA_EPOCHS=5 aqui era ignorado e o run ia para 200 epocas em silencio.
+TARGET_EPOCHS="${HCPA_EPOCHS:-${TARGET_EPOCHS:-200}}"
 
 TRAIN_STATIC_ARGS=(
   --model InceptionV3

@@ -19,8 +19,8 @@
 #   PROJECT_DIR                   default lido do state.env
 #   STATE_FILE                    default ~/.g5k_hcpa/state.env
 #   SIF_NAME                      default hcpa.sif
-#   DATA_REL                      default data/all-tfrec
-#   DATASET_NAME                  default all-tfrec
+#   DATA_REL                      default data/all-tfrec-v2 (split val* por paciente)
+#   DATASET_NAME                  default all-tfrec-v2
 #   CONT_WORKDIR                  default /workspace
 #   GPU_TAG                       default extraido por nvidia-smi
 ###############################################################################
@@ -40,10 +40,44 @@ RUN_START="${RUN_START:-0}"
 RUN_END="${RUN_END:-9}"
 BASE_SEED="${BASE_SEED:-42}"
 SIF_NAME="${SIF_NAME:-hcpa.sif}"
-DATA_REL="${DATA_REL:-data/all-tfrec}"
-DATASET_NAME="${DATASET_NAME:-all-tfrec}"
+# all-tfrec-v2 = split POR PACIENTE com val* disjunto do test* (tools/make_val_split.py).
+# NAO usar data/all-tfrec (legado): nao tem shards val*, o que dispara o fallback
+# val->test e reintroduz o vazamento P1 (best-checkpoint selecionado no teste).
+DATA_REL="${DATA_REL:-data/all-tfrec-v2}"
+DATASET_NAME="${DATASET_NAME:-all-tfrec-v2}"
 CONT_WORKDIR="${CONT_WORKDIR:-/workspace}"
 GPU_TAG_OVERRIDE="${GPU_TAG:-}"
+
+# O estudo e SINGLE-GPU por padrao. Em nos com varias GPUs (chuc tem 4x A100), o
+# TensorFlow faz `if len(gpus) > 1: MirroredStrategy` e treinaria em 4 GPUs com
+# batch global 4x96, enquanto o pytorch_* (sem torchrun) usaria 1 — e o NVML
+# mediria a energia de UMA GPU. Isso invalidaria a comparacao. Em hydra (1
+# GPU/no) o bug era invisivel. Fixar a visibilidade e o que torna o experimento
+# identico entre clusters. HCPA_VISIBLE_GPUS=0,1 para o estudo de escalabilidade
+# (weak scaling): TF usa MirroredStrategy automaticamente (len(gpus)>1); PyTorch
+# precisa de TORCHRUN_NPROC (abaixo) — sem ele so usaria a GPU 0.
+HCPA_VISIBLE_GPUS="${HCPA_VISIBLE_GPUS:-0}"
+
+# TORCHRUN_NPROC: vazio (default) = `python3 ENTRY ...` (comportamento legado,
+# inalterado). Se setado (ex.: 2), lanca via `torchrun --standalone
+# --nproc_per_node=N ENTRY ...` — DDP multi-GPU num node so (pytorch_opt/
+# pytorch_base). Nao afeta TensorFlow (MirroredStrategy nao usa torchrun).
+TORCHRUN_NPROC="${TORCHRUN_NPROC:-}"
+
+# HCPA_NUMA_NODE: vazio (default) = sem pin (legado, inalterado). Se setado
+# (0 ou 1), o processo INTEIRO (singularity exec + tudo dentro, incl. workers
+# de decode/augment da CPU) roda preso a esse NUMA node via `numactl
+# --cpunodebind=N --membind=N`. Existe para rodar 2 abordagens EM PARALELO no
+# mesmo node multi-GPU (ex.: pytorch_opt na GPU0 + tensorflow_opt na GPU1, fase
+# 1-GPU do estudo de escalabilidade) sem contencao de CPU/memoria entre elas:
+# `nvidia-smi topo -m` mostra GPU0<->cores 0-31,64-95 (NUMA0) e GPU1<->cores
+# 32-63,96-127 (NUMA1) no grouille; sem pin, o scheduler do Linux pode espalhar
+# os workers de decode de UM framework pelos cores do NUMA node do OUTRO,
+# competindo por CPU e adicionando latencia de memoria cross-socket (~3.2x mais
+# lenta que local, medido: node distance 32 vs 10). Energia/util de GPU (NVML)
+# JA SAO isoladas por hardware por device — o pin nao afeta essas metricas,
+# so a limpeza do lado CPU/decode/augment.
+HCPA_NUMA_NODE="${HCPA_NUMA_NODE:-}"
 
 # carrega state.env (define G5K_NODE, OAR_JOB_ID, PROJECT_DIR)
 g5k_load_state
@@ -90,7 +124,12 @@ g5k_precheck() {
   g5k_ssh "test -f '${SIF_PATH}'" \
     || fail "imagem ausente em ${G5K_NODE}:${SIF_PATH}. Rode tools/g5k_setup_node.sh com APPROACHES='${APPROACH}'"
   g5k_ssh "test -d '${TFREC_DIR}'" \
-    || fail "dataset ausente em ${G5K_NODE}:${TFREC_DIR}. Faca o rsync de data/all-tfrec."
+    || fail "dataset ausente em ${G5K_NODE}:${TFREC_DIR}. Faca o rsync de ${DATA_REL}."
+  # GUARDA ANTI-VAZAMENTO (P1): sem shards val*, o codigo cai no fallback
+  # val->valid->test (resolve_split_files) e o best-checkpoint passa a ser
+  # selecionado NO PROPRIO TESTE. Falhar alto em vez de vazar em silencio.
+  g5k_ssh "ls '${TFREC_DIR}'/val*.tfrec >/dev/null 2>&1" \
+    || fail "dataset ${DATA_REL} nao tem split val* -> usaria val==test (vazamento P1). Use DATA_REL=data/all-tfrec-v2."
   g5k_ssh "nvidia-smi --query-gpu=name --format=csv,noheader | head -1" \
     || fail "nvidia-smi falhou em ${G5K_NODE}"
 
@@ -99,6 +138,10 @@ g5k_precheck() {
     GPU_TAG_OVERRIDE="$(sanitize_tag "${GPU_NAME_RAW}")"
   fi
   export GPU_TAG="${GPU_TAG_OVERRIDE}"
+  # RESULTS_TAG nomeia a pasta de resultados. Por padrão é o GPU_TAG (produção).
+  # A varredura de LR o sobrepõe (ex.: RESULTS_TAG=lrsweep_1e-3) para não
+  # sobrescrever os runs de produção.
+  export RESULTS_TAG="${RESULTS_TAG:-${GPU_TAG}}"
 
   mkdir -p "${LOG_DIR}"
   g5k_ssh "mkdir -p '${RESULTS_DIR}' '${LOG_DIR}'"
@@ -132,7 +175,11 @@ g5k_stage_data() {
 g5k_run_one() {
   local run_id="$1"
   local run_seed=$(( BASE_SEED + run_id ))
-  local run_results_subdir="results/${GPU_TAG}_g5k_hydra/run_${run_id}"
+  # cluster real derivado do hostname (chuc-7.lille... -> chuc; hydra-1.lyon... -> hydra),
+  # senao os resultados de OUTROS clusters (ex: chuc/A100) sairiam rotulados "hydra".
+  local cl_suffix="${G5K_CLUSTER:-$(printf '%s' "${G5K_NODE}" | sed -E 's/-[0-9]+\..*//')}"
+  [[ -n "${cl_suffix}" ]] || cl_suffix="hydra"
+  local run_results_subdir="results/${RESULTS_TAG}_g5k_${cl_suffix}/run_${run_id}"
   local run_results_host="${APPROACH_DIR}/${run_results_subdir}"
   local run_results_cont="${CONT_WORKDIR}/${run_results_subdir}"
   local run_log="${LOG_DIR}/g5k_${APPROACH}_job${OAR_JOB_ID}_run${run_id}.log"
@@ -153,15 +200,29 @@ g5k_run_one() {
     run_args+=( --dataset "${DATASET_NAME}" )
   fi
   run_args+=( "${TRAIN_STATIC_ARGS[@]}" )
+  # EXTRA_TRAIN_ARGS: appenda DEPOIS de TRAIN_STATIC_ARGS. argparse e last-wins
+  # para flags repetidas (ex.: --epochs), entao isto sobrescreve valores fixos
+  # do script sem precisar editar TRAIN_STATIC_ARGS. Uso: smoke test rapido
+  # (EXTRA_TRAIN_ARGS="--epochs 2"), ablacoes pontuais, etc. Vazio = no-op.
+  if [[ -n "${EXTRA_TRAIN_ARGS:-}" ]]; then
+    # shellcheck disable=SC2206
+    local -a _extra=( ${EXTRA_TRAIN_ARGS} )
+    run_args+=( "${_extra[@]}" )
+  fi
 
   # Constroi argv como uma string segura. Cada arg %q-escapado.
   local printed_args
   printed_args="$(printf ' %q' "${run_args[@]}")"
 
-  # Coleta --env extras de vars opcionais exportadas pela abordagem (ex: TF_*)
+  # Coleta --env extras de vars opcionais exportadas pela abordagem (ex: TF_*).
+  # As HCPA_* precisam estar aqui: sem isso a telemetria e o profiler de kernel
+  # nunca veem as manoplas (elas ficariam só no host, fora do container).
   local extra_env_block=""
   for _evar in TF_GPU_ALLOCATOR TF_FORCE_GPU_ALLOW_GROWTH TF_ENABLE_GPU_GC \
-               TF_NUM_INTEROP_THREADS TF_CPP_MIN_LOG_LEVEL DALI_LOG; do
+               TF_NUM_INTEROP_THREADS TF_CPP_MIN_LOG_LEVEL DALI_LOG \
+               PT_DISABLE_COMPILE HCPA_COMPILE_MODE HCPA_CACHE_IN_MEMORY \
+               HCPA_ENERGY_ALL_VISIBLE_GPUS \
+               HCPA_GPU_SAMPLE_MS HCPA_PROFILE_EPOCHS HCPA_PROFILE_DIR; do
     local _eval="${!_evar:-}"
     [[ -n "${_eval}" ]] && extra_env_block+="  --env ${_evar}=${_eval} \\"$'\n'
   done
@@ -169,23 +230,47 @@ g5k_run_one() {
   # Singularity exec com bind do projeto e dos tmp/caches em /tmp do node
   local tmp_root="/tmp/hcpa_${OAR_JOB_ID}_${APPROACH}_r${run_id}"
   local cache_root="${tmp_root}/cache"
+  # Cache do torch.compile (TorchInductor/Triton) PERSISTENTE entre runs da MESMA
+  # abordagem no MESMO job (nao leva _r${run_id} no nome, nao e removido pelo
+  # cleanup por-run). Sem isso, cada um dos 10 runs recompilava do zero: no
+  # smoke com DDP (2 ranks compilando em paralelo, cache Triton frio) o 1o
+  # compile passou de 10min. So o 1o run de cada approach paga o custo; os
+  # demais 9 reusam os kernels (mesma config: mesmo modelo/batch/GPU, so muda
+  # a seed). Some sozinho quando o job termina (node e ephemeral).
+  local torch_cache_root="/tmp/hcpa_${OAR_JOB_ID}_${APPROACH}_torchcache"
   local remote_script_dir="${APPROACH_DIR}/.g5k_run_scripts"
   local remote_script="${remote_script_dir}/run_${run_id}.sh"
 
   mkdir -p "${remote_script_dir}" 2>/dev/null || true
+  # Prefixo do lancamento: torchrun (DDP multi-GPU, --standalone = rendezvous
+  # local, sem precisar de MASTER_ADDR/PORT) se TORCHRUN_NPROC setado, senao
+  # python3 direto (legado, single-processo). So troca o prefixo — o resto da
+  # linha (aspas do entry path + printed_args) fica EXATAMENTE como antes.
+  local py_launch_prefix="python3"
+  if [[ -n "${TORCHRUN_NPROC}" ]]; then
+    py_launch_prefix="torchrun --standalone --nproc_per_node=${TORCHRUN_NPROC}"
+  fi
+  # Pin de NUMA (ver comentario de HCPA_NUMA_NODE acima). Prende o processo
+  # INTEIRO (singularity + tudo dentro) ao node de memoria/cpu local da GPU.
+  local numa_prefix=""
+  if [[ -n "${HCPA_NUMA_NODE}" ]]; then
+    numa_prefix="numactl --cpunodebind=${HCPA_NUMA_NODE} --membind=${HCPA_NUMA_NODE} "
+  fi
   # Escreve o script local (no NFS compartilhado, ja visivel no node)
   cat > "${remote_script}" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-mkdir -p '${tmp_root}/mplconfig' '${cache_root}/hf' '${cache_root}/torch' '${cache_root}/torchinductor' '${cache_root}/triton'
+mkdir -p '${tmp_root}/mplconfig' '${cache_root}/hf' '${cache_root}/torch' '${torch_cache_root}/torchinductor' '${torch_cache_root}/triton'
 cd '${APPROACH_DIR}'
-exec singularity exec --nv \\
+exec ${numa_prefix}singularity exec --nv \\
   --bind '${APPROACH_DIR}:${CONT_WORKDIR}' \\
   --bind '${PROJECT_DIR}:/hcpa:ro' \\
   --bind '${PROJECT_DIR}/tools:${CONT_WORKDIR}/tools:ro' \\
   --bind '${PROJECT_DIR}/hybrid_shared:${CONT_WORKDIR}/hybrid_shared:ro' \\
   --bind '${TFREC_DIR_EFFECTIVE}:${CONT_WORKDIR}/${DATA_REL}:ro' \\
   --bind '${tmp_root}:/tmp/hcpa' \\
+  --bind '${torch_cache_root}:/tmp/hcpa_persist' \\
+  --env CUDA_VISIBLE_DEVICES=${HCPA_VISIBLE_GPUS} \\
   --env KERAS_BACKEND=${KERAS_BACKEND:-torch} \\
   --env PYTHONPATH=${CONT_WORKDIR}:/hcpa \\
   --env PYTHONUNBUFFERED=1 \\
@@ -198,14 +283,14 @@ exec singularity exec --nv \\
   --env HF_HOME=/tmp/hcpa/cache/hf \\
   --env TRANSFORMERS_CACHE=/tmp/hcpa/cache/hf \\
   --env TORCH_HOME=/tmp/hcpa/cache/torch \\
-  --env TORCHINDUCTOR_CACHE_DIR=/tmp/hcpa/cache/torchinductor \\
-  --env TRITON_CACHE_DIR=/tmp/hcpa/cache/triton \\
+  --env TORCHINDUCTOR_CACHE_DIR=/tmp/hcpa_persist/torchinductor \\
+  --env TRITON_CACHE_DIR=/tmp/hcpa_persist/triton \\
   --env NCCL_DEBUG=${NCCL_DEBUG:-WARN} \\
   --env CUDA_LAUNCH_BLOCKING=0 \\
   --env TRITON_LIBCUDA_PATH=/.singularity.d/libs \\
   --env LD_LIBRARY_PATH=/.singularity.d/libs:/usr/local/cuda/compat/lib.real:/usr/local/cuda/lib64 \\
 ${extra_env_block}  '${SIF_PATH}' \\
-  bash -c '[ -f /etc/shinit_v2 ] && source /etc/shinit_v2 >/dev/null 2>&1; exec python3 '\''${CONT_WORKDIR}/${ENTRY}'\''${printed_args}'
+  bash -c '[ -f /etc/shinit_v2 ] && source /etc/shinit_v2 >/dev/null 2>&1; exec ${py_launch_prefix} '\''${CONT_WORKDIR}/${ENTRY}'\''${printed_args}'
 EOF
   chmod +x "${remote_script}"
   # Executa no node (nao usa -lc pra evitar dump de /etc/profile do Ubuntu)
@@ -221,7 +306,9 @@ EOF
   # (best.ckpt/last.ckpt do TF, ~460MB/run), mplconfig/, *.index, json/txt e
   # qualquer cache que o clean_temp_loggers nao tenha pego. Evita estourar a
   # quota do home no G5K (.sif ja consome ~25GB).
-  g5k_ssh "find '${run_results_host}' -type f ! -name '*.csv' ! -name '*.pdf' -delete 2>/dev/null; find '${run_results_host}' -mindepth 1 -type d -empty -delete 2>/dev/null" \
+  # Preserva *.json: sao os traces de kernel do CUPTI (kprof-*/epoch_N.json).
+  # Sem esta excecao a limpeza apagava exatamente o que o piano roll consome.
+  g5k_ssh "find '${run_results_host}' -type f ! -name '*.csv' ! -name '*.pdf' ! -name '*.json' -delete 2>/dev/null; find '${run_results_host}' -mindepth 1 -type d -empty -delete 2>/dev/null" \
     || log "whitelist purge falhou (nao critico)"
   # garante que os resultados ficam acessiveis para o usuario via NFS
   g5k_ssh "chown -R ${HOST_UID}:${HOST_GID} '${run_results_host}' 2>/dev/null || true" || true
@@ -235,5 +322,5 @@ g5k_run_all() {
   for rid in $(seq "${RUN_START}" "${RUN_END}"); do
     g5k_run_one "${rid}"
   done
-  log "concluido. Resultados em ${G5K_NODE}:${RESULTS_DIR}/${GPU_TAG}_g5k_hydra/run_*"
+  log "concluido. Resultados em ${G5K_NODE}:${RESULTS_DIR}/${RESULTS_TAG}_g5k_hydra/run_*"
 }
