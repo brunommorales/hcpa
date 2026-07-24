@@ -39,3 +39,31 @@ clean_hcpa_pytorch/
 *.bak_pre_exclude
 batch96_*.csv
 copy_sdd.sh
+
+# --- Ambientes virtuais por abordagem ---
+pytorch_base/env_arm/
+pytorch_opt/env_arm/
+pytorch_base/lib/
+pytorch_opt/lib/
+tensorflow_base/lib/
+tensorflow_opt/lib/
+tensorflow_base/.env/
+tensorflow_opt/.env/
+tensorflow_opt/.keras/
+
+# --- Pesos pre-treinados (grandes, nao versionar) ---
+**/weights/
+
+# --- Saidas de analise e figuras (regeneraveis a partir dos runs) ---
+new_results/final/
+new_results/analysis/
+new_results/multigpu/
+plots/
+plots_all/
+paper_plots/
+stats_plots/
+reports/
+results_bkp/
+single_gpu_runs.csv
+single_gpu_summary.csv
+*.py.main
