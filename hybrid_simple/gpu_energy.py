@@ -105,6 +105,47 @@ def _resolve_handle(torch_device=None):
         return None
 
 
+def _resolve_all_local_handles():
+    """Handles NVML de TODAS as GPUs que ESTE processo dirige — para o caso de UM
+    processo controlar várias GPUs (TF MirroredStrategy / MultiWorker num node).
+
+    Respeita CUDA_VISIBLE_DEVICES (índices ou UUIDs). Se não estiver setado, usa
+    todas as GPUs do node. Retorna [] se o NVML não iniciar.
+
+    NÃO usar para DDP: lá cada rank tem 1 GPU (current_device) e a soma entre GPUs
+    é feita por all_reduce entre os processos — enumerar 'todas as visíveis' aqui
+    contaria a mesma GPU em vários ranks (dupla contagem).
+    """
+    if not _ensure_init():
+        return []
+    handles = []
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    try:
+        if cvd and cvd not in ("-1",):
+            for tok in (t.strip() for t in cvd.split(",") if t.strip()):
+                try:
+                    if tok.startswith("GPU-"):
+                        handles.append(_nvml.nvmlDeviceGetHandleByUUID(tok.encode()))
+                    elif "-" in tok:
+                        handles.append(_nvml.nvmlDeviceGetHandleByUUID(f"GPU-{tok}".encode()))
+                    else:
+                        handles.append(_nvml.nvmlDeviceGetHandleByIndex(int(tok)))
+                except Exception:
+                    pass
+        else:
+            for i in range(_nvml.nvmlDeviceGetCount()):
+                handles.append(_nvml.nvmlDeviceGetHandleByIndex(i))
+    except Exception:
+        pass
+    return handles
+
+
+def _sum_local_gpus_enabled() -> bool:
+    """Ligado quando UM processo dirige N GPUs (TF Mirrored/MultiWorker). NÃO ligar
+    em DDP (1 GPU/processo + all_reduce). Env HCPA_ENERGY_ALL_VISIBLE_GPUS=1."""
+    return os.environ.get("HCPA_ENERGY_ALL_VISIBLE_GPUS", "0").strip().lower() in ("1", "true", "yes")
+
+
 class GpuTelemetry:
     """Leitor pontual de energia / potência / memória real da GPU ativa.
 
@@ -113,27 +154,46 @@ class GpuTelemetry:
     """
 
     def __init__(self, torch_device=None):
-        self._h = _resolve_handle(torch_device)
+        # Caminho single-GPU (auditado): 1 handle = a GPU deste processo.
+        # Caminho multi-GPU num processo (TF Mirrored/MultiWorker): soma TODAS as
+        # GPUs locais em energia e potência (aditivas). mem/util ficam no primário.
+        if _sum_local_gpus_enabled():
+            self._handles = _resolve_all_local_handles() or [_resolve_handle(torch_device)]
+        else:
+            self._handles = [_resolve_handle(torch_device)]
+        self._handles = [h for h in self._handles if h is not None]
+        self._h = self._handles[0] if self._handles else None
 
     @property
     def available(self) -> bool:
         return self._h is not None
 
+    @property
+    def n_gpus(self) -> int:
+        return len(self._handles)
+
     def energy_j(self):
-        """Energia acumulada desde o load do driver (Joules). Delta entre duas leituras = energia da região."""
-        if self._h is None:
+        """Energia acumulada desde o load do driver (Joules), SOMADA sobre as GPUs
+        locais deste processo. Delta entre duas leituras = energia da região."""
+        if not self._handles:
             return None
         try:
-            return _nvml.nvmlDeviceGetTotalEnergyConsumption(self._h) / 1000.0
+            total = 0.0
+            for h in self._handles:
+                total += _nvml.nvmlDeviceGetTotalEnergyConsumption(h) / 1000.0
+            return total
         except Exception:
             return None
 
     def power_w(self):
-        """Potência instantânea (Watts)."""
-        if self._h is None:
+        """Potência instantânea (Watts), SOMADA sobre as GPUs locais do processo."""
+        if not self._handles:
             return None
         try:
-            return _nvml.nvmlDeviceGetPowerUsage(self._h) / 1000.0
+            total = 0.0
+            for h in self._handles:
+                total += _nvml.nvmlDeviceGetPowerUsage(h) / 1000.0
+            return total
         except Exception:
             return None
 
@@ -183,9 +243,24 @@ class GpuTelemetry:
         return None
 
 
+SAMPLING_DISABLED = -1.0
+
+_SYNC_WARNED = False   # avisa uma unica vez se o TF nao puder sincronizar
+
+# Intervalo de amostragem padrão, em segundos. ÚNICO para todas as abordagens e
+# frameworks — é o que torna util%/potência comparáveis entre elas. Sobrepor com
+# HCPA_GPU_SAMPLE_MS (0 = desliga a amostragem).
+DEFAULT_SAMPLE_INTERVAL_S = 0.2
+
+
 def _effective_interval(passed: float) -> float:
     """Intervalo efetivo de amostragem (s). A env var HCPA_GPU_SAMPLE_MS, se definida,
     SOBREPÕE qualquer valor passado — uma única manopla para toda a telemetria.
+
+    `HCPA_GPU_SAMPLE_MS=0` DESLIGA a amostragem em background: energia e tempo
+    continuam sendo medidos (contador NVML + perf_counter nas bordas), mas
+    potência/util/memória ficam None. É o braço de controle do teste de efeito
+    observador — e o modo de menor perturbação possível.
 
     Regra de projeto: a amostragem deve ser <= ~10% do tempo de um step de kernel
     para resolver potência/util no nível do step. Para o step estável mais rápido
@@ -195,15 +270,20 @@ def _effective_interval(passed: float) -> float:
     independentemente do intervalo; só melhora a média/pico de potência/util.
     (2) nvmlDeviceGetUtilizationRates tem janela interna própria de agregação
     (dependente do device); intervalos muito finos re-amostram o mesmo valor —
-    resolução por-kernel real exige CUDA events/CUPTI, não NVML.
+    resolução por-kernel real exige CUPTI, não NVML (ver gpu_kernel_profile.py).
     (3) Efeito observador: intervalos muito finos adicionam carga de CPU que pode
-    perturbar o próprio step — validar overhead no smoke-test."""
+    perturbar o próprio step — por isso a amostragem é SEMPRE em thread de fundo
+    (nunca por-batch no laço de treino), e o intervalo é o mesmo em todos os
+    frameworks. Amostrar por-batch tornaria o overhead proporcional ao número de
+    batches, que difere entre abordagens — enviesando justamente o util%."""
     ov = os.environ.get("HCPA_GPU_SAMPLE_MS")
     if ov:
         try:
-            v = float(ov) / 1000.0
+            v = float(ov)
+            if v == 0:
+                return SAMPLING_DISABLED
             if v > 0:
-                return v
+                return v / 1000.0
         except Exception:
             pass
     return passed
@@ -223,6 +303,7 @@ class _Sampler(threading.Thread):
         self.power_samples = []
         self.util_samples = []
         self.mem_util_samples = []
+        self.nvml_calls = 0   # auditoria do efeito observador
 
     def run(self):
         while not self._stop_event.is_set():
@@ -238,6 +319,7 @@ class _Sampler(threading.Thread):
             mu = self._tele.mem_util_pct()
             if mu is not None:
                 self.mem_util_samples.append(mu)
+            self.nvml_calls += 4
             self._stop_event.wait(self._interval)
 
     def stop(self):
@@ -245,16 +327,40 @@ class _Sampler(threading.Thread):
 
 
 def _cuda_sync():
-    """Sincroniza a GPU (torch) antes de ler energia/tempo, para a fronteira da
-    medição refletir o trabalho de fato CONCLUÍDO (CUDA é assíncrono). Só age se o
-    torch já estiver usando CUDA (processos PyTorch); em processos TF (torch.cuda não
-    inicializado) é no-op — no TF a fronteira on_test_begin já é sincronizada pelo Keras."""
+    """Sincroniza a GPU antes de ler energia/tempo, para a fronteira da medição
+    refletir o trabalho de fato CONCLUÍDO (CUDA é assíncrono).
+
+    Cobre os DOIS frameworks. Antes, isto só agia em processos PyTorch, e no TF
+    confiava-se em que "o Keras sincroniza sozinho em on_test_begin" — uma
+    suposição não verificada. Se ela fosse falsa, a energia e o tempo da fase de
+    treino do TF estariam sistematicamente deslocados em relação aos do PyTorch,
+    e a comparação entre frameworks (o objeto do estudo) ficaria contaminada.
+    Sincronizar explicitamente custa ~nada nas bordas de época e remove a dúvida.
+    """
     try:
         import torch
         if torch.cuda.is_available() and torch.cuda.is_initialized():
             torch.cuda.synchronize()
+            return
     except Exception:
         pass
+
+    import sys
+    tf = sys.modules.get("tensorflow")   # não IMPORTA o TF; só usa se já estiver carregado
+    if tf is None:
+        return                           # nem torch-CUDA nem TF ativos: nada a sincronizar
+    try:
+        tf.test.experimental.sync_devices()
+    except Exception as exc:
+        # NÃO falhar em silêncio: sem sync, a borda da janela mede trabalho que a
+        # GPU ainda não terminou, e o tempo/energia do TF fica deslocado em
+        # relação ao do PyTorch — exatamente o viés que este estudo compara.
+        global _SYNC_WARNED
+        if not _SYNC_WARNED:
+            _SYNC_WARNED = True
+            print("[gpu_energy][ATENCAO] tf.test.experimental.sync_devices() indisponivel "
+                  f"({exc}). As bordas de medicao do TensorFlow NAO estao sincronizadas: "
+                  "tempo e energia por epoca podem estar deslocados. Verifique a versao do TF.")
 
 
 class EnergyScope:
@@ -287,9 +393,11 @@ class EnergyScope:
         self.avg_mem_util_pct = None   # utilização média de BANDA de memória (0-100)
         self.peak_mem_util_pct = None
         self.busy_time_s = None        # tempo GPU-ATIVA = elapsed_s * avg_util_pct/100 (tira ociosidade/CPU)
+        self.nvml_calls = 0            # quantas leituras NVML a amostragem fez nesta região
         self._e0 = None
         self._t0 = None
         self._sampler = None
+        self._stopped = False
 
     def start(self):
         """Atalho para uso sem `with` (ex.: em volta de uma chamada multi-linha)."""
@@ -303,12 +411,18 @@ class EnergyScope:
         _cuda_sync()   # borda limpa: garante que o trabalho anterior terminou
         self._t0 = time.perf_counter()
         self._e0 = self.tele.energy_j()
-        if self._bg and self.tele.available:
+        if self._bg and self.tele.available \
+                and _effective_interval(self._interval) != SAMPLING_DISABLED:
             self._sampler = _Sampler(self.tele, self._interval)
             self._sampler.start()
         return self
 
     def __exit__(self, *exc):
+        # Idempotente: fechar duas vezes (ex.: on_test_begin e depois on_epoch_end,
+        # ou vários caminhos de saída) não deve re-medir nem inflar a energia.
+        if self._stopped:
+            return False
+        self._stopped = True
         _cuda_sync()   # borda limpa: garante que os kernels da região terminaram
         self.elapsed_s = time.perf_counter() - self._t0
         e1 = self.tele.energy_j()
@@ -317,6 +431,7 @@ class EnergyScope:
         if self._sampler is not None:
             self._sampler.stop()
             self._sampler.join(timeout=2.0)
+            self.nvml_calls = self._sampler.nvml_calls
             if self._sampler.mem_samples:
                 self.peak_mem_mb = max(self._sampler.mem_samples)
                 self.avg_mem_mb = sum(self._sampler.mem_samples) / len(self._sampler.mem_samples)
