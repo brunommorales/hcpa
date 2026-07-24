@@ -1,0 +1,130 @@
+===============================================================================
+ COMO RODAR O HCPA NO GRID5000
+===============================================================================
+
+Exemplo usando a LYON (GH200). Para Lille ou Nancy, troque as 3 variaveis do
+passo de preparar o node (tabela no final) e troque "lyon" por "lille"/"nancy".
+
+
+-------------------------------------------------------------------------------
+OS 2 CONTAINERS (.sif)
+-------------------------------------------------------------------------------
+
+Existem 2 containers, nao 8. Um para cada familia:
+
+  .sif do pytorch_opt   -> usado por: pytorch_opt, pytorch_base, hybrid_simple,
+                           hybrid_token_reduction, hybrid_token_reduction_opt,
+                           retfound_green  (6 abordagens)
+
+  .sif do tensorflow_opt -> usado por: tensorflow_opt, tensorflow_base
+                            (2 abordagens)
+
+Se faltar o .sif de alguma abordagem, este e' o comando para apontar pro da
+mesma familia:
+
+ln -sf ~/projects/hcpa/tensorflow_opt/hcpa.sif ~/projects/hcpa/tensorflow_base/hcpa.sif
+
+for a in hybrid_simple hybrid_token_reduction hybrid_token_reduction_opt retfound_green; do
+  ln -sf ~/projects/hcpa/pytorch_opt/hcpa.sif ~/projects/hcpa/$a/hcpa.sif
+done
+
+
+-------------------------------------------------------------------------------
+1. ENVIAR O CODIGO (rodar no GPPD)
+-------------------------------------------------------------------------------
+
+NO_DATA=1 bash tools/g5k_send_to_grid.sh
+
+
+-------------------------------------------------------------------------------
+2. ENTRAR NO FRONTEND DO SITE
+-------------------------------------------------------------------------------
+
+ssh g5k-access
+ssh lyon
+cd ~/projects/hcpa
+
+
+-------------------------------------------------------------------------------
+3. ALOCAR E PREPARAR O NODE (reserva + kadeploy + singularity, tudo em um comando)
+-------------------------------------------------------------------------------
+
+SKIP_BUILD=1 WALLTIME=12:00:00 G5K_CLUSTER=hydra G5K_SITE=lyon EXOTIC=1 bash tools/g5k_setup_node.sh
+
+
+-------------------------------------------------------------------------------
+4. RODAR UM SMOKE TEST (1 run, 2 epocas, so para validar)
+-------------------------------------------------------------------------------
+
+HCPA_EPOCHS=2 RUN_START=0 RUN_END=0 DATA_REL=data/all-tfrec-v2 DATASET_NAME=all-tfrec-v2 bash pytorch_opt/run_g5k_hydra.sh
+
+
+-------------------------------------------------------------------------------
+5. RODAR AS 8 ABORDAGENS (10 runs de 200 epocas cada)
+-------------------------------------------------------------------------------
+
+for A in pytorch_opt tensorflow_opt pytorch_base tensorflow_base hybrid_simple hybrid_token_reduction hybrid_token_reduction_opt retfound_green; do
+  HCPA_EPOCHS=200 RUN_START=0 RUN_END=9 DATA_REL=data/all-tfrec-v2 DATASET_NAME=all-tfrec-v2 bash $A/run_g5k_hydra.sh
+done
+
+
+-------------------------------------------------------------------------------
+6. ACOMPANHAR O ANDAMENTO DOS JOBS
+-------------------------------------------------------------------------------
+
+oarstat -u bmorales
+
+
+-------------------------------------------------------------------------------
+7. TRAZER OS RESULTADOS DE VOLTA PARA O GPPD (rodar no GPPD)
+-------------------------------------------------------------------------------
+
+bash tools/g5k_fetch_results.sh
+
+
+-------------------------------------------------------------------------------
+8. LIBERAR O NODE QUANDO TERMINAR
+-------------------------------------------------------------------------------
+
+oardel <JOBID>
+
+
+===============================================================================
+VARIAVEIS DO PASSO 3 PARA CADA SITE
+===============================================================================
+
+Lyon  (GH200):  G5K_CLUSTER=hydra    G5K_SITE=lyon   EXOTIC=1
+Lille (A100):   G5K_CLUSTER=chuc     G5K_SITE=lille  EXOTIC=0
+Nancy (A100):   G5K_CLUSTER=grouille G5K_SITE=nancy  EXOTIC=1
+
+
+===============================================================================
+COTA DE USO
+===============================================================================
+
+De dia (dias uteis, horario do site): cada job consome uma cota diaria de
+GPU.h por cluster. chuc = 64 GPU.h/dia, hydra = 8 GPU.h/dia.
+
+De noite e fim de semana: sem cota, livre.
+
+O horario e' do site (CET/CEST). No horario de Brasilia, a janela livre
+comeca por volta das 14h-15h.
+
+
+===============================================================================
+PROBLEMAS CONHECIDOS
+===============================================================================
+
+Sem GPU visivel dentro do container: rodar este comando no node (como root),
+o kadeploy nao cria esse link e sem ele o treino roda na CPU sem avisar.
+
+ln -sf /usr/sbin/ldconfig /usr/sbin/ldconfig.real
+
+Node travado sem responder (nao usar reboot, e' bloqueado):
+
+oardel <JOBID>
+
+Gerar o dataset v2 (se so existir data/all-tfrec sem a pasta v2):
+
+python3 tools/make_val_split.py --src data/all-tfrec --dst data/all-tfrec-v2 --val-frac 0.15 --seed 42
+python3 pytorch_opt/lib/build_tfrecord_idx.py --dir data/all-tfrec-v2 --overwrite

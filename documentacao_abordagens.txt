@@ -1,0 +1,555 @@
+================================================================================
+  HCPA — Documentação das Abordagens de Treinamento
+  Detecção de Retinopatia Diabética em Imagens de Fundo de Olho
+  Atualizado: 2026-06-22
+================================================================================
+
+Este documento descreve os parâmetros de entrada, arquiteturas e otimizações de
+cada abordagem implementada no projeto HCPA para classificação de retinopatia
+diabética. Todas as abordagens utilizam o mesmo dataset localizado em:
+  /home/users/bmmorales/projects/hcpa/data/all-tfrec
+
+As abordagens são organizadas em cinco grupos:
+  1. Baselines TensorFlow e PyTorch
+  2. Versões otimizadas TensorFlow e PyTorch
+  3. Híbridas CNN + Transformer
+  4. Modelos de Fundação (RETFound-Green e ViT-Pure)
+
+================================================================================
+  SEÇÃO 1 — VISÃO GERAL DO MODELO CNN DE REFERÊNCIA
+================================================================================
+
+O modelo CNN usado como backbone em seis das nove abordagens é a InceptionV3.
+
+InceptionV3:
+  - Arquitetura: CNN profunda com módulos Inception (convoluções paralelas de
+    diferentes tamanhos de kernel: 1x1, 3x3, 5x5 + max-pooling)
+  - Entrada nativa: 299x299 pixels (3 canais RGB)
+  - Saída do backbone: vetor de 2048 features (GlobalAveragePooling)
+  - Pré-treino: ImageNet (pesos carregados via TensorFlow/Keras ou timm)
+  - Por que InceptionV3: balanceia profundidade, eficiência e compatibilidade com
+    imagens médicas de alta resolução (olho de fundo)
+
+Nas abordagens híbridas, a InceptionV3 atua como extrator de features e um
+Transformer processa a sequência de tokens extraídos.
+
+================================================================================
+  SEÇÃO 2 — PARÂMETROS COMUNS A TODAS AS ABORDAGENS
+================================================================================
+
+  Épocas:       200 (todas as abordagens)
+  Otimizador:   AdamW (padrão em todas; pytorch_opt permite trocar via flag)
+  Distribuição: DDP (DistributedDataParallel) — suporte a múltiplas GPUs
+  Dataset:      TFRecord (all-tfrec), leitura com tf.data ou DALI
+  Tarefa:       Classificação binária (sem RD / com RD)
+  Loss base:    BCEWithLogitsLoss / BinaryCrossentropy + peso pos. automático
+
+================================================================================
+  SEÇÃO 3 — TABELA COMPARATIVA GERAL
+================================================================================
+
+┌──────────────────────────┬──────────────┬────────────┬────────────┬──────────────┬────────────────────────────────────┐
+│ Abordagem                │ Framework    │ Backbone   │ Batch Size │ Img. Size    │ Learning Rate                      │
+├──────────────────────────┼──────────────┼────────────┼────────────┼──────────────┼────────────────────────────────────┤
+│ tensorflow_base          │ TensorFlow   │ InceptionV3│     96     │ 299 x 299    │ 5e-4                               │
+│ tensorflow_opt           │ TensorFlow   │ InceptionV3│     96     │ 299 x 299    │ 3e-3                               │
+│ pytorch_base             │ PyTorch      │ InceptionV3│     96     │ 299 x 299    │ 5e-4                               │
+│ pytorch_opt              │ PyTorch      │ InceptionV3│     96     │ 299 x 299    │ 5e-4                               │
+│ hybrid_simple            │ PyTorch      │ InceptionV3│     96     │ 299 x 299    │ 1e-4                               │
+│ hybrid_token_reduction   │ PyTorch      │ InceptionV3│     96     │ 299 x 299    │ 1e-4                               │
+│ hybrid_token_reduct._opt │ PyTorch      │ InceptionV3│     96     │ 299 x 299    │ 1e-4                               │
+│ retfound_green           │ PyTorch      │ ViT-S/14*  │     96     │ 392 x 392    │ 5e-5 (discriminativo)              │
+│ vit_pure                 │ PyTorch      │ ViT-B/16   │     32     │ 320 x 320    │ 1e-4                               │
+└──────────────────────────┴──────────────┴────────────┴────────────┴──────────────┴────────────────────────────────────┘
+
+* retfound_green usa vit_small_patch14_reg4_dinov2 (pré-treino RETFound-Green/DINOv2)
+
+================================================================================
+  SEÇÃO 4 — TABELA DE OTIMIZAÇÕES POR ABORDAGEM
+================================================================================
+
+┌──────────────────────────┬────────┬────────────┬────────────┬──────────┬────────┬───────────┬───────────┬─────────────┐
+│ Abordagem                │ AMP    │ DALI       │ JIT/Compile│ Flash    │ EMA    │ Mixup/    │ Token     │ LR Sched.   │
+│                          │        │            │            │ Attn.    │        │ CutMix    │ Reduction │ (Cosine+WU) │
+├──────────────────────────┼────────┼────────────┼────────────┼──────────┼────────┼───────────┼───────────┼─────────────┤
+│ tensorflow_base          │  Não   │  Não       │  Não       │  Não     │  Não   │  Não      │  Não      │  Não        │
+│ tensorflow_opt           │  Sim   │  Sim(flag) │  Sim(flag) │  Não     │  Não   │  Sim      │  Não      │  Sim        │
+│ pytorch_base             │  Não   │  Não       │  Não       │  Não     │  Não   │  Não      │  Não      │  Não        │
+│ pytorch_opt              │  Sim   │  Sim       │  Não       │  Não     │  Sim   │  Sim      │  Não      │  Sim        │
+│ hybrid_simple            │  Opt.  │  Não       │  Não       │  Não     │  Opt.  │  Não      │  Não      │  Opt.       │
+│ hybrid_token_reduction   │  Sim   │  Não       │  Não       │  Não     │  Não   │  Não      │  Sim      │  Sim        │
+│ hybrid_token_reduct._opt │  Sim   │  Não       │  Sim       │  Sim     │  Sim   │  Sim      │  Sim+WU   │  Sim        │
+│ retfound_green           │  Sim   │  Não       │  Não       │  Não     │  Sim   │  Não      │  Não      │  Sim        │
+│ vit_pure                 │  Sim   │  Não       │  Não       │  Opt.    │  Sim   │  Não      │  Não      │  Sim        │
+└──────────────────────────┴────────┴────────────┴────────────┴──────────┴────────┴───────────┴───────────┴─────────────┘
+
+Legenda: Sim = ativado por padrão | Opt. = disponível via flag | Não = não implementado
+         WU = warmup progressivo de epochs | LR Sched. = scheduler de learning rate
+
+================================================================================
+  SEÇÃO 5 — DETALHAMENTO POR ABORDAGEM
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+5.1  tensorflow_base  (Baseline TensorFlow)
+────────────────────────────────────────────────────────────────────────────────
+Arquivo: tensorflow_base/dr_hcpa_v2_2024.py
+Framework: TensorFlow 2.x + Keras
+
+Parâmetros:
+  backbone       : InceptionV3 (pré-treino ImageNet)
+  epochs         : 200
+  batch_size     : 96
+  learning_rate  : 5e-4
+  optimizer      : AdamW
+  image_size     : 299 x 299
+  input_channels : 3 (RGB)
+  features_out   : 2048 (após GlobalAveragePooling)
+
+Pipeline de dados: tf.data com augmentação básica (flip, rotação)
+Loss: BinaryCrossentropy
+Scheduler: nenhum (LR fixo)
+
+Propósito: referência mínima em TensorFlow sem nenhuma otimização.
+Nenhuma otimização aplicada.
+
+────────────────────────────────────────────────────────────────────────────────
+5.2  tensorflow_opt  (TensorFlow Otimizado)
+────────────────────────────────────────────────────────────────────────────────
+Arquivo: tensorflow_opt/dr_hcpa_v2_2024.py
+Framework: TensorFlow 2.x + Keras
+
+Parâmetros:
+  backbone       : InceptionV3 (pré-treino ImageNet)
+  epochs         : 200
+  batch_size     : 96
+  learning_rate  : 3e-3  (3x maior que o base — melhor convergência com cosine)
+  optimizer      : AdamW
+  image_size     : 299 x 299
+  label_smoothing: 0.01
+
+Otimizações aplicadas:
+  [1] AMP (mixed precision float16)
+      Reduz uso de memória ~50% e acelera operações em Tensor Cores.
+
+  [2] DALI pipeline (--use_dali)
+      NVIDIA Data Loading Library: decodificação de imagens diretamente na GPU,
+      eliminando o gargalo de CPU na leitura do dataset.
+
+  [3] JIT Compilation (--jit_compile)
+      tf.function com XLA: funde operações do grafo em kernels otimizados.
+      Resultado medido: ~3976 img/s no H200 (vs ~1141 img/s sem JIT).
+
+  [4] Mixup augmentation (alpha=0.3) + CutMix
+      Regularização por interpolação de pares de imagens.
+
+  [5] Focal Loss (--use_focal_loss)
+      Penaliza mais os exemplos difíceis; útil para datasets desbalanceados.
+
+  [6] LR Scheduler: Cosine Annealing + Warmup
+      LR sobe linearmente nos primeiros epochs (warmup) e decai em cosine.
+
+  [7] BatchNorm Freezing (--freeze_bn)
+      Congela as camadas de BatchNorm do backbone para estabilizar fine-tuning.
+
+────────────────────────────────────────────────────────────────────────────────
+5.3  pytorch_base  (Baseline PyTorch)
+────────────────────────────────────────────────────────────────────────────────
+Arquivo: pytorch_base/dr_hcpa_v2_2024.py
+Framework: PyTorch + timm
+
+Parâmetros:
+  backbone       : inception_v3 (via timm, pré-treino ImageNet)
+  epochs         : 200
+  batch_size     : 96
+  learning_rate  : 5e-4
+  optimizer      : AdamW
+  image_size     : 299 x 299
+
+Pipeline de dados: DataLoader padrão com augmentação básica
+Loss: BCEWithLogitsLoss + peso positivo automático
+Distribuição: DDP (DistributedDataParallel)
+
+Propósito: referência mínima em PyTorch.
+Nenhuma otimização aplicada.
+
+────────────────────────────────────────────────────────────────────────────────
+5.4  pytorch_opt  (PyTorch Otimizado)
+────────────────────────────────────────────────────────────────────────────────
+Arquivo: pytorch_opt/dr_hcpa_v2_2024.py
+Framework: PyTorch + timm
+
+Parâmetros:
+  backbone       : inception_v3 (via timm, pré-treino ImageNet)
+  epochs         : 200
+  batch_size     : 96
+  learning_rate  : 5e-4
+  optimizer      : AdamW (padrão) | Adam | SGD | RMSprop | Adadelta (via flag)
+  image_size     : 299 x 299
+
+Otimizações aplicadas:
+  [1] AMP (Automatic Mixed Precision, FP16)
+      torch.cuda.amp.GradScaler + autocast; acelera sem perda de precisão.
+
+  [2] DALI pipeline
+      Leitura e decodificação de TFRecord diretamente na GPU.
+
+  [3] Gradient Clipping (norm=1.0)
+      Previne explosão de gradientes durante fine-tuning.
+
+  [4] Cosine Annealing + Warmup
+      LR decresce suavemente; warmup evita instabilidade nos primeiros steps.
+
+  [5] Mixup (alpha configurável) + CutMix
+      Regularização por interpolação e colagem de regiões de imagens.
+
+  [6] EMA (Exponential Moving Average)
+      Mantém média dos pesos ao longo do treino; melhora generalização.
+
+  [7] Otimizador configurável
+      Permite testar AdamW, Adam, SGD, RMSprop ou Adadelta via argumento.
+
+────────────────────────────────────────────────────────────────────────────────
+5.5  hybrid_simple  (Híbrido CNN + Transformer Básico)
+────────────────────────────────────────────────────────────────────────────────
+Arquivo: hybrid_simple/train.py
+Framework: PyTorch
+
+Parâmetros:
+  backbone            : InceptionV3 (extrator de features)
+  transformer_layers  : 4
+  attention_heads     : 4
+  feature_dim         : 2048 (saída da InceptionV3)
+  epochs              : 200
+  batch_size          : 96
+  learning_rate       : 1e-4
+  optimizer           : AdamW
+  image_size          : 299 x 299
+  grad_clip_norm      : 1.0
+
+Arquitetura:
+  Imagem → InceptionV3 → features [B, 2048] →
+  projeção linear → sequência de tokens → 4× TransformerEncoderLayer →
+  [CLS token] → classificador binário
+
+Congelamento do backbone nos primeiros epochs (backbone_freeze_epochs).
+
+Otimizações disponíveis via flag (desligadas por padrão):
+  - AMP (--amp)
+  - EMA (--ema)
+  - Cosine Annealing (--cosine_lr)
+
+Propósito: versão mínima do híbrido para validar a arquitetura CNN+Transformer.
+
+────────────────────────────────────────────────────────────────────────────────
+5.6  hybrid_token_reduction  (Híbrido com Redução de Tokens)
+────────────────────────────────────────────────────────────────────────────────
+Arquivo: hybrid_token_reduction/train.py
+Framework: PyTorch
+
+Parâmetros:
+  backbone            : InceptionV3
+  transformer_layers  : 4
+  attention_heads     : 4
+  keep_ratio          : 0.5  (mantém 50% dos tokens)
+  epochs              : 200
+  batch_size          : 96
+  learning_rate       : 1e-4
+  optimizer           : AdamW
+  image_size          : 299 x 299
+
+Otimizações aplicadas:
+  [1] Token Reduction (keep_ratio=0.5)
+      Após extração de features, seleciona os k tokens mais informativos
+      (scoring por magnitude de ativação). Reduz a complexidade da atenção
+      de O(n²) para O(k²), onde k = 50% de n.
+      Resultado: ~62,5% menos operações na atenção; ~62,5% menos memória
+      no bloco Transformer.
+
+  [2] AMP — ativado por padrão
+
+  [3] Cosine Annealing — ativado por padrão
+
+Propósito: testar se a redução de tokens mantém a qualidade preditiva com
+menor custo computacional no bloco Transformer.
+
+────────────────────────────────────────────────────────────────────────────────
+5.7  hybrid_token_reduction_opt  (Híbrido Token Reduction Totalmente Otimizado)
+────────────────────────────────────────────────────────────────────────────────
+Arquivo: hybrid_token_reduction_opt/train.py
+Framework: PyTorch
+
+Parâmetros:
+  backbone            : InceptionV3
+  transformer_layers  : 4
+  attention_heads     : 4
+  keep_ratio          : 0.5
+  epochs              : 200
+  batch_size          : 96
+  learning_rate       : 1e-4
+  optimizer           : AdamW
+  image_size          : 299 x 299
+
+Otimizações aplicadas:
+  [1] Token Reduction com warmup progressivo (5 epochs)
+      Nos primeiros 5 epochs o keep_ratio é relaxado gradualmente até 0.5,
+      evitando instabilidade no início do treino.
+
+  [2] Flash Attention — ativado por padrão
+      Implementação memory-efficient da atenção (IO-aware, sem materializar
+      a matriz NxN completa). Requer GPU Ampere+ (A100, H100, GH200, etc.).
+
+  [3] AMP com bf16 preferencial
+      torch.autocast com dtype automático (bf16 se disponível, senão fp16).
+      bf16 evita overflow sem necessidade de GradScaler.
+
+  [4] torch.compile (mode='reduce-overhead')
+      Compila o modelo com Triton kernels para reduzir overhead de Python
+      no loop de treino.
+
+  [5] Channels Last memory format
+      Reordena tensores para NHWC (vs padrão NCHW), melhora throughput em
+      convoluções nos Tensor Cores.
+
+  [6] EMA (Exponential Moving Average) — ativado por padrão
+
+  [7] Mixup (alpha=0.2) + CutMix (alpha=0.5)
+
+  [8] Verificações de estabilidade numérica
+      Checa NaN/Inf nos gradientes em cada step; aborta se detectado.
+
+Propósito: versão de produção do híbrido com todas as otimizações empilhadas.
+
+────────────────────────────────────────────────────────────────────────────────
+5.8  retfound_green  (Modelo de Fundação RETFound-Green)
+────────────────────────────────────────────────────────────────────────────────
+Arquivo: retfound_green/train.py
+Framework: PyTorch + timm
+
+Parâmetros:
+  backbone       : vit_small_patch14_reg4_dinov2
+                   (ViT-Small, patches 14x14, 4 registros, pré-treino DINOv2)
+  pré-treino     : RETFound-Green (pesos especializados em retina)
+  epochs         : 200
+  batch_size     : 96
+  learning_rate  : 5e-5  (backbone: LR/10 = 5e-6)
+  optimizer      : AdamW
+  image_size     : 392 x 392  (= 28 patches × 14px)
+  num_patches    : 784 + 4 registros = 788 tokens
+
+Arquitetura:
+  ViT-Small: 12 camadas Transformer, 6 cabeças de atenção, embed_dim=384.
+  Não é CNN — é um Transformer puro com patches de imagem como tokens.
+
+Otimizações aplicadas:
+  [1] Learning Rate Discriminativo
+      Backbone recebe LR 10× menor que a cabeça de classificação.
+      Preserva os pesos de pré-treino especializados em retina.
+
+  [2] AMP — ativado por padrão
+
+  [3] Cosine Annealing + Warmup
+
+  [4] EMA — ativado por padrão
+
+  [5] LP-FT (Linear Probe → Fine-Tuning)
+      Treina só a cabeça de classificação primeiro (backbone congelado),
+      depois descongela para fine-tuning completo. Evita destruir os pesos
+      de pré-treino nas primeiras épocas.
+
+  [6] Peso positivo automático
+      Calcula pos_weight a partir da proporção de classes no dataset.
+
+Propósito: explorar pré-treino especializado em imagens de retina.
+Maior resolução de entrada (392px) para preservar detalhes vasculares finos.
+
+────────────────────────────────────────────────────────────────────────────────
+5.9  vit_pure  (Transformer Puro — ViT-B/16)
+────────────────────────────────────────────────────────────────────────────────
+Arquivo: vit_pure/train.py
+Framework: PyTorch
+
+Parâmetros:
+  backbone       : ViT-B/16 (Vision Transformer Base, patches 16x16)
+  epochs         : 200
+  batch_size     : 32  ← menor que as demais (ViT-B tem 86M parâmetros)
+  learning_rate  : 1e-4
+  optimizer      : AdamW
+  image_size     : 320 x 320  (= 20 patches × 16px)
+  embed_dim      : 768
+  transformer_layers: 12
+  attention_heads: 12
+  mlp_ratio      : 4.0
+  grad_accumulation: 1 (configurável para simular batch maior)
+
+Arquitetura:
+  Não usa CNN. A imagem é dividida em 400 patches de 16x16px.
+  Cada patch é projetado para um vetor de 768 dimensões (token).
+  12 camadas de Multi-Head Self-Attention processam os 400+1 tokens ([CLS]).
+  Classificador binário sobre o [CLS] token final.
+
+Otimizações aplicadas:
+  [1] AMP — ativado por padrão
+
+  [2] Cosine Annealing + Warmup
+
+  [3] EMA — ativado por padrão
+
+  [4] Gradient Accumulation
+      Acumula gradientes por N steps antes de atualizar os pesos,
+      permitindo simular batch_size efetivo maior sem mais memória.
+
+  [5] Flash/SDPA Attention (opcional, --flash_attn)
+      Ativa scaled_dot_product_attention do PyTorch 2.0+.
+
+  [6] Peso positivo automático
+
+Propósito: baseline puro de Transformer sem nenhum componente CNN,
+para comparar a arquitetura end-to-end de atenção com os híbridos.
+Batch size menor (32) reflete o custo de memória da atenção quadrática em 400 tokens.
+
+================================================================================
+  SEÇÃO 6 — TABELA DE ARQUITETURA INTERNA DOS MODELOS
+================================================================================
+
+┌──────────────────────────┬──────────────────────────────┬────────────┬────────────┬──────────────────────────────────┐
+│ Abordagem                │ Tipo de Backbone              │ Parâmetros │ Tokens     │ Classificador Final              │
+│                          │                               │ (aprox.)   │ Entrada    │                                  │
+├──────────────────────────┼──────────────────────────────┼────────────┼────────────┼──────────────────────────────────┤
+│ tensorflow_base          │ CNN (InceptionV3)             │ ~24M       │ —          │ Dense(1) após GAP 2048           │
+│ tensorflow_opt           │ CNN (InceptionV3)             │ ~24M       │ —          │ Dense(1) após GAP 2048           │
+│ pytorch_base             │ CNN (InceptionV3)             │ ~24M       │ —          │ Linear(2048→1) após GAP          │
+│ pytorch_opt              │ CNN (InceptionV3)             │ ~24M       │ —          │ Linear(2048→1) após GAP          │
+│ hybrid_simple            │ CNN+Transformer (InceptionV3) │ ~28M       │ projetado  │ Linear([CLS]→1)                  │
+│ hybrid_token_reduction   │ CNN+Transformer (InceptionV3) │ ~28M       │ k=50% seq  │ Linear([CLS]→1)                  │
+│ hybrid_token_reduct._opt │ CNN+Transformer (InceptionV3) │ ~28M       │ k=50% seq  │ Linear([CLS]→1) + Flash Attn     │
+│ retfound_green           │ ViT-S/14 (DINOv2/RETFound)   │ ~22M       │ 784+4=788  │ Linear(384→1) sobre [CLS]        │
+│ vit_pure                 │ ViT-B/16                      │ ~86M       │ 400+1=401  │ Linear(768→1) sobre [CLS]        │
+└──────────────────────────┴──────────────────────────────┴────────────┴────────────┴──────────────────────────────────┘
+
+GAP = Global Average Pooling
+
+================================================================================
+  SEÇÃO 7 — RESUMO DAS DIFERENÇAS ENTRE BASE E OPT
+================================================================================
+
+TensorFlow Base → TensorFlow Opt
+  ┌─────────────────────────────┬───────────────────────────────────────────┐
+  │ O que mudou                 │ Detalhe                                   │
+  ├─────────────────────────────┼───────────────────────────────────────────┤
+  │ Learning rate               │ 5e-4 → 3e-3 (cosine requer LR maior)     │
+  │ Precisão                    │ FP32 → AMP FP16                           │
+  │ Pipeline de dados           │ tf.data CPU → DALI GPU                    │
+  │ JIT                         │ Não → XLA compile (flag)                  │
+  │ Augmentação                 │ Básica → Mixup + CutMix + Label Smooth    │
+  │ Scheduler                   │ Nenhum → Cosine + Warmup                  │
+  │ Loss                        │ BCE → BCE ou Focal (flag)                 │
+  └─────────────────────────────┴───────────────────────────────────────────┘
+
+PyTorch Base → PyTorch Opt
+  ┌─────────────────────────────┬───────────────────────────────────────────┐
+  │ O que mudou                 │ Detalhe                                   │
+  ├─────────────────────────────┼───────────────────────────────────────────┤
+  │ Precisão                    │ FP32 → AMP FP16 + GradScaler             │
+  │ Pipeline de dados           │ DataLoader CPU → DALI GPU                 │
+  │ Scheduler                   │ Nenhum → Cosine + Warmup                  │
+  │ Augmentação                 │ Básica → Mixup + CutMix                   │
+  │ EMA                         │ Não → Sim                                 │
+  │ Grad clipping               │ Não → norm=1.0                            │
+  │ Otimizador                  │ AdamW fixo → configurável via flag        │
+  └─────────────────────────────┴───────────────────────────────────────────┘
+
+Hybrid Simple → Hybrid Token Reduction → Hybrid Token Reduction Opt
+  ┌─────────────────────────────┬──────────────┬────────────────────────────┐
+  │ Otimização                  │ token_reduc. │ token_reduc._opt           │
+  ├─────────────────────────────┼──────────────┼────────────────────────────┤
+  │ Token Reduction             │ Sim (50%)    │ Sim (50%) + warmup 5ep     │
+  │ AMP                         │ Sim          │ Sim (bf16 preferencial)    │
+  │ Flash Attention             │ Não          │ Sim                        │
+  │ torch.compile               │ Não          │ Sim (reduce-overhead)      │
+  │ Channels Last               │ Não          │ Sim                        │
+  │ EMA                         │ Não          │ Sim                        │
+  │ Mixup + CutMix              │ Não          │ Sim                        │
+  │ Verificação NaN/Inf         │ Não          │ Sim                        │
+  │ Cosine LR                   │ Sim          │ Sim                        │
+  └─────────────────────────────┴──────────────┴────────────────────────────┘
+
+================================================================================
+  SEÇÃO 8 — GLOSSÁRIO DE TERMOS TÉCNICOS
+================================================================================
+
+AMP (Automatic Mixed Precision)
+  Treinamento com precisão mista (FP16 + FP32). Tensors intermediários em FP16
+  (menos memória, mais rápido em Tensor Cores); acumuladores em FP32 (precisão).
+
+BF16 (BFloat16)
+  Alternativa ao FP16 com range dinâmico maior (mesmos expoentes que FP32).
+  Disponível em A100, H100, GH200. Elimina necessidade de GradScaler.
+
+CutMix
+  Augmentação: recorta uma região de uma imagem e cola na outra, misturando
+  os labels proporcionalmente à área recortada.
+
+DALI (NVIDIA Data Loading Library)
+  Pipeline de dados acelerado por GPU: decodificação JPEG, resize e augmentação
+  acontecem na GPU, eliminando gargalo de CPU e PCIe.
+
+DINOv2
+  Método de pré-treino self-supervised por distilação de conhecimento entre
+  redes de visão. Produz representações visuais ricas sem labels.
+
+DDP (DistributedDataParallel)
+  Módulo PyTorch para treino distribuído multi-GPU: cada GPU tem uma cópia
+  do modelo e os gradientes são sincronizados via all-reduce.
+
+EMA (Exponential Moving Average)
+  Mantém uma média ponderada exponencialmente dos pesos do modelo ao longo
+  do treino. O modelo EMA tende a generalizar melhor que o modelo instantâneo.
+
+Flash Attention
+  Implementação da atenção que evita materializar a matriz NxN na memória HBM,
+  usando tiling e recomputation. Complexidade de memória O(n) em vez de O(n²).
+
+Focal Loss
+  Variante da Cross-Entropy que reduz o peso de exemplos fáceis (bem
+  classificados), focando o treino em exemplos difíceis.
+
+GAP (Global Average Pooling)
+  Reduz o mapa de features espacial (H×W×C) para um vetor (C) fazendo a
+  média sobre todas as posições espaciais.
+
+InceptionV3
+  CNN com módulos Inception: aplica convoluções 1x1, 3x3 e 5x5 em paralelo
+  e concatena os resultados, permitindo capturar features em múltiplas escalas.
+
+JIT (Just-In-Time compilation)
+  Compila operações do grafo computacional em tempo de execução para kernels
+  otimizados (XLA no TensorFlow; Triton/torch.compile no PyTorch).
+
+Label Smoothing
+  Substitui os labels 0/1 por 0.01/0.99. Regulariza o modelo evitando que
+  ele fique excessivamente confiante.
+
+LP-FT (Linear Probe → Fine-Tuning)
+  Treina primeiro apenas a cabeça de classificação (backbone congelado) para
+  encontrar um bom ponto inicial, depois descongela tudo para fine-tuning.
+
+Mixup
+  Augmentação: combina dois exemplos linearmente (imagem e label) com
+  coeficiente amostrado de uma distribuição Beta(alpha, alpha).
+
+Token Reduction
+  Seleciona um subconjunto dos tokens mais informativos antes do bloco
+  Transformer, reduzindo a complexidade da atenção de O(n²) para O(k²).
+
+ViT (Vision Transformer)
+  Arquitetura que divide a imagem em patches fixos, projeta cada patch para
+  um embedding e processa a sequência com Multi-Head Self-Attention.
+
+Warmup
+  Fase inicial do treino onde o LR sobe linearmente de 0 até o valor alvo,
+  evitando instabilidade nos primeiros steps com pesos aleatórios.
+
+================================================================================
+  FIM DO DOCUMENTO
+================================================================================
