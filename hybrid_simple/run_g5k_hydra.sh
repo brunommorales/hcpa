@@ -32,10 +32,10 @@ FREEZE_BACKBONE_EPOCHS="${FREEZE_BACKBONE_EPOCHS:-3}"
 # simple -> token_reduction -> token_reduction_opt. O default anterior era
 # ENABLE_AMP=1, o que contradizia o proprio config.py (set_defaults False) e
 # invalidava a leitura de "hibrido sem otimizacao".
-ENABLE_AMP="${ENABLE_AMP:-0}"
+ENABLE_AMP="${ENABLE_AMP:-1}"
 ENABLE_EMA="${ENABLE_EMA:-0}"
 ENABLE_DALI="${ENABLE_DALI:-0}"
-ENABLE_COSINE="${ENABLE_COSINE:-0}"
+ENABLE_COSINE="${ENABLE_COSINE:-1}"
 
 TRAIN_STATIC_ARGS=(
   --batch_size "${BATCH_SIZE}"

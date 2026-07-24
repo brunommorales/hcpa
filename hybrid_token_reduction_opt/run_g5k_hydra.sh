@@ -37,7 +37,7 @@ ENABLE_DALI="${ENABLE_DALI:-0}"
 # mudava a curva de convergencia so desta abordagem (pico tardio, ep.169) e
 # inviabilizava a comparacao de "energia ate o pico". Para a ablacao de
 # scheduler, passe ENABLE_COSINE=0 explicitamente.
-ENABLE_COSINE="${ENABLE_COSINE:-1}"
+ENABLE_COSINE="${ENABLE_COSINE:-0}"
 # PARIDADE COM pytorch_opt: esta variante deve ter EXATAMENTE a mesma pilha de
 # otimizacao do pytorch_opt (AMP + cosine/warmup + torch.compile) e NADA ALEM
 # disso. Por isso:
@@ -47,8 +47,8 @@ ENABLE_COSINE="${ENABLE_COSINE:-1}"
 #     (receita comum). O default anterior aqui era 1 (mixup=0.2, cutmix=0.5),
 #     ou seja o hibrido "opt" treinava com augmentation que os CNNs nao tinham.
 #   - torch.compile LIGADO: o pytorch_opt usa; aqui estava desativado.
-ENABLE_FLASH_ATTENTION="${ENABLE_FLASH_ATTENTION:-0}"
-ENABLE_MIXUP_CUTMIX="${ENABLE_MIXUP_CUTMIX:-0}"
+ENABLE_FLASH_ATTENTION="${ENABLE_FLASH_ATTENTION:-1}"
+ENABLE_MIXUP_CUTMIX="${ENABLE_MIXUP_CUTMIX:-1}"
 ENABLE_COMPILE="${ENABLE_COMPILE:-1}"
 MIXUP_ALPHA_ON="${MIXUP_ALPHA_ON:-0.2}"
 CUTMIX_ALPHA_ON="${CUTMIX_ALPHA_ON:-0.5}"

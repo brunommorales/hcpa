@@ -1,5 +1,16 @@
 # HCPA — Diabetic Retinopathy Detection on Fundus Images
 
+> ### Frozen artifact branch
+> This branch reproduces the configuration reported in **Table 1 of the SSCAD 2026 paper**,
+> so the launchers run the reported setup with no extra environment variable. It is kept
+> unchanged for readers who want to execute exactly what the paper measured.
+>
+> It therefore also preserves two settings that were found to be inconsistent afterwards: the
+> plain and token-reduction hybrids enable AMP and a cosine schedule despite being described
+> as unoptimized, and the optimized hybrid enables flash attention and mixup/CutMix while
+> running *without* a cosine schedule. Both are corrected on the **`colaboration`** branch,
+> where development continues. Do not develop here.
+
 This repository contains training approaches for binary classification of Diabetic Retinopathy (DR)
 using fundus photographs from the HCPA (Hospital de Clínicas de Porto Alegre) dataset.
 
@@ -86,9 +97,9 @@ sequence of tokens into a Transformer encoder.
 | `tensorflow_opt` | ✓ | flag | flag | — | — | ✓ | — | ✓ Cosine+WU |
 | `pytorch_base` | — | — | — | — | — | — | — | — |
 | `pytorch_opt` | ✓ | ✓ | — | — | ✓ | ✓ | — | ✓ Cosine+WU |
-| `hybrid_simple` | — | — | — | — | — | — | — | — |
-| `hybrid_token_reduction` | — | — | — | — | — | — | ✓ 50% | — |
-| `hybrid_token_reduction_opt` | ✓ bf16 | — | ✓ | — | — | — | ✓ 50%+WU | ✓ Cosine+WU |
+| `hybrid_simple` | ✓ | — | — | — | — | — | — | ✓ Cosine+WU |
+| `hybrid_token_reduction` | ✓ | — | — | — | — | — | ✓ 50% | ✓ Cosine+WU |
+| `hybrid_token_reduction_opt` | ✓ bf16 | — | ✓ | ✓ | — | ✓ | ✓ 50%+WU | — |
 | `retfound_green` | ✓ | — | — | — | ✓ | — | — | ✓ Cosine+WU |
 | `vit_pure` | ✓ | — | — | flag | ✓ | — | — | ✓ Cosine+WU |
 
@@ -100,19 +111,16 @@ environment variable (`ENABLE_AMP`, `ENABLE_COSINE`, `ENABLE_MIXUP_CUTMIX`,
 `ENABLE_FLASH_ATTENTION`, `KEEP_RATIO`, …), so a configuration is always recorded in the
 command that produced it rather than hidden in an argparse default.
 
-### The three hybrids are an incremental ablation
+### The three hybrids, as the paper ran them
 
-The hybrid variants are meant to be read as one progression, adding a single group of
-changes at a time:
+The hybrids were *intended* as one progression adding a single group of changes at a time,
+but on this branch they are not: `hybrid_simple` and `hybrid_token_reduction` already carry
+AMP and a cosine schedule, so the first step is not an unoptimized baseline, and
+`hybrid_token_reduction_opt` adds compilation, flash attention and mixup/CutMix while
+dropping the cosine schedule. Only the `simple` to `token_reduction` step cleanly isolates
+one change (token reduction).
 
-| Step | Variant | What it adds |
-|---|---|---|
-| 1 | `hybrid_simple` | nothing — the plain CNN+Transformer baseline, no AMP, no cosine |
-| 2 | `hybrid_token_reduction` | token reduction only (keeps 50 % of the 64 stem tokens) |
-| 3 | `hybrid_token_reduction_opt` | mixed precision, cosine schedule and `torch.compile` |
-
-Flash attention and mixup/CutMix are **off by default** in step 3 so that the step isolates
-the runtime recipe. Turn them on explicitly if you want them.
+The clean progression is on the `colaboration` branch.
 
 ---
 
@@ -360,44 +368,40 @@ Batch size:     32  (smaller — quadratic attention over 400 tokens)
 | Feature | `hybrid_simple` | `hybrid_token_reduction` | `hybrid_token_reduction_opt` |
 |---|---|---|---|
 | Token Reduction | — | ✓ 50 % | ✓ 50 % + 5-epoch warmup |
-| AMP | — | — | ✓ bf16 preferred |
-| Cosine LR | — | — | ✓ |
+| AMP | ✓ | ✓ | ✓ bf16 preferred |
+| Cosine LR | ✓ | ✓ | — |
 | torch.compile | — | — | ✓ reduce-overhead |
 | Channels Last | — | — | ✓ |
 | NaN/Inf checks | — | — | ✓ |
-| Flash Attention | — | — | available, off by default |
-| Mixup + CutMix | — | — | available, off by default |
+| Flash Attention | — | — | ✓ |
+| Mixup + CutMix | — | — | ✓ |
 | EMA | available, off | available, off | available, off |
-
-Steps 1 and 2 carry no optimization at all, so the difference between them isolates token
-reduction and the difference between 2 and 3 isolates the runtime recipe.
 
 ---
 
 ## Reproducing the runs reported in the paper
 
-The launcher defaults above were **corrected after** the 160 runs reported in the paper were
-executed: the plain hybrid used to enable AMP and cosine despite being described as the
-unoptimized baseline, and the optimized hybrid used to enable flash attention and
-mixup/CutMix while running *without* a cosine schedule. The defaults now express the clean
-progression described above.
-
-The configuration actually used for the reported runs is the one printed in Table 1 of the
-paper. To reproduce it with this code, set the environment variables explicitly:
+On this branch the launcher defaults **are** the configuration reported in Table 1 of the
+paper, so running an approach reproduces the reported setup directly:
 
 ```bash
-# hybrid_simple            (as run for the paper)
-ENABLE_AMP=1 ENABLE_COSINE=1 ./run_g5k_hydra.sh
-
-# hybrid_token_reduction   (as run for the paper)
-ENABLE_AMP=1 ENABLE_COSINE=1 KEEP_RATIO=0.5 ./run_g5k_hydra.sh
-
-# hybrid_token_reduction_opt (as run for the paper)
-ENABLE_AMP=1 ENABLE_COSINE=0 ENABLE_FLASH_ATTENTION=1 \
-ENABLE_MIXUP_CUTMIX=1 KEEP_RATIO=0.5 ./run_g5k_hydra.sh
+cd hybrid_token_reduction_opt && ./run_g5k_hydra.sh   # no extra variables needed
 ```
 
-The remaining six approaches are unchanged with respect to the reported runs.
+What the paper measured, per hybrid variant:
+
+| Variant | AMP | Cosine | Token red. | Compile | Flash | Mixup/CutMix |
+|---|:--:|:--:|:--:|:--:|:--:|:--:|
+| `hybrid_simple` | ✓ | ✓ | — | — | — | — |
+| `hybrid_token_reduction` | ✓ | ✓ | 50 % | — | — | — |
+| `hybrid_token_reduction_opt` | ✓ | — | 50 % | ✓ | ✓ | ✓ |
+
+Note that the optimized variant differs from the other two by four additions and one
+removal (it drops the cosine schedule), which is why the paper states that its clinical gain
+cannot be credited to compilation alone. The corrected ablation, in which each step adds one
+group of changes, is on the `colaboration` branch.
+
+The dataset itself is not distributed here; the fundus images are patient data.
 
 ---
 

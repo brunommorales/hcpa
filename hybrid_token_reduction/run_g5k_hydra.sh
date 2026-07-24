@@ -31,10 +31,10 @@ FREEZE_BACKBONE_EPOCHS="${FREEZE_BACKBONE_EPOCHS:-3}"
 # APENAS TOKEN REDUCTION: esta variante isola o efeito do token reduction
 # sobre o hibrido simples. Nenhuma outra otimizacao (sem AMP, sem cosine),
 # para que a diferenca vs. hybrid_simple seja SO' o token reduction.
-ENABLE_AMP="${ENABLE_AMP:-0}"
+ENABLE_AMP="${ENABLE_AMP:-1}"
 ENABLE_EMA="${ENABLE_EMA:-0}"
 ENABLE_DALI="${ENABLE_DALI:-0}"
-ENABLE_COSINE="${ENABLE_COSINE:-0}"
+ENABLE_COSINE="${ENABLE_COSINE:-1}"
 
 TRAIN_STATIC_ARGS=(
   --batch_size "${BATCH_SIZE}"
