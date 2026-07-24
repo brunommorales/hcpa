@@ -67,3 +67,5 @@ results_bkp/
 single_gpu_runs.csv
 single_gpu_summary.csv
 *.py.main
+*/results_gppd_l40s/
+*/results_gppd_smoke/
